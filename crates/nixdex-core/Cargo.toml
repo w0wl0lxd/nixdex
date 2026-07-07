@@ -1,0 +1,40 @@
+[package]
+name = "nixdex-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+publish = false
+
+[features]
+default = []
+cli = ["dep:clap"]
+
+[dependencies]
+tokio = { workspace = true }
+reqwest = { workspace = true }
+rayon = { workspace = true }
+sonic-rs = { workspace = true }
+redb = { workspace = true }
+fst = { workspace = true }
+roaring = { workspace = true }
+postcard = { workspace = true }
+zstd = { workspace = true }
+moka = { workspace = true }
+memchr = { workspace = true }
+scc = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+compact_str = { workspace = true }
+smallvec = { workspace = true }
+rustc-hash = { workspace = true }
+ahash = { workspace = true }
+clap = { workspace = true, optional = true }
+
+[lints]
+workspace = true

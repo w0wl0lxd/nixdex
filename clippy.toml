@@ -1,0 +1,30 @@
+# Clippy configuration. Complements [workspace.lints.clippy] in Cargo.toml.
+
+cognitive-complexity-threshold = 15
+too-many-lines-threshold = 100
+too-many-arguments-threshold = 8
+type-complexity-threshold = 300
+
+disallowed-methods = [
+  { path = "std::option::Option::unwrap_or", reason = "use an explicit match/if-let with a named fallback, or unwrap_or_else with a computed value — not a silent literal default" },
+  { path = "std::option::Option::unwrap_or_default", reason = "do not hide missing data with a type default; return an explicit error instead" },
+  { path = "std::result::Result::unwrap_or", reason = "propagate the error or handle it explicitly — do not silently substitute a default" },
+  { path = "std::result::Result::unwrap_or_default", reason = "do not hide a parse/conversion error with a type default; propagate or handle explicitly" },
+  { path = "core::option::Option::unwrap_or", reason = "use an explicit match/if-let with a named fallback" },
+  { path = "core::option::Option::unwrap_or_default", reason = "do not hide missing data with a type default" },
+  { path = "core::result::Result::unwrap_or", reason = "propagate the error or handle it explicitly" },
+  { path = "core::result::Result::unwrap_or_default", reason = "do not hide a parse/conversion error with a type default" },
+]
+
+disallowed-types = [
+  "f32",
+  "std::collections::HashMap",
+  "std::collections::hash_map::HashMap",
+  "std::collections::HashSet",
+  "std::collections::hash_set::HashSet",
+]
+
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = true

@@ -1,0 +1,30 @@
+# Rust
+/target/
+crates/*/target
+**/*.rs.bk
+Cargo.lock
+
+# Nix
+result
+result-*
+
+# CodeGraph
+.codegraph/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Upstream mirror build artifacts
+.upstream/nix-index/target/
+
+# Research database dumps
+research/nix-index-db*
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+Thumbs.db

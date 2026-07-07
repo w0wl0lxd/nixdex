@@ -1,0 +1,30 @@
+[package]
+name = "nixdex-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+publish = false
+default-run = "nix-index"
+
+[dependencies]
+clap = { workspace = true }
+owo-colors = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+color-eyre = { workspace = true }
+tokio = { workspace = true }
+nixdex-core = { workspace = true, features = ["cli"] }
+
+[[bin]]
+name = "nix-index"
+path = "src/bin/nix-index.rs"
+
+[[bin]]
+name = "nix-locate"
+path = "src/bin/nix-locate.rs"
+
+[lints]
+workspace = true
