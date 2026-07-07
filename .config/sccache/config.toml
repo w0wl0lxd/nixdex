@@ -1,0 +1,3 @@
+[cache.disk]
+dir = "/mnt/build/sccache"
+size = 53687091200

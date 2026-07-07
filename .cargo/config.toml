@@ -1,0 +1,21 @@
+[build]
+rustc-wrapper = "sccache"
+
+[alias]
+ck = "check --all-features"
+cl = "clippy --all-features -- -D warnings"
+nt = "nextest run --no-fail-fast"
+
+[env]
+SCCACHE_SERVER_PORT = "4237"
+SCCACHE_CACHE_SIZE = "50G"
+SCCACHE_DIR = "/mnt/build/sccache"
+SCCACHE_CONF = { value = ".config/sccache/config.toml", relative = true }
+SCCACHE_BASE_DIR = { value = ".", relative = true }
+
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = [
+  "-C",
+  "link-arg=-fuse-ld=mold",
+]

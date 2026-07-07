@@ -1,0 +1,129 @@
+[workspace]
+resolver = "3"
+members = ["crates/nixdex-core", "crates/nixdex-cli", "crates/nixdex-daemon"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["w0wl0lxd"]
+license = "AGPL-3.0-only"
+repository = "https://github.com/w0wl0lxd/nixdex"
+description = "Modern rewrite of nix-index / nix-locate"
+categories = ["development-tools", "command-line-utilities"]
+rust-version = "1.85.0"
+
+[workspace.dependencies]
+# Core async runtime and networking
+tokio = { version = "1.49", features = ["full"] }
+reqwest = { version = "0.13", default-features = false, features = ["http2", "rustls", "brotli", "zstd"] }
+rayon = "1.10"
+
+# Serialization and compression
+sonic-rs = "0.5"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+zstd = "0.13"
+bytes = { version = "1", features = ["serde"] }
+
+# Databases and indexing
+redb = "2.2"
+fst = "0.4"
+roaring = "0.10"
+
+# Concurrency and collections
+scc = "3"
+moka = { version = "0.12", features = ["future"] }
+memchr = "2.7"
+compact_str = { version = "0.7", features = ["serde"] }
+smallvec = { version = "1", features = ["serde"] }
+rustc-hash = "2"
+ahash = { version = "0.8", features = ["serde"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+color-eyre = "0.6"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+owo-colors = { version = "4", features = ["supports-colors"] }
+
+# Workspace crates
+nixdex-core = { path = "crates/nixdex-core" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+get_unwrap = "deny"
+indexing_slicing = "deny"
+clone_on_ref_ptr = "deny"
+redundant_clone = "deny"
+manual_assert = "deny"
+disallowed_methods = "deny"
+disallowed_types = "deny"
+
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+doc_markdown = "allow"
+uninlined_format_args = "allow"
+too_many_lines = "allow"
+type_complexity = "allow"
+too_many_arguments = "allow"
+manual_unwrap_or = "allow"
+manual_unwrap_or_default = "allow"
+missing_const_for_fn = "allow"
+future_not_send = "allow"
+significant_drop_tightening = "allow"
+missing_transmute_annotations = "allow"
+impl_trait_in_params = "allow"
+redundant_pub_crate = "allow"
+str_to_string = "allow"
+fallible_impl_from = "allow"
+unwrap_in_result = "allow"
+single_match_else = "allow"
+needless_pass_by_value = "allow"
+similar_names = "allow"
+shadow_unrelated = "allow"
+shadow_reuse = "allow"
+shadow_same = "allow"
+items_after_statements = "allow"
+or_fun_call = "allow"
+option_if_let_else = "allow"
+map_unwrap_or = "allow"
+borrow_as_ptr = "allow"
+ref_as_ptr = "allow"
+missing_assert_message = "allow"
+mixed_read_write_in_expression = "allow"
+disallowed_names = "allow"
+multiple_crate_versions = "allow"
+wildcard_imports = "allow"
+default_trait_access = "allow"
+cast_sign_loss = "allow"
+result_large_err = "allow"
+struct_excessive_bools = "allow"
+unused_async = "allow"
+duration_suboptimal_units = "allow"
+manual_split_once = "allow"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

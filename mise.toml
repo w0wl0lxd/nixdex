@@ -1,0 +1,5 @@
+[tools]
+rust = "stable"
+
+[settings]
+experimental = true
