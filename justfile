@@ -3,6 +3,12 @@ set shell := ["bash", "-uc"]
 default:
     @just --list
 
+# One-time per clone: point git at tracked hooks under .githooks/
+setup-hooks:
+    git config core.hooksPath .githooks
+    @echo "hooks active: core.hooksPath=.githooks"
+    @ls -1 .githooks/
+
 fmt:
     cargo fmt --all
 

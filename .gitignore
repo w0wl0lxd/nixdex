@@ -1,30 +1,101 @@
-# Rust
+# =============================================================================
+# nixdex .gitignore — dual-track AI / DevEx hygiene (2026)
+#
+# Tracked: product source, command-not-found scripts, research markdown notes
+# Ignored: local AI instruction overrides, tool scratch, secrets, build output
+# =============================================================================
+
+# ----- Rust / Cargo ----------------------------------------------------------
 /target/
 crates/*/target
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock is tracked for the binary workspace (applications lock).
 
-# Nix
+# ----- Nix -------------------------------------------------------------------
 result
 result-*
+.direnv/
 
-# CodeGraph
-.codegraph/
-
-# Environment
+# ----- Secrets & env ---------------------------------------------------------
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+credentials.json
 
-# Upstream mirror build artifacts
-.upstream/nix-index/target/
-
-# Research database dumps
-research/nix-index-db*
-
-# IDE / OS
+# ----- OS / editor scratch ---------------------------------------------------
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
 .idea/
 .vscode/
-.DS_Store
-*.swp
-Thumbs.db
+*.code-workspace
+
+# ----- Code indexing / analysis cache ----------------------------------------
+.codegraph/
+.cache/
+coverage/
+lcov.info
+*.profraw
+*.profdata
+mutants.out/
+mutants.out.old/
+
+# ----- Upstream / research dumps ---------------------------------------------
+.upstream/
+research/nix-index-db*/
+research/paths.cache
+paths.cache
+
+# ----- AI agent instruction files (local-only) --------------------------------
+# Team product docs stay in CONTRIBUTING.md + README.md.
+# Root CLAUDE.md / AGENTS.md are personal agent loaders; keep them untracked.
+/AGENTS.md
+/AGENTS.local.md
+/AGENTS.override.md
+/CLAUDE.md
+/CLAUDE.local.md
+/GEMINI.md
+/AIDER.md
+/CONTINUE.md
+/.cursorrules
+
+# Tool directories (session state, permissions, caches)
+.claude/
+.cursor/
+.windsurf/
+.codex/
+.copilot/
+.copilot-tracking/
+.devin/
+.maki/
+.opencode/
+.kilocode/
+.agent/
+.agents/
+.ai/
+.ai-output/
+.openai/
+.anthropic/
+.tmpclaude-*/
+*.codex
+.codex-pr-body.md
+
+# Lefthook / hook manager local (if ever added)
+lefthook-local.yml
+
+# Local unversioned scratch
+/tmp/
+/scratch/
+*.local.toml
+*.local.yaml
+*.local.yml
+*.local.json
+
+# Nextest / sccache local state
+.sccache/
+target-nextest/
