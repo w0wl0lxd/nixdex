@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# prepare-commit-msg: soft strip of known AI trailers before the editor opens,
+# and reject Agent/bot identity env bleed. Hard policy lives in commit-msg.
+set -euo pipefail
+
+MSG_FILE=${1:?}
+# $2 = source (message|template|merge|squash|commit); $3 = commit SHA for -c/-C
+SOURCE=${2:-}
+
+# Never rewrite merge or squash message bodies automatically.
+case "$SOURCE" in
+  merge|squash) exit 0 ;;
+esac
+
+# Soft-strip common auto-appended AI trailers so humans never see them in
+# the editor. commit-msg still hard-fails if any slip back in.
+if [[ -f "$MSG_FILE" ]]; then
+  tmp=$(mktemp)
+  # Remove Co-Authored-By / Assisted-By / Generated-By lines for known agents,
+  # "Generated with …" lines, and bare robot emoji attribution lines.
+  grep -viE \
+    -e '^[[:space:]]*Co-[Aa]uthored-[Bb]y:.*(Devin|Claude|Anthropic|Cursor|Copilot|OpenAI|Gemini|Codex|Windsurf|Codeium|Tabnine|devin-ai-integration|copilot-swe-agent)' \
+    -e '^[[:space:]]*Assisted-[Bb]y:.*(Devin|Claude|Anthropic|Cursor|Copilot|OpenAI|Gemini|Codex)' \
+    -e '^[[:space:]]*Generated-[Bb]y:.*(Devin|Claude|Anthropic|Cursor|Copilot|OpenAI|Gemini|Codex)' \
+    -e '^[[:space:]]*Generated with' \
+    -e '^[[:space:]]*🤖' \
+    "$MSG_FILE" >"$tmp" || true
+  # Collapse runs of 3+ blank lines to a single blank after stripping.
+  awk 'BEGIN{b=0} /^$/{b++; if(b<=1) print; next} {b=0; print}' "$tmp" >"$MSG_FILE"
+  rm -f "$tmp"
+fi
+
+exit 0

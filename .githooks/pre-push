@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# pre-push: reject pushes of commits with AI attribution, agent authors,
+# or non-conventional subjects in the range being pushed.
+set -euo pipefail
+
+ROOT=$(git rev-parse --show-toplevel)
+# shellcheck source=lib/ai-attribution.sh
+source "$ROOT/.githooks/lib/ai-attribution.sh"
+
+zero=0000000000000000000000000000000000000000
+failed=0
+CONV='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?(!)?:[[:space:]]+.+$'
+
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  if [[ "$local_sha" == "$zero" ]]; then
+    continue
+  fi
+
+  if [[ "$remote_sha" == "$zero" ]]; then
+    commits=$(git rev-list --max-count=50 "$local_sha" --not --remotes=origin 2>/dev/null \
+      || git rev-list --max-count=50 "$local_sha")
+  else
+    commits=$(git rev-list "${remote_sha}..${local_sha}")
+  fi
+
+  for sha in $commits; do
+    msg=$(git log -1 --format='%B' "$sha")
+    subject=$(git log -1 --format='%s' "$sha")
+    author=$(git log -1 --format='%an <%ae>' "$sha")
+
+    if echo "$author" | grep -qiE 'agent@devin|devin-ai-integration|noreply@anthropic|copilot-swe-agent|<claude@|<cursor@'; then
+      echo "error: commit $sha has agent author identity: $author" >&2
+      echo "Rewrite authorship with git filter-repo using your human identity." >&2
+      failed=1
+      continue
+    fi
+
+    # pipe message into match helper via temp file for portability
+    tmp=$(mktemp)
+    printf '%s' "$msg" >"$tmp"
+    if match=$(ai_attribution_match "$tmp"); then
+      ai_attribution_reject "commit $sha" "$match"
+      failed=1
+      rm -f "$tmp"
+      continue
+    fi
+    rm -f "$tmp"
+
+    if ! [[ "$subject" =~ $CONV ]]; then
+      echo "error: commit $sha subject is not Conventional Commits:" >&2
+      echo "  $subject" >&2
+      failed=1
+    fi
+  done
+done
+
+if ((failed)); then
+  echo >&2
+  echo "pre-push: rejected. Fix commit messages / authorship, then push again." >&2
+  echo "See CONTRIBUTING.md. Emergency bypass: git push --no-verify (not recommended)." >&2
+  exit 1
+fi
+
+exit 0

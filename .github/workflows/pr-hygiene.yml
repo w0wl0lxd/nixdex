@@ -1,0 +1,101 @@
+name: pr-hygiene
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  title-and-body:
+    name: conventional title + no AI slop
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR title (Conventional Commits)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = context.payload.pull_request.title || '';
+            const conv = /^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?(!)?: .+/;
+            const slop = /^(feat|fix|chore|docs)(\([^)]+\))?: (wip|tmp|temp|asdf|test|foo|bar|lorem|stuff|changes|update|misc)$/i;
+            if (!conv.test(title)) {
+              core.setFailed(`PR title is not Conventional Commits:\n  ${title}\nExpected: type(scope)?: description`);
+            }
+            if (title.length > 72) {
+              core.setFailed(`PR title is ${title.length} chars (max 72)`);
+            }
+            if (/\.$/.test(title)) {
+              core.setFailed('PR title must not end with a period');
+            }
+            if (slop.test(title.trim())) {
+              core.setFailed(`PR title looks like placeholder slop: ${title}`);
+            }
+
+      - name: Check PR body (no AI attribution / empty shell)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.pull_request.body || '';
+            const patterns = [
+              /Generated with \[?(Devin|Claude|Cursor|Copilot|Codex)/i,
+              /Co-[Aa]uthored-[Bb]y:.*(Devin|Claude|Anthropic|Cursor|Copilot|OpenAI|Gemini|Codex|devin-ai-integration|copilot-swe-agent)/i,
+              /Assisted-[Bb]y:.*(Devin|Claude|Cursor|Copilot)/i,
+              /🤖/,
+              /AI[- ]generated/i,
+              /noreply@anthropic\.com/i,
+            ];
+            for (const re of patterns) {
+              if (re.test(body)) {
+                core.setFailed(`PR body contains AI attribution matching ${re}`);
+              }
+            }
+            // Require a non-template Summary section
+            const stripped = body
+              .replace(/<!--[\s\S]*?-->/g, '')
+              .replace(/^\s*[-*]\s*$/gm, '')
+              .trim();
+            if (stripped.length < 40) {
+              core.setFailed('PR body is too short or still an empty template. Fill in Summary and Test plan.');
+            }
+            if (!/##\s*Summary/i.test(body) || !/##\s*Test plan/i.test(body)) {
+              core.setFailed('PR body must keep ## Summary and ## Test plan sections.');
+            }
+
+      - name: Check commits on the PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const number = context.payload.pull_request.number;
+            const commits = await github.paginate(github.rest.pulls.listCommits, {
+              owner, repo, pull_number: number, per_page: 100,
+            });
+            const conv = /^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?(!)?: .+/;
+            const ai = [
+              /Generated with/i,
+              /Co-[Aa]uthored-[Bb]y:.*(Devin|Claude|Cursor|Copilot|Codex|Anthropic)/i,
+              /🤖/,
+              /agent@devin/i,
+              /devin-ai-integration/i,
+            ];
+            const failures = [];
+            for (const c of commits) {
+              const msg = c.commit.message || '';
+              const subject = msg.split('\n')[0];
+              const author = `${c.commit.author?.name || ''} <${c.commit.author?.email || ''}>`;
+              if (!conv.test(subject)) {
+                failures.push(`${c.sha.slice(0,7)} non-conventional: ${subject}`);
+              }
+              for (const re of ai) {
+                if (re.test(msg) || re.test(author)) {
+                  failures.push(`${c.sha.slice(0,7)} AI attribution: ${subject}`);
+                  break;
+                }
+              }
+            }
+            if (failures.length) {
+              core.setFailed('Commit hygiene failures:\n' + failures.join('\n'));
+            }
