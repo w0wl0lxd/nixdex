@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# commit-msg: Conventional Commits + no AI attribution + no slop.
+# Enable: just setup-hooks  (sets core.hooksPath = .githooks)
+set -euo pipefail
+shopt -s extglob
+
+MSG_FILE=${1:?commit-msg requires the message file path}
+ROOT=$(git rev-parse --show-toplevel)
+# shellcheck source=lib/ai-attribution.sh
+source "$ROOT/.githooks/lib/ai-attribution.sh"
+
+# ---------------------------------------------------------------------------
+# 1. Reject AI attribution (hard fail — do not silently strip; the author
+#    should notice and rewrite). Bypass only with: git commit --no-verify
+# ---------------------------------------------------------------------------
+if match=$(ai_attribution_match "$MSG_FILE"); then
+  ai_attribution_reject "commit message" "$match"
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 2. Strip leading blank lines and editor comments for validation
+# ---------------------------------------------------------------------------
+mapfile -t LINES < <(grep -vE '^#' "$MSG_FILE" || true)
+while ((${#LINES[@]} > 0)) && [[ -z "${LINES[0]// }" ]]; do
+  LINES=("${LINES[@]:1}")
+done
+
+if ((${#LINES[@]} == 0)); then
+  echo "error: empty commit message" >&2
+  exit 1
+fi
+
+SUBJECT=${LINES[0]}
+
+# ---------------------------------------------------------------------------
+# 3. Conventional Commits subject
+#    type(scope)?: description
+# ---------------------------------------------------------------------------
+CONV='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?(!)?:[[:space:]]+.+$'
+if ! [[ "$SUBJECT" =~ $CONV ]]; then
+  cat >&2 <<EOF
+error: subject is not a Conventional Commit:
+
+  $SUBJECT
+
+Expected:
+  <type>[optional scope][optional !]: <description>
+
+Types: feat fix docs style refactor perf test build ci chore revert
+
+Examples:
+  feat(cli): add truss new --template flag
+  fix(sync): detect drift for missing flake.nix
+  chore(hooks): add commit-msg AI-attribution guard
+EOF
+  exit 1
+fi
+
+SUBJECT_LEN=${#SUBJECT}
+if ((SUBJECT_LEN > 72)); then
+  echo "error: subject is ${SUBJECT_LEN} chars (max 72):" >&2
+  echo "  $SUBJECT" >&2
+  exit 1
+fi
+
+if [[ "$SUBJECT" =~ \.$ ]]; then
+  echo "error: subject must not end with a period" >&2
+  echo "  $SUBJECT" >&2
+  exit 1
+fi
+
+DESC=${SUBJECT#*: }
+DESC=${DESC##+([[:space:]])}
+if [[ "$DESC" =~ ^(Added|Adds|Adding|Fixed|Fixes|Fixing|Updated|Updates|Updating|Changed|Changes|Changing|Implemented|Implements|Implementing|Created|Creates|Creating|Removed|Removes|Removing|Refactored|Refactors|Refactoring)[[:space:]] ]]; then
+  cat >&2 <<EOF
+error: subject description should use imperative mood (e.g. "add" not "Added"):
+
+  $SUBJECT
+EOF
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Body hygiene: blank line after subject when body present
+# ---------------------------------------------------------------------------
+if ((${#LINES[@]} > 1)); then
+  if [[ -n "${LINES[1]// }" ]]; then
+    echo "error: blank line required between subject and body" >&2
+    exit 1
+  fi
+fi
+
+SLOP_SUBJECT='^(feat|fix|chore|docs)(\([^)]+\))?:[[:space:]]*(wip|tmp|temp|asdf|test|foo|bar|lorem|stuff|changes|update|misc)[[:space:]]*$'
+if [[ "$SUBJECT" =~ $SLOP_SUBJECT ]]; then
+  echo "error: placeholder subject rejected: $SUBJECT" >&2
+  echo "Write a specific summary of the change." >&2
+  exit 1
+fi
+
+exit 0
