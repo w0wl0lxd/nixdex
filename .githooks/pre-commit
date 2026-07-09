@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# pre-commit: secret scanning on staged files (gitleaks + ripsecrets).
+# Enable with: just setup-hooks
+set -euo pipefail
+
+ROOT=$(git rev-parse --show-toplevel)
+cd "$ROOT"
+
+# Staged files only (Added / Copied / Modified)
+mapfile -t STAGED < <(git diff --cached --name-only --diff-filter=ACM)
+if ((${#STAGED[@]} == 0)); then
+  exit 0
+fi
+
+failed=0
+
+# ---- gitleaks (staged) -----------------------------------------------------
+if command -v gitleaks >/dev/null 2>&1; then
+  if ! gitleaks protect --staged --redact -v --config "$ROOT/.gitleaks.toml" 2>&1; then
+    echo "error: gitleaks found secrets in staged changes" >&2
+    echo "Remove secrets from the index, rotate any exposed credentials, retry." >&2
+    failed=1
+  fi
+else
+  echo "warning: gitleaks not on PATH — skip staged secret scan" >&2
+  echo "  install: mise use -g gitleaks   # or nix-shell -p gitleaks" >&2
+fi
+
+# ---- ripsecrets (local-only, fast, no network) -----------------------------
+if command -v ripsecrets >/dev/null 2>&1; then
+  # Only scan staged paths that still exist as files
+  existing=()
+  for f in "${STAGED[@]}"; do
+    if [[ -f "$f" ]]; then
+      existing+=("$f")
+    fi
+  done
+  if ((${#existing[@]} > 0)); then
+    if ! ripsecrets --strict-ignore "${existing[@]}" 2>&1; then
+      echo "error: ripsecrets found high-entropy secrets in staged files" >&2
+      failed=1
+    fi
+  fi
+else
+  echo "warning: ripsecrets not on PATH — skip fast local secret scan" >&2
+  echo "  install: cargo install ripsecrets   # or nix-shell -p ripsecrets" >&2
+fi
+
+# ---- block common secret filenames even if empty ---------------------------
+for f in "${STAGED[@]}"; do
+  base=$(basename "$f")
+  case "$base" in
+    .env|.env.local|.env.production|.env.staging|id_rsa|id_ed25519|*.pem|credentials.json|secrets.yaml|secrets.yml)
+      echo "error: refusing to commit secret-looking path: $f" >&2
+      failed=1
+      ;;
+  esac
+  case "$f" in
+    *.pem|*.key|*.p12|*.pfx|id_rsa*|id_ed25519*|*.keystore)
+      echo "error: refusing to commit key material: $f" >&2
+      failed=1
+      ;;
+  esac
+done
+
+if ((failed)); then
+  exit 1
+fi
+exit 0

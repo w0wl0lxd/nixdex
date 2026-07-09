@@ -1,0 +1,8 @@
+# Paths trufflehog should skip (globs relative to repo root)
+target/**
+.git/**
+.codegraph/**
+**/*.lock
+**/Cargo.lock
+research/**
+.upstream/**
