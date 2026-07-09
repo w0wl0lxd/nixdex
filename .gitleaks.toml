@@ -1,0 +1,72 @@
+# Gitleaks — secrets / PII / high-entropy leakage guardrails
+# Used by: .githooks/pre-commit, just secrets, .github/workflows/secrets-scan.yml
+title = "nixdex gitleaks"
+
+[extend]
+useDefault = true
+
+# --- AI / cloud provider keys (critical) ------------------------------------
+[[rules]]
+id = "openai-api-key"
+description = "OpenAI API Key"
+regex = '''sk-[a-zA-Z0-9]{20,}T3BlbkFJ[a-zA-Z0-9]{20,}'''
+keywords = ["sk-"]
+
+[[rules]]
+id = "openai-api-key-project"
+description = "OpenAI project API Key"
+regex = '''sk-proj-[a-zA-Z0-9_-]{20,}'''
+keywords = ["sk-proj-"]
+
+[[rules]]
+id = "anthropic-api-key"
+description = "Anthropic/Claude API Key"
+regex = '''sk-ant-[a-zA-Z0-9\-_]{80,}'''
+keywords = ["sk-ant-"]
+
+[[rules]]
+id = "github-pat"
+description = "GitHub personal access token"
+regex = '''gh[pousr]_[A-Za-z0-9_]{36,}'''
+keywords = ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"]
+
+[[rules]]
+id = "aws-access-key"
+description = "AWS Access Key ID"
+regex = '''AKIA[0-9A-Z]{16}'''
+keywords = ["AKIA"]
+
+[[rules]]
+id = "private-key-block"
+description = "PEM private key block"
+regex = '''-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----'''
+keywords = ["BEGIN"]
+
+[[rules]]
+id = "generic-api-assignment"
+description = "Generic API key assignment"
+regex = '''(?i)(?:api[_-]?key|apikey|secret[_-]?key|access[_-]?token|auth[_-]?token)\s*[:=]\s*['"][A-Za-z0-9_\-]{20,}['"]'''
+keywords = ["api_key", "apikey", "secret_key", "access_token", "auth_token"]
+
+# --- Allowlist --------------------------------------------------------------
+[allowlist]
+description = "False-positive and intentional non-secret paths"
+paths = [
+  '''(^|/)target/''',
+  '''(^|/)\.git/''',
+  '''(^|/)\.codegraph/''',
+  '''(^|/)Cargo\.lock$''',
+  '''(^|/)deny\.toml$''',
+  '''(^|/)\.gitleaks\.toml$''',
+  '''(^|/)crates/.*/templates/''',
+  '''(^|/)research/''',
+  '''(^|/)\.upstream/''',
+]
+
+regexes = [
+  '''(?i)(example|sample|dummy|fake|placeholder|your[_-]?api[_-]?key|xxx+|replace[_-]?me)''',
+  '''(?i)sk-ant-api03-xxxxxxxx''',
+]
+
+# nixdex: local research artifacts stay untracked; double-ignore if scanned
+# [[allowlist paths additions handled above via research pattern]]

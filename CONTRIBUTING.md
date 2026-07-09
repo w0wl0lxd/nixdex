@@ -33,9 +33,9 @@ Rules:
 Good:
 
 ```text
-feat(cli): support --template for truss new
+feat(locate): support --minimal output
 
-Default remains "default"; registry entries override embedded packs.
+Keep flag parity with upstream nix-locate.
 ```
 
 Bad:
@@ -87,11 +87,38 @@ just setup-hooks
 
 | Hook | Role |
 |------|------|
+| `pre-commit` | gitleaks + ripsecrets on staged files; block secret filenames |
 | `prepare-commit-msg` | Soft-strips known AI trailers before the editor |
 | `commit-msg` | Hard-fails on AI attribution, non-conventional subjects, placeholder slop |
 | `pre-push` | Scans commits being pushed for AI trailers, agent authors, non-conventional subjects |
 
 Bypass (emergency only): `git commit --no-verify` / `git push --no-verify`.
+
+## Secrets, PII, and source leakage
+
+Never commit:
+
+- `.env` / `.env.*`, PEM / OpenSSH private keys, `credentials.json`
+- Cloud / AI API keys (`sk-…`, `sk-ant-…`, `ghp_…`, `AKIA…`, …)
+- Personal data (emails/phones in fixtures must be clearly fake)
+- Private store dumps or customer indexes
+
+**Local**
+
+```bash
+just secrets           # gitleaks detect + ripsecrets
+gitleaks protect --staged --config .gitleaks.toml
+ripsecrets --strict-ignore $(git diff --cached --name-only --diff-filter=ACM)
+```
+
+**CI** (`.github/workflows/secrets-scan.yml`)
+
+- `gitleaks` on PR ranges and full history on `main` / weekly schedule
+- `trufflehog --only-verified` on the tree
+- `cargo audit --deny warnings`
+
+Config: `.gitleaks.toml`, `.trufflehog-exclude`.  
+If a real secret is committed: **rotate first**, then rewrite history if needed.
 
 ## AI agent files
 
@@ -100,12 +127,13 @@ are **gitignored**. Keep personal agent loaders local. Product conventions for
 humans and reviewers live in this file and `README.md`.
 
 Scaffold templates may still embed `AGENTS.md` / `CLAUDE.md` **inside** template
-trees (e.g. `crates/truss-cli/templates/default/`) — those are product output,
+trees (e.g. `research/ (local dumps gitignored)`) — those are product output,
 not repo agent config.
 
 ## Verification before opening a PR
 
 ```bash
 just setup-hooks   # once
+just secrets
 just validate      # fmt + check + clippy + test
 ```
