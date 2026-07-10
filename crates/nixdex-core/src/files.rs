@@ -198,6 +198,18 @@ impl FileTree {
         })
     }
 
+    /// Parse a binary-cache `.ls` JSON document into a file tree.
+    ///
+    /// Accepts either the full document (`{"root":{...}}`) or a bare node object
+    /// (`{"type":"directory","entries":{...}}`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Parse`] when the JSON is invalid or the schema is unexpected.
+    pub fn from_ls_json(bytes: &[u8]) -> crate::Result<Self> {
+        from_ls_json_inner(bytes).map_err(crate::Error::Parse)
+    }
+
     /// List all entries whose path starts with `filter_prefix`.
     #[must_use]
     pub fn to_list(&self, filter_prefix: &[u8]) -> Vec<FileTreeEntry> {
@@ -227,5 +239,90 @@ impl FileTree {
     #[must_use]
     pub fn root(&self) -> &FileNode<FileEntries> {
         &self.0
+    }
+}
+
+/// JSON shape of a cache.nixos.org `.ls` node.
+#[derive(Debug, Deserialize)]
+struct LsNode {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    executable: Option<bool>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    entries: Option<indexmap::IndexMap<String, Self>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LsRoot {
+    root: LsNode,
+}
+
+fn from_ls_json_inner(bytes: &[u8]) -> Result<FileTree, String> {
+    // Prefer full document with `root`; fall back to bare node.
+    if let Ok(doc) = sonic_rs::from_slice::<LsRoot>(bytes) {
+        return ls_node_to_tree(doc.root);
+    }
+    let node: LsNode =
+        sonic_rs::from_slice(bytes).map_err(|err| format!(".ls JSON parse: {err}"))?;
+    ls_node_to_tree(node)
+}
+
+fn ls_node_to_tree(node: LsNode) -> Result<FileTree, String> {
+    match node.kind.as_str() {
+        "regular" => {
+            let size = match node.size {
+                Some(n) => n,
+                None => 0,
+            };
+            let executable = matches!(node.executable, Some(true));
+            Ok(FileTree::regular(size, executable))
+        }
+        "symlink" => {
+            let target = node
+                .target
+                .ok_or_else(|| "symlink node missing target".to_string())?;
+            Ok(FileTree::symlink(Bytes::from(target.into_bytes())))
+        }
+        "directory" => {
+            let map = match node.entries {
+                Some(m) => m,
+                None => indexmap::IndexMap::new(),
+            };
+            let mut entries = Vec::with_capacity(map.len());
+            for (name, child) in map {
+                let child_tree = ls_node_to_tree(child)?;
+                entries.push((Bytes::from(name.into_bytes()), child_tree));
+            }
+            Ok(FileTree::directory(entries))
+        }
+        other => Err(format!("unknown .ls node type: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_sample_ls_bin() {
+        let json = br#"{"entries":{"hello":{"executable":true,"size":64472,"type":"regular"}},"type":"directory"}"#;
+        let tree = from_ls_json_inner(json).expect("parse");
+        let list = tree.to_list(b"");
+        assert!(list.iter().any(|e| e.path == b"/hello"));
+        let hello = list.iter().find(|e| e.path == b"/hello").expect("hello");
+        assert!(hello.node.is_executable());
+    }
+
+    #[test]
+    fn parse_full_root_document() {
+        let json = br#"{"root":{"type":"directory","entries":{"bin":{"type":"directory","entries":{"hello":{"type":"regular","size":1,"executable":true}}}}}}"#;
+        let tree = from_ls_json_inner(json).expect("parse");
+        let list = tree.to_list(b"/bin");
+        assert!(list.iter().any(|e| e.path == b"/bin/hello"));
     }
 }

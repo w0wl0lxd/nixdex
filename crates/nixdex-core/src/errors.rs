@@ -86,6 +86,10 @@ pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
 
+    /// Parsing a file listing or other structured input failed.
+    #[error("parse error: {0}")]
+    Parse(String),
+
     /// Requested functionality is not implemented yet.
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
