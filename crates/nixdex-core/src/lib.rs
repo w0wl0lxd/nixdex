@@ -11,6 +11,8 @@ pub mod store_path;
 
 pub use errors::{Error, Result};
 pub use files::{FileEntries, FileNode, FileTree, FileTreeEntry, FileType, ALL_FILE_TYPES};
+pub use hydra::Fetcher;
+pub use nixpkgs::{EvalJob, EvalJobLine, EvalJobsOptions, PackageList};
 pub use store_path::{Origin, StorePath};
 
 /// Default binary-cache URL used when fetching file listings.
