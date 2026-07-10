@@ -34,6 +34,7 @@ compact_str = { workspace = true }
 smallvec = { workspace = true }
 rustc-hash = { workspace = true }
 ahash = { workspace = true }
+indexmap = { workspace = true }
 clap = { workspace = true, optional = true }
 
 [lints]
