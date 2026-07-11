@@ -4,6 +4,7 @@ pub mod daemon;
 pub mod database;
 pub mod errors;
 pub mod files;
+pub mod frcode;
 pub mod hydra;
 pub mod index;
 pub mod nixpkgs;

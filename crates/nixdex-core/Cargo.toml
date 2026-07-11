@@ -35,7 +35,13 @@ smallvec = { workspace = true }
 rustc-hash = { workspace = true }
 ahash = { workspace = true }
 indexmap = { workspace = true }
+byteorder = { workspace = true }
+regex = { workspace = true }
 clap = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }
 
 [lints]
 workspace = true
