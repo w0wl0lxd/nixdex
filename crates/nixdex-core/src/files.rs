@@ -1,7 +1,12 @@
 //! File-tree data types used while indexing store paths.
 
+use std::io::Write;
+use std::str;
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+
+use crate::frcode;
 
 /// The kind of a file node inside a store path.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -147,27 +152,96 @@ pub struct FileTreeEntry {
     pub node: FileNode<()>,
 }
 
-impl FileTreeEntry {
-    /// Encode the entry as bytes for storage.
+impl FileNode<()> {
+    /// Write NIXI metadata for this node (size/target + type tag) into `encoder`.
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::NotImplemented`] until the on-disk codec lands.
-    pub fn encode<W: std::io::Write>(&self, _writer: &mut W) -> crate::Result<()> {
-        Err(crate::Error::NotImplemented(
-            "FileTreeEntry::encode is not implemented yet",
-        ))
+    /// Returns an error when the encoder rejects the metadata bytes.
+    pub fn encode_meta<W: Write>(
+        &self,
+        encoder: &mut frcode::Encoder<W>,
+    ) -> Result<(), frcode::Error> {
+        match self {
+            Self::Regular { executable, size } => {
+                let tag = if *executable { "x" } else { "r" };
+                let meta = format!("{size}{tag}");
+                encoder.write_meta(meta.as_bytes())?;
+            }
+            Self::Symlink { target } => {
+                encoder.write_meta(target)?;
+                encoder.write_meta(b"s")?;
+            }
+            Self::Directory { size, contents: () } => {
+                let meta = format!("{size}d");
+                encoder.write_meta(meta.as_bytes())?;
+            }
+        }
+        Ok(())
     }
 
-    /// Decode an entry from a byte buffer.
+    /// Decode a content-free node from NIXI metadata bytes (without the path).
+    #[must_use]
+    pub fn decode_meta(buf: &[u8]) -> Option<Self> {
+        let (kind, rest) = buf.split_last()?;
+        match *kind {
+            b'x' | b'r' => {
+                let executable = *kind == b'x';
+                let size = str::from_utf8(rest).ok()?.parse().ok()?;
+                Some(Self::Regular { executable, size })
+            }
+            b's' => Some(Self::Symlink {
+                target: Bytes::copy_from_slice(rest),
+            }),
+            b'd' => {
+                let size = str::from_utf8(rest).ok()?.parse().ok()?;
+                Some(Self::Directory {
+                    size,
+                    contents: (),
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+impl FileTreeEntry {
+    /// Encode the entry into an frcode stream (`metadata\\0path\\n`).
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::NotImplemented`] until the on-disk codec lands.
-    pub fn decode(_buf: &[u8]) -> crate::Result<Self> {
-        Err(crate::Error::NotImplemented(
-            "FileTreeEntry::decode is not implemented yet",
-        ))
+    /// Returns an error when writing to the encoder fails.
+    pub fn encode<W: Write>(
+        self,
+        encoder: &mut frcode::Encoder<W>,
+    ) -> Result<(), frcode::Error> {
+        self.node.encode_meta(encoder)?;
+        encoder.write_path(self.path)?;
+        Ok(())
+    }
+
+    /// Decode an entry from a decoded frcode line (`metadata\\0path`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Parse`] when the buffer is not a valid entry.
+    pub fn decode(buf: &[u8]) -> crate::Result<Self> {
+        let sep = memchr::memchr(b'\0', buf).ok_or_else(|| {
+            crate::Error::Parse("file entry missing NUL separator".to_string())
+        })?;
+        let node_bytes = buf.get(..sep).ok_or_else(|| {
+            crate::Error::Parse("file entry metadata slice out of range".to_string())
+        })?;
+        let path = buf.get(sep + 1..).ok_or_else(|| {
+            crate::Error::Parse("file entry path slice out of range".to_string())
+        })?;
+        let node = FileNode::decode_meta(node_bytes).ok_or_else(|| {
+            crate::Error::Parse(format!("invalid file entry metadata: {node_bytes:?}"))
+        })?;
+        Ok(Self {
+            path: path.to_vec(),
+            node,
+        })
     }
 }
 
@@ -324,5 +398,67 @@ mod tests {
         let tree = from_ls_json_inner(json).expect("parse");
         let list = tree.to_list(b"/bin");
         assert!(list.iter().any(|e| e.path == b"/bin/hello"));
+    }
+
+    #[test]
+    fn file_tree_entry_encode_decode_roundtrip() {
+        let cases = [
+            FileTreeEntry {
+                path: b"/bin/hello".to_vec(),
+                node: FileNode::Regular {
+                    size: 64472,
+                    executable: true,
+                },
+            },
+            FileTreeEntry {
+                path: b"/share/doc".to_vec(),
+                node: FileNode::Directory {
+                    size: 3,
+                    contents: (),
+                },
+            },
+            FileTreeEntry {
+                path: b"/bin/sh".to_vec(),
+                node: FileNode::Symlink {
+                    target: Bytes::from_static(b"bash"),
+                },
+            },
+            FileTreeEntry {
+                path: b"/etc/foo".to_vec(),
+                node: FileNode::Regular {
+                    size: 12,
+                    executable: false,
+                },
+            },
+        ];
+
+        for entry in cases {
+            let mut buf = Vec::new();
+            {
+                let mut enc =
+                    frcode::Encoder::new(&mut buf, b"p".to_vec(), b"{}".to_vec()).expect("enc");
+                entry.clone().encode(&mut enc).expect("encode");
+                enc.finish().expect("finish");
+            }
+            // Decode the first line without the package footer / trailing newline.
+            let line = buf
+                .split(|b| *b == b'\n')
+                .next()
+                .expect("line")
+                .to_vec();
+            // Expand frcode: single-entry encoder emits metadata\0diff path
+            // Re-decode via Decoder for a faithful roundtrip.
+            let mut dec = frcode::Decoder::new(std::io::Cursor::new(&buf));
+            let block = dec.decode().expect("decode block");
+            let entry_line = block
+                .split(|b| *b == b'\n')
+                .next()
+                .expect("entry line");
+            // Strip trailing empty etc — the entry line is metadata\0path
+            // but still has no trailing newline in the split piece.
+            let decoded = FileTreeEntry::decode(entry_line).expect("decode entry");
+            assert_eq!(decoded, entry);
+            let _ = line;
+        }
     }
 }
