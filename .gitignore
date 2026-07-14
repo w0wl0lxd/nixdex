@@ -99,3 +99,6 @@ lefthook-local.yml
 # Nextest / sccache local state
 .sccache/
 target-nextest/
+
+# Wave4 / research local DBs
+research/nixdex-db*/

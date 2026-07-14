@@ -1,0 +1,10 @@
+{
+  "entries": {
+    "hello": {
+      "executable": true,
+      "size": 64472,
+      "type": "regular"
+    }
+  },
+  "type": "directory"
+}
