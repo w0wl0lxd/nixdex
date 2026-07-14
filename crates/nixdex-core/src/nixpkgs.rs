@@ -192,14 +192,11 @@ pub async fn run_eval_jobs(options: &EvalJobsOptions<'_>) -> Result<Vec<EvalJobL
     // use --expr for classic `<nixpkgs>` / file paths.
     if options.nixpkgs.starts_with("github:")
         || options.nixpkgs.contains('#')
-        || options.nixpkgs.starts_with('.')
+        || options.nixpkgs.starts_with("path:")
     {
         cmd.arg("--flake").arg(options.nixpkgs);
     } else {
-        cmd.arg("--expr").arg(format!(
-            "import ({}) {{ config = {{ allowAliases = false; }}; }}",
-            nix_string_literal(options.nixpkgs)
-        ));
+        cmd.arg("--expr").arg(eval_expr_for_nixpkgs(options.nixpkgs));
     }
     if let Some(system) = options.system {
         cmd.arg("--system").arg(system);
@@ -317,12 +314,27 @@ pub fn ensure_nixpkgs_path(path: &Path) -> Result<()> {
     }
 }
 
-fn nix_string_literal(value: &str) -> String {
-    // `<nixpkgs>` is a path expression already.
+/// Build a `nix-eval-jobs --expr` argument for a nixpkgs location.
+///
+/// - `<nixpkgs>` gets `import <nixpkgs> { config.allowAliases = false; }`
+/// - existing `.nix` files are imported as attrsets: `import /abs/path.nix`
+/// - other tokens are string-quoted paths under `import "…"`
+fn eval_expr_for_nixpkgs(value: &str) -> String {
     if value.starts_with('<') && value.ends_with('>') {
-        return value.to_string();
+        return format!("import {value} {{ config = {{ allowAliases = false; }}; }}");
     }
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    let path = Path::new(value);
+    if path.is_file() {
+        let abs = match path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => path.to_path_buf(),
+        };
+        return format!("import {}", abs.display());
+    }
+    format!(
+        "import \"{}\" {{ config = {{ allowAliases = false; }}; }}",
+        value.replace('\\', "\\\\").replace('"', "\\\"")
+    )
 }
 
 #[cfg(test)]
