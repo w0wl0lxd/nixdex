@@ -51,8 +51,8 @@ struct Args {
     #[arg(short = 's', long, value_name = "platform")]
     system: Option<String>,
 
-    /// Zstandard compression level.
-    #[arg(short, long = "compression", default_value = "22")]
+    /// Zstandard compression level (1–22).
+    #[arg(short, long = "compression", default_value = "22", value_parser = clap::value_parser!(i32).range(1..=22))]
     compression_level: i32,
 
     /// Show a stack trace in the case of a Nix evaluation error.
@@ -100,8 +100,8 @@ async fn main() -> color_eyre::Result<()> {
         extra_scopes: args.extra_scopes,
     };
 
-    match nixdex_core::update_index(&options).await {
-        Ok(()) => Ok(()),
-        Err(err) => Err(err).wrap_err("nix-index: not yet implemented"),
-    }
+    nixdex_core::update_index(&options)
+        .await
+        .wrap_err("nix-index failed")?;
+    Ok(())
 }
