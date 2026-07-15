@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: check clippy test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: check
+        run: cargo check --all-features
+      - name: clippy
+        run: cargo clippy --all-features -- -D warnings
+      - name: nextest
+        uses: taiki-e/install-action@nextest
+      - name: test
+        run: cargo nextest run --workspace --no-fail-fast
