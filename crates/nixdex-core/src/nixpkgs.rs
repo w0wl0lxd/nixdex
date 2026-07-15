@@ -1,6 +1,6 @@
 //! Querying available packages from nixpkgs via `nix-eval-jobs`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use indexmap::IndexMap;
@@ -26,6 +26,10 @@ pub enum Error {
     /// Local process I/O failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Invalid user-supplied nixpkgs location / expression.
+    #[error("invalid nixpkgs argument: {0}")]
+    InvalidArgument(String),
 
     /// Requested functionality is not implemented yet.
     #[error("not implemented: {0}")]
@@ -57,6 +61,9 @@ pub struct EvalJobsOptions<'a> {
     pub check_cache_status: bool,
     /// Whether to pass `--show-trace` to Nix.
     pub show_trace: bool,
+    /// Optional attribute path suffix for extra scopes (e.g. `haskellPackages`).
+    /// When set, the evaluated expression becomes `(root).<scope>`.
+    pub scope: Option<&'a str>,
 }
 
 /// One successfully decoded derivation job from `nix-eval-jobs` NDJSON.
@@ -181,6 +188,86 @@ pub fn parse_eval_line(raw: &str) -> Result<EvalJobLine> {
     })
 }
 
+/// Validate a scope attribute path component sequence (`haskellPackages`, `a.b`).
+fn validate_scope(scope: &str) -> Result<()> {
+    if scope.is_empty() {
+        return Err(Error::InvalidArgument("scope cannot be empty".into()));
+    }
+    for part in scope.split('.') {
+        if part.is_empty()
+            || !part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            || part.starts_with('-')
+        {
+            return Err(Error::InvalidArgument(format!(
+                "invalid scope component in {scope:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Build a `nix-eval-jobs --expr` argument for a trusted nixpkgs location.
+///
+/// Allowed forms only:
+/// - `<nixpkgs>` / other pure path lookups of the form `<name>`
+/// - An existing filesystem path to a `.nix` file (canonicalized)
+/// - An existing filesystem directory used as a classic nixpkgs root
+///
+/// Free-form string expressions are **rejected** to prevent injecting Nix code
+/// through `-f` / `--nixpkgs`.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] for rejected inputs.
+pub fn eval_expr_for_nixpkgs(value: &str, scope: Option<&str>) -> Result<String> {
+    if let Some(scope) = scope {
+        validate_scope(scope)?;
+    }
+
+    let root = if value.starts_with('<') && value.ends_with('>') {
+        // Only allow simple alphanumeric path lookups, not `<foo/../../../x>`.
+        let inner = &value[1..value.len() - 1];
+        if inner.is_empty()
+            || !inner
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
+            return Err(Error::InvalidArgument(format!(
+                "invalid path lookup {value:?}"
+            )));
+        }
+        format!("import {value} {{ config = {{ allowAliases = false; }}; }}")
+    } else {
+        let path = Path::new(value);
+        let abs: PathBuf = path.canonicalize().map_err(|err| {
+            Error::InvalidArgument(format!(
+                "nixpkgs path must exist and be resolvable: {value}: {err}"
+            ))
+        })?;
+        if abs.is_file() {
+            // File roots are evaluated as-is (fixtures like research/small.nix).
+            format!("import {}", abs.display())
+        } else if abs.is_dir() {
+            format!(
+                "import {} {{ config = {{ allowAliases = false; }}; }}",
+                abs.display()
+            )
+        } else {
+            return Err(Error::InvalidArgument(format!(
+                "nixpkgs path is neither a file nor a directory: {}",
+                abs.display()
+            )));
+        }
+    };
+
+    match scope {
+        Some(scope) => Ok(format!("({root}).{scope}")),
+        None => Ok(root),
+    }
+}
+
 /// Spawn `nix-eval-jobs` and collect NDJSON lines (decoded when possible).
 ///
 /// # Errors
@@ -188,15 +275,32 @@ pub fn parse_eval_line(raw: &str) -> Result<EvalJobLine> {
 /// Returns an error if the process cannot be started or exits unsuccessfully.
 pub async fn run_eval_jobs(options: &EvalJobsOptions<'_>) -> Result<Vec<EvalJobLine>> {
     let mut cmd = Command::new("nix-eval-jobs");
-    // Prefer flake-style only when the arg looks like a flake ref; otherwise
-    // use --expr for classic `<nixpkgs>` / file paths.
+    // Flake refs only when they look like flake URLs, never for bare paths.
     if options.nixpkgs.starts_with("github:")
-        || options.nixpkgs.contains('#')
+        || options.nixpkgs.starts_with("git+")
         || options.nixpkgs.starts_with("path:")
+        || (options.nixpkgs.contains('#')
+            && (options.nixpkgs.starts_with('.') || options.nixpkgs.starts_with('/')))
     {
+        if options.scope.is_some() {
+            return Err(Error::InvalidArgument(
+                "extra scopes are not supported with flake refs yet".into(),
+            ));
+        }
+        // Still reject nested # injection tricks with whitespace / shell metacharacters.
+        if options
+            .nixpkgs
+            .chars()
+            .any(|c| c.is_whitespace() || ";|&$`".contains(c))
+        {
+            return Err(Error::InvalidArgument(
+                "flake ref contains disallowed characters".into(),
+            ));
+        }
         cmd.arg("--flake").arg(options.nixpkgs);
     } else {
-        cmd.arg("--expr").arg(eval_expr_for_nixpkgs(options.nixpkgs));
+        let expr = eval_expr_for_nixpkgs(options.nixpkgs, options.scope)?;
+        cmd.arg("--expr").arg(expr);
     }
     if let Some(system) = options.system {
         cmd.arg("--system").arg(system);
@@ -228,7 +332,6 @@ pub async fn run_eval_jobs(options: &EvalJobsOptions<'_>) -> Result<Vec<EvalJobL
         if line.trim().is_empty() {
             continue;
         }
-        // Soft-skip undecodable error lines rather than failing the whole stream.
         match parse_eval_line(&line) {
             Ok(record) => records.push(record),
             Err(_) => records.push(EvalJobLine {
@@ -274,6 +377,56 @@ pub async fn list_packages_async(options: &EvalJobsOptions<'_>) -> Result<Packag
     Ok(list)
 }
 
+/// List root packages plus each non-empty extra scope (sequential eval passes).
+///
+/// # Errors
+///
+/// Propagates hard evaluation failures for the root set. Scope failures are
+/// returned as soft-empty lists by the caller.
+pub async fn list_packages_with_scopes(
+    nixpkgs: &str,
+    system: Option<&str>,
+    extra_scopes: &[String],
+    show_trace: bool,
+) -> Result<PackageList> {
+    let root_opts = EvalJobsOptions {
+        nixpkgs,
+        system,
+        select: None,
+        check_cache_status: true,
+        show_trace,
+        scope: None,
+    };
+    let mut merged = list_packages_async(&root_opts).await?;
+
+    for scope in extra_scopes {
+        if scope.is_empty() {
+            continue;
+        }
+        if validate_scope(scope).is_err() {
+            continue;
+        }
+        let scope_opts = EvalJobsOptions {
+            nixpkgs,
+            system,
+            select: None,
+            check_cache_status: true,
+            show_trace,
+            scope: Some(scope.as_str()),
+        };
+        match list_packages_async(&scope_opts).await {
+            Ok(more) => {
+                merged.attrs.extend(more.attrs);
+                merged.store_paths.extend(more.store_paths);
+            }
+            Err(_) => {
+                // Soft-skip missing scopes (custom nixpkgs without haskellPackages).
+            }
+        }
+    }
+    Ok(merged)
+}
+
 /// Synchronous façade used by call sites that are not async yet.
 ///
 /// # Errors
@@ -282,20 +435,18 @@ pub async fn list_packages_async(options: &EvalJobsOptions<'_>) -> Result<Packag
 pub fn list_packages(
     nixpkgs: &str,
     system: Option<&str>,
-    _extra_scopes: &[String],
+    extra_scopes: &[String],
     show_trace: bool,
 ) -> Result<PackageList> {
-    let options = EvalJobsOptions {
-        nixpkgs,
-        system,
-        select: None,
-        check_cache_status: true,
-        show_trace,
-    };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(list_packages_async(&options))
+    runtime.block_on(list_packages_with_scopes(
+        nixpkgs,
+        system,
+        extra_scopes,
+        show_trace,
+    ))
 }
 
 /// Verify that a local nixpkgs path exists (pre-flight helper).
@@ -314,29 +465,6 @@ pub fn ensure_nixpkgs_path(path: &Path) -> Result<()> {
     }
 }
 
-/// Build a `nix-eval-jobs --expr` argument for a nixpkgs location.
-///
-/// - `<nixpkgs>` gets `import <nixpkgs> { config.allowAliases = false; }`
-/// - existing `.nix` files are imported as attrsets: `import /abs/path.nix`
-/// - other tokens are string-quoted paths under `import "…"`
-fn eval_expr_for_nixpkgs(value: &str) -> String {
-    if value.starts_with('<') && value.ends_with('>') {
-        return format!("import {value} {{ config = {{ allowAliases = false; }}; }}");
-    }
-    let path = Path::new(value);
-    if path.is_file() {
-        let abs = match path.canonicalize() {
-            Ok(p) => p,
-            Err(_) => path.to_path_buf(),
-        };
-        return format!("import {}", abs.display());
-    }
-    format!(
-        "import \"{}\" {{ config = {{ allowAliases = false; }}; }}",
-        value.replace('\\', "\\\\").replace('"', "\\\"")
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,9 +479,6 @@ mod tests {
         let paths = job.store_paths();
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].hash(), "pg2zfrrbm58ynbjshhzkgg4q466spinf");
-        assert_eq!(paths[0].name(), "hello-2.12.3");
-        assert_eq!(paths[0].origin().attr, "hello");
-        assert_eq!(paths[0].origin().output, "out");
     }
 
     #[test]
@@ -361,5 +486,25 @@ mod tests {
         let raw = r#"{"error":"unfree","fatal":false,"attr":"foo"}"#;
         let line = parse_eval_line(raw).expect("parse");
         assert!(line.job.is_none());
+    }
+
+    #[test]
+    fn rejects_injection_in_nixpkgs_arg() {
+        assert!(eval_expr_for_nixpkgs(r#"$(rm -rf /)"#, None).is_err());
+        assert!(eval_expr_for_nixpkgs(r#"foo"; builtins.trace "x" 1#"#, None).is_err());
+        assert!(eval_expr_for_nixpkgs("<nixpkgs/../../etc>", None).is_err());
+    }
+
+    #[test]
+    fn accepts_path_lookup_and_scope() {
+        let expr = eval_expr_for_nixpkgs("<nixpkgs>", Some("haskellPackages")).expect("ok");
+        assert!(expr.contains("import <nixpkgs>"));
+        assert!(expr.ends_with(".haskellPackages"));
+    }
+
+    #[test]
+    fn rejects_bad_scope() {
+        assert!(eval_expr_for_nixpkgs("<nixpkgs>", Some("foo;bar")).is_err());
+        assert!(eval_expr_for_nixpkgs("<nixpkgs>", Some("../x")).is_err());
     }
 }

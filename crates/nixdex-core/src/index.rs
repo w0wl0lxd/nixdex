@@ -9,7 +9,7 @@ use tracing::{info, warn};
 use crate::database::Writer;
 use crate::errors::{Error, Result};
 use crate::hydra::Fetcher;
-use crate::nixpkgs::{self, EvalJobsOptions};
+use crate::nixpkgs;
 use crate::CACHE_URL;
 
 /// Options controlling an index build.
@@ -85,11 +85,9 @@ impl IndexBuilder {
         let opts = &self.options;
 
         if opts.path_cache {
-            // Full paths.cache (bincode dump of fetched trees) is a development aid
-            // in upstream nix-index. Wave 3 skips persistence and always re-fetches.
-            warn!(
-                "--path-cache is not fully supported yet; continuing without a cache file"
-            );
+            return Err(Error::NotImplemented(
+                "--path-cache is not implemented yet (refusing to silently no-op)",
+            ));
         }
 
         std::fs::create_dir_all(&opts.database).map_err(|source| Error::CreateDatabaseDir {
@@ -105,30 +103,23 @@ impl IndexBuilder {
             }
         })?;
 
-        let eval_opts = EvalJobsOptions {
-            nixpkgs: &opts.nixpkgs,
-            system: opts.system.as_deref(),
-            // Always evaluate the full requested expression. Callers that need a
-            // tiny subset should pass a scoped nixpkgs expression (see research/).
-            select: None,
-            check_cache_status: true,
-            show_trace: opts.show_trace,
-        };
-
-        let packages = nixpkgs::list_packages_async(&eval_opts)
-            .await
-            .map_err(|source| Error::QueryPackages {
-                source: Box::new(source),
-            })?;
+        // Root set + each extra scope (mirrors upstream nix-index multi-query).
+        let packages = nixpkgs::list_packages_with_scopes(
+            &opts.nixpkgs,
+            opts.system.as_deref(),
+            &opts.extra_scopes,
+            opts.show_trace,
+        )
+        .await
+        .map_err(|source| Error::QueryPackages {
+            source: Box::new(source),
+        })?;
 
         info!(
             packages = packages.store_paths.len(),
+            scopes = opts.extra_scopes.len(),
             "listed store paths from nixpkgs"
         );
-
-        // extra_scopes are currently only documented for the CLI; evaluation of
-        // nested attrsets beyond the root select will need a richer evaluator.
-        let _ = &opts.extra_scopes;
 
         let fetcher = Fetcher::new(CACHE_URL).map_err(|err| {
             Error::Io(std::io::Error::other(format!(
