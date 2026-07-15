@@ -188,8 +188,6 @@ fn main() -> color_eyre::Result<()> {
         mode: args.mode,
     };
 
-    match nixdex_core::search_database(&options) {
-        Ok(()) => Ok(()),
-        Err(err) => Err(err).wrap_err("nix-locate: not yet implemented"),
-    }
+    nixdex_core::search_database(&options).wrap_err("nix-locate failed")?;
+    Ok(())
 }
