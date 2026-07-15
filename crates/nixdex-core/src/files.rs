@@ -279,9 +279,17 @@ impl FileTree {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::Parse`] when the JSON is invalid or the schema is unexpected.
+    /// Returns [`crate::Error::Parse`] when the JSON is invalid, oversized, too deep,
+    /// or the schema is unexpected.
     pub fn from_ls_json(bytes: &[u8]) -> crate::Result<Self> {
-        from_ls_json_inner(bytes).map_err(crate::Error::Parse)
+        const MAX_LS_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
+        if bytes.len() > MAX_LS_BYTES {
+            return Err(crate::Error::Parse(format!(
+                ".ls payload too large: {} bytes (max {MAX_LS_BYTES})",
+                bytes.len()
+            )));
+        }
+        from_ls_json_inner(bytes, 0).map_err(crate::Error::Parse)
     }
 
     /// List all entries whose path starts with `filter_prefix`.
@@ -336,17 +344,22 @@ struct LsRoot {
     root: LsNode,
 }
 
-fn from_ls_json_inner(bytes: &[u8]) -> Result<FileTree, String> {
+fn from_ls_json_inner(bytes: &[u8], depth: u32) -> Result<FileTree, String> {
     // Prefer full document with `root`; fall back to bare node.
     if let Ok(doc) = sonic_rs::from_slice::<LsRoot>(bytes) {
-        return ls_node_to_tree(doc.root);
+        return ls_node_to_tree(doc.root, depth);
     }
     let node: LsNode =
         sonic_rs::from_slice(bytes).map_err(|err| format!(".ls JSON parse: {err}"))?;
-    ls_node_to_tree(node)
+    ls_node_to_tree(node, depth)
 }
 
-fn ls_node_to_tree(node: LsNode) -> Result<FileTree, String> {
+const MAX_LS_DEPTH: u32 = 64;
+
+fn ls_node_to_tree(node: LsNode, depth: u32) -> Result<FileTree, String> {
+    if depth > MAX_LS_DEPTH {
+        return Err(format!(".ls tree exceeds max depth {MAX_LS_DEPTH}"));
+    }
     match node.kind.as_str() {
         "regular" => {
             let size = match node.size {
@@ -369,7 +382,11 @@ fn ls_node_to_tree(node: LsNode) -> Result<FileTree, String> {
             };
             let mut entries = Vec::with_capacity(map.len());
             for (name, child) in map {
-                let child_tree = ls_node_to_tree(child)?;
+                // Directory entry names from the cache must be single path components.
+                if name.contains('/') || name.contains('\\') || name == ".." || name == "." {
+                    return Err(format!("invalid directory entry name: {name:?}"));
+                }
+                let child_tree = ls_node_to_tree(child, depth + 1)?;
                 entries.push((Bytes::from(name.into_bytes()), child_tree));
             }
             Ok(FileTree::directory(entries))
@@ -385,7 +402,7 @@ mod tests {
     #[test]
     fn parse_sample_ls_bin() {
         let json = br#"{"entries":{"hello":{"executable":true,"size":64472,"type":"regular"}},"type":"directory"}"#;
-        let tree = from_ls_json_inner(json).expect("parse");
+        let tree = from_ls_json_inner(json, 0).expect("parse");
         let list = tree.to_list(b"");
         assert!(list.iter().any(|e| e.path == b"/hello"));
         let hello = list.iter().find(|e| e.path == b"/hello").expect("hello");
@@ -395,9 +412,15 @@ mod tests {
     #[test]
     fn parse_full_root_document() {
         let json = br#"{"root":{"type":"directory","entries":{"bin":{"type":"directory","entries":{"hello":{"type":"regular","size":1,"executable":true}}}}}}"#;
-        let tree = from_ls_json_inner(json).expect("parse");
+        let tree = from_ls_json_inner(json, 0).expect("parse");
         let list = tree.to_list(b"/bin");
         assert!(list.iter().any(|e| e.path == b"/bin/hello"));
+    }
+
+    #[test]
+    fn rejects_traversal_entry_names() {
+        let json = br#"{"type":"directory","entries":{"..":{"type":"regular","size":1,"executable":false}}}"#;
+        assert!(from_ls_json_inner(json, 0).is_err());
     }
 
     #[test]
