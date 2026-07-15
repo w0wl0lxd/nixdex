@@ -13,6 +13,8 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use regex::bytes::Regex;
 use thiserror::Error;
 
+use indexmap::IndexSet;
+
 use crate::files::{FileNode, FileTree, FileTreeEntry, FileType};
 use crate::frcode;
 use crate::store_path::StorePath;
@@ -371,8 +373,8 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
             source: Box::new(source),
         })?;
 
-    // Track printed attrs for --minimal de-duplication without HashSet.
-    let mut printed_attrs: Vec<String> = Vec::new();
+    // Track printed attrs for --minimal de-duplication (ordered set).
+    let mut printed_attrs: IndexSet<String> = IndexSet::new();
 
     for (store_path, FileTreeEntry { path, node }) in results {
         // Grouping: only print if the last regex match ends in the final path component.
@@ -413,9 +415,8 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
 
         match options.mode {
             SearchMode::Minimal => {
-                if !printed_attrs.iter().any(|a| a == &attr) {
+                if printed_attrs.insert(attr.clone()) {
                     println!("{attr}");
-                    printed_attrs.push(attr);
                 }
             }
             SearchMode::Full { color, .. } => {
