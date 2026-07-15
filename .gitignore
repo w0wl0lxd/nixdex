@@ -102,3 +102,6 @@ target-nextest/
 
 # Wave4 / research local DBs
 research/nixdex-db*/
+
+# Private local planning (never commit)
+.plan/
