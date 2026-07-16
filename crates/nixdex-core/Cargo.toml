@@ -28,6 +28,10 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 indicatif = { workspace = true }
 indexmap = { workspace = true }
+ahash = { workspace = true }
+papaya = { workspace = true }
+scc = { workspace = true }
+quanta = { workspace = true }
 byteorder = { workspace = true }
 regex = { workspace = true }
 clap = { workspace = true, optional = true }

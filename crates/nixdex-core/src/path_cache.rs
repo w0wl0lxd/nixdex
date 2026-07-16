@@ -3,13 +3,18 @@
 //! The cache is stored beside the database as `paths.cache`. It is keyed by
 //! store-path hash and records the `FileTree`, runtime references, and a
 //! timestamp so a rebuild can skip HTTP fetches for unchanged closures.
+//!
+//! The in-memory representation uses a lock-free [`papaya::HashMap`] so the
+//! cache can be shared directly between async fetch workers.
 
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
+use std::sync::atomic::AtomicUsize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use indexmap::IndexMap;
+use ahash::RandomState;
+use papaya::HashMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -52,12 +57,15 @@ struct Payload {
 }
 
 /// In-memory path cache keyed by store-path hash.
+///
+/// `PathCache` is `Sync` and is intended to be shared via `Arc` across the
+/// fetch worker pool. Lookups and inserts are lock-free.
 #[derive(Debug)]
 pub struct PathCache {
     cache_key: String,
-    entries: IndexMap<String, CachedEntry>,
+    map: HashMap<String, CachedEntry, RandomState>,
     /// Number of successful cache lookups during this build.
-    pub hits: usize,
+    pub hits: AtomicUsize,
 }
 
 /// Errors that can occur when reading or writing a path cache.
@@ -92,8 +100,8 @@ impl PathCache {
     pub fn new(cache_key: impl Into<String>) -> Self {
         Self {
             cache_key: cache_key.into(),
-            entries: IndexMap::new(),
-            hits: 0,
+            map: HashMap::with_hasher(RandomState::new()),
+            hits: AtomicUsize::new(0),
         }
     }
 
@@ -140,10 +148,10 @@ impl PathCache {
             return Ok(None);
         }
 
-        let mut cache = Self::new(expected_key);
+        let cache = Self::new(expected_key);
         for entry in payload.entries {
             let key = entry.store_path.hash().to_string();
-            cache.entries.insert(key, entry);
+            let _ = cache.map.pin().insert(key, entry);
         }
         Ok(Some(cache))
     }
@@ -160,9 +168,15 @@ impl PathCache {
             let mut writer = BufWriter::new(file);
             writer.write_all(MAGIC)?;
             writer.write_all(&VERSION.to_le_bytes())?;
+            let entries: Vec<CachedEntry> = self
+                .map
+                .pin()
+                .iter()
+                .map(|(_, entry)| entry.clone())
+                .collect();
             let payload = Payload {
                 cache_key: self.cache_key.clone(),
-                entries: self.entries.values().cloned().collect(),
+                entries,
             };
             let bytes =
                 postcard::to_stdvec(&payload).map_err(|e| Error::Postcard(e.to_string()))?;
@@ -173,21 +187,33 @@ impl PathCache {
         Ok(())
     }
 
-    /// Look up an entry by store-path hash.
+    /// Look up an entry by store-path hash, returning a cloned copy if found.
     #[must_use]
-    pub fn get(&self, hash: &str) -> Option<&CachedEntry> {
-        self.entries.get(hash)
+    pub fn get(&self, hash: &str) -> Option<CachedEntry> {
+        self.map.pin().get(hash).cloned()
     }
 
-    /// Look up a mutable entry by store-path hash.
+    /// Look up the cached narinfo references for a store-path hash.
     #[must_use]
-    pub fn get_mut(&mut self, hash: &str) -> Option<&mut CachedEntry> {
-        self.entries.get_mut(hash)
+    pub fn get_refs(&self, hash: &str) -> Option<Vec<StorePath>> {
+        self.map
+            .pin()
+            .get(hash)
+            .and_then(|entry| entry.refs.clone())
+    }
+
+    /// Look up the cached `.ls` tree for a store-path hash.
+    #[must_use]
+    pub fn get_tree(&self, hash: &str) -> Option<FileTree> {
+        self.map
+            .pin()
+            .get(hash)
+            .and_then(|entry| entry.tree.clone())
     }
 
     /// Insert or replace an entry keyed by its store-path hash.
-    pub fn insert(&mut self, hash: impl Into<String>, entry: CachedEntry) -> Option<CachedEntry> {
-        self.entries.insert(hash.into(), entry)
+    pub fn insert(&self, hash: impl Into<String>, entry: CachedEntry) {
+        let _ = self.map.pin().insert(hash.into(), entry);
     }
 }
 
@@ -214,7 +240,7 @@ mod tests {
         let path = dir.path().join("paths.cache");
 
         let sp = sample_path();
-        let mut cache = PathCache::new("<nixpkgs>");
+        let cache = PathCache::new("<nixpkgs>");
         let mut entry = CachedEntry::new(sp.clone());
         entry.tree = Some(FileTree::directory(vec![]));
         entry.refs = Some(vec![]);
@@ -237,8 +263,9 @@ mod tests {
         let path = dir.path().join("paths.cache");
 
         let sp = sample_path();
-        let mut cache = PathCache::new("key-a");
-        cache.insert(sp.hash().to_string(), CachedEntry::new(sp.clone()));
+        let cache = PathCache::new("key-a");
+        let hash = sp.hash().to_string();
+        cache.insert(hash, CachedEntry::new(sp));
         cache.save(&path).expect("save");
 
         assert!(PathCache::load(&path, "key-b").expect("load").is_none());

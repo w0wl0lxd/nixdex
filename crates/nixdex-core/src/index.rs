@@ -1,10 +1,11 @@
 //! Building a nixdex index from nixpkgs and the binary cache.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use indicatif::{MultiProgress, ProgressBar};
-use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::CACHE_URL;
@@ -12,7 +13,7 @@ use crate::database::Writer;
 use crate::errors::{Error, Result};
 use crate::hydra::Fetcher;
 use crate::listings;
-use crate::nixpkgs;
+use crate::nixpkgs::{self, PackageList};
 use crate::path_cache::PathCache;
 
 /// Options controlling an index build.
@@ -104,31 +105,14 @@ impl IndexBuilder {
             source,
         })?;
 
+        let clock = quanta::Clock::new();
+
         let cache_path = opts.database.join("paths.cache");
-        let cache_key = if let Some(key) = opts.cache_key.as_deref() {
-            key
-        } else {
-            &opts.nixpkgs
+        let cache_key = match opts.cache_key.as_deref() {
+            Some(key) => key,
+            None => &opts.nixpkgs,
         };
-        let path_cache: Option<Arc<Mutex<PathCache>>> = if opts.path_cache {
-            if opts.force {
-                Some(Arc::new(Mutex::new(PathCache::new(cache_key))))
-            } else {
-                match PathCache::load(&cache_path, cache_key) {
-                    Ok(Some(cache)) => Some(Arc::new(Mutex::new(cache))),
-                    Ok(None) => {
-                        info!(cache_key, "path cache not found or stale; starting fresh");
-                        Some(Arc::new(Mutex::new(PathCache::new(cache_key))))
-                    }
-                    Err(err) => {
-                        warn!(error = %err, "failed to load path cache; starting fresh");
-                        Some(Arc::new(Mutex::new(PathCache::new(cache_key))))
-                    }
-                }
-            }
-        } else {
-            None
-        };
+        let path_cache = load_path_cache(&cache_path, cache_key, opts.path_cache, opts.force);
 
         let db_file = opts.database.join("files");
         let mut writer =
@@ -140,9 +124,9 @@ impl IndexBuilder {
 
         let progress = MultiProgress::new();
 
-        // Root set + each extra scope (mirrors upstream nix-index multi-query).
         let eval_pb = progress.add(ProgressBar::new_spinner());
         eval_pb.set_message("Evaluating nixpkgs...");
+        let eval_start = clock.now();
         let packages = nixpkgs::list_packages_with_scopes(
             &opts.nixpkgs,
             opts.system.as_deref(),
@@ -154,7 +138,12 @@ impl IndexBuilder {
         .map_err(|source| Error::QueryPackages {
             source: Box::new(source),
         })?;
-        eval_pb.finish_with_message(format!("Evaluated {} package(s)", packages.packages.len()));
+        let eval_elapsed = eval_start.elapsed();
+        eval_pb.finish_with_message(format!(
+            "Evaluated {} package(s) in {:?}",
+            packages.packages.len(),
+            eval_elapsed
+        ));
 
         let fetcher = Fetcher::new(CACHE_URL).map_err(|err| {
             Error::Io(std::io::Error::other(format!(
@@ -162,78 +151,31 @@ impl IndexBuilder {
             )))
         })?;
 
-        let jobs = opts.jobs.max(1);
+        let starting_set = build_starting_set(packages);
         let filter_prefix = opts.filter_prefix.as_bytes().to_vec();
+        let (indexed, failed, fetch_elapsed) = write_listings(
+            &mut writer,
+            &fetcher,
+            opts.jobs.max(1),
+            starting_set,
+            path_cache.clone(),
+            filter_prefix,
+            &db_file,
+            &progress,
+        )
+        .await?;
 
-        let starting_set = packages
-            .packages
-            .into_iter()
-            .flat_map(|pkg| {
-                let main_program = pkg.main_program.clone();
-                pkg.store_paths.into_iter().map(move |path| {
-                    let mp = if path.origin().output == "out" {
-                        main_program.clone()
-                    } else {
-                        None
-                    };
-                    listings::PackageEntry {
-                        path,
-                        main_program: mp,
-                    }
-                })
-            })
-            .collect();
-
-        let fetch_pb = progress.add(ProgressBar::new_spinner());
-        fetch_pb.set_message("Fetching listings...");
-
-        let mut listings =
-            listings::fetch_listings(&fetcher, jobs, starting_set, path_cache.clone())
-                .await
-                .map_err(|source| {
-                    Error::Io(std::io::Error::other(format!(
-                        "failed to start listing fetcher: {source}"
-                    )))
-                })?;
-
-        let mut indexed = 0usize;
-        let mut failed = 0usize;
-        while let Some(result) = listings.recv().await {
-            match result {
-                Ok((store_path, tree)) => {
-                    writer
-                        .add(&store_path, &tree, &filter_prefix)
-                        .map_err(|source| Error::WriteDatabase {
-                            path: db_file.clone(),
-                            source: Box::new(source),
-                        })?;
-                    indexed += 1;
-                }
-                Err(err) => {
-                    warn!(error = %err, "closure fetch yielded an error; skipping");
-                    failed += 1;
-                }
-            }
-            fetch_pb.set_message(format!("Indexed {indexed}, failed {failed}"));
-            fetch_pb.inc(1);
-        }
-        fetch_pb.finish_with_message(format!("Fetched {indexed} listings ({failed} failed)"));
-
-        let cached = if let Some(pc) = path_cache.as_ref() {
-            pc.lock().await.hits
-        } else {
-            0
-        };
+        let cached = path_cache
+            .as_ref()
+            .map_or(0, |pc| pc.hits.load(Ordering::Relaxed));
 
         if opts.path_cache {
-            match path_cache {
-                Some(pc) => {
-                    let cache = pc.lock().await;
-                    if let Err(err) = cache.save(&cache_path) {
-                        warn!(error = %err, "failed to save path cache");
-                    }
+            if let Some(pc) = path_cache.as_ref() {
+                if let Err(err) = pc.save(&cache_path) {
+                    warn!(error = %err, "failed to save path cache");
                 }
-                None => warn!("path cache enabled but not initialized"),
+            } else {
+                warn!("path cache enabled but not initialized");
             }
         }
 
@@ -242,16 +184,119 @@ impl IndexBuilder {
             source: Box::new(source),
         })?;
 
+        let bytes_downloaded = fetcher.bytes_downloaded();
+
         info!(
             indexed,
             failed,
             cached,
+            bytes_downloaded,
             size_bytes = size,
+            ?eval_elapsed,
+            ?fetch_elapsed,
             db = %db_file.display(),
             "index build complete"
         );
         Ok(())
     }
+}
+
+fn load_path_cache(
+    cache_path: &Path,
+    cache_key: &str,
+    enabled: bool,
+    force: bool,
+) -> Option<Arc<PathCache>> {
+    if !enabled {
+        return None;
+    }
+    if force {
+        return Some(Arc::new(PathCache::new(cache_key)));
+    }
+    match PathCache::load(cache_path, cache_key) {
+        Ok(Some(cache)) => Some(Arc::new(cache)),
+        Ok(None) => {
+            info!(cache_key, "path cache not found or stale; starting fresh");
+            Some(Arc::new(PathCache::new(cache_key)))
+        }
+        Err(err) => {
+            warn!(error = %err, "failed to load path cache; starting fresh");
+            Some(Arc::new(PathCache::new(cache_key)))
+        }
+    }
+}
+
+fn build_starting_set(packages: PackageList) -> Vec<listings::PackageEntry> {
+    packages
+        .packages
+        .into_iter()
+        .flat_map(|pkg| {
+            let main_program = pkg.main_program.clone();
+            pkg.store_paths.into_iter().map(move |path| {
+                let mp = if path.origin().output == "out" {
+                    main_program.clone()
+                } else {
+                    None
+                };
+                listings::PackageEntry {
+                    path,
+                    main_program: mp,
+                }
+            })
+        })
+        .collect()
+}
+
+async fn write_listings(
+    writer: &mut Writer,
+    fetcher: &Fetcher,
+    jobs: usize,
+    starting_set: Vec<listings::PackageEntry>,
+    path_cache: Option<Arc<PathCache>>,
+    filter_prefix: Vec<u8>,
+    db_file: &Path,
+    progress: &MultiProgress,
+) -> Result<(usize, usize, Duration)> {
+    let fetch_pb = progress.add(ProgressBar::new_spinner());
+    fetch_pb.set_message("Fetching listings...");
+    let fetch_start = quanta::Instant::now();
+
+    let mut listings = listings::fetch_listings(fetcher, jobs, starting_set, path_cache)
+        .await
+        .map_err(|source| {
+            Error::Io(std::io::Error::other(format!(
+                "failed to start listing fetcher: {source}"
+            )))
+        })?;
+
+    let mut indexed = 0usize;
+    let mut failed = 0usize;
+    while let Some(result) = listings.recv().await {
+        match result {
+            Ok((store_path, tree)) => {
+                writer
+                    .add(&store_path, &tree, &filter_prefix)
+                    .map_err(|source| Error::WriteDatabase {
+                        path: db_file.to_path_buf(),
+                        source: Box::new(source),
+                    })?;
+                indexed += 1;
+            }
+            Err(err) => {
+                warn!(error = %err, "closure fetch yielded an error; skipping");
+                failed += 1;
+            }
+        }
+        fetch_pb.set_message(format!("Indexed {indexed}, failed {failed}"));
+        fetch_pb.inc(1);
+    }
+    let fetch_elapsed = fetch_start.elapsed();
+    fetch_pb.finish_with_message(format!(
+        "Fetched {indexed} listings ({failed} failed) in {:?}",
+        fetch_elapsed
+    ));
+
+    Ok((indexed, failed, fetch_elapsed))
 }
 
 /// Build or update the nixdex index.

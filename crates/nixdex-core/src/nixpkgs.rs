@@ -271,9 +271,8 @@ pub fn eval_expr_for_nixpkgs(value: &str, scope: Option<&str>) -> Result<String>
         validate_scope(scope)?;
     }
 
-    let root = if value.starts_with('<') && value.ends_with('>') {
+    let root = if let Some(inner) = value.strip_prefix('<').and_then(|v| v.strip_suffix('>')) {
         // Only allow simple alphanumeric path lookups, not `<foo/../../../x>`.
-        let inner = &value[1..value.len() - 1];
         if inner.is_empty()
             || !inner
                 .chars()
