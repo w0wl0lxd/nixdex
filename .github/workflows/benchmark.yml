@@ -37,8 +37,15 @@ jobs:
     name: SearchDb criterion benchmark
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      SCCACHE_DIR: /home/runner/.cache/sccache
+      SCCACHE_CACHE_SIZE: 2G
     steps:
       - uses: actions/checkout@v4
+      - name: Install build tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sccache clang mold
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run SearchDb criterion benchmark
@@ -56,8 +63,15 @@ jobs:
     if: github.event_name != 'pull_request'
     timeout-minutes: 360
     needs: searchdb-benchmark
+    env:
+      SCCACHE_DIR: /home/runner/.cache/sccache
+      SCCACHE_CACHE_SIZE: 2G
     steps:
       - uses: actions/checkout@v4
+      - name: Install build tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sccache clang mold
       - uses: cachix/install-nix-action@v27
         with:
           nix_path: nixpkgs=channel:nixos-unstable
