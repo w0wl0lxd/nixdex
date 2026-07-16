@@ -38,6 +38,14 @@ pub struct CachedEntry {
 }
 
 impl CachedEntry {
+    /// Check if this entry is expired given a TTL in seconds.
+    #[must_use]
+    pub fn is_expired(&self, ttl_secs: u64) -> bool {
+        let now = now_secs();
+        let age = now.saturating_sub(self.fetched_at);
+        age > ttl_secs
+    }
+
     /// Create a new entry for `store_path` with no tree or refs yet.
     #[must_use]
     pub fn new(store_path: StorePath) -> Self {
@@ -53,6 +61,7 @@ impl CachedEntry {
 #[derive(Debug, Serialize, Deserialize)]
 struct Payload {
     cache_key: String,
+    ttl_secs: u64,
     entries: Vec<CachedEntry>,
 }
 
@@ -60,6 +69,7 @@ struct Payload {
 #[derive(Serialize)]
 struct SerializePayload<'a> {
     cache_key: &'a str,
+    ttl_secs: u64,
     entries: Vec<&'a CachedEntry>,
 }
 
@@ -73,6 +83,8 @@ pub struct PathCache {
     map: HashMap<String, CachedEntry, RandomState>,
     /// Number of successful cache lookups during this build.
     pub hits: AtomicUsize,
+    /// Time-to-live for cache entries in seconds (0 = no expiry).
+    ttl_secs: u64,
 }
 
 /// Errors that can occur when reading or writing a path cache.
@@ -103,12 +115,28 @@ impl PathCache {
     ///
     /// The key is written into the cache file and checked on load; a mismatch
     /// treats the cache as stale and causes a rebuild.
+    ///
+    /// `ttl_secs` is the time-to-live for cache entries in seconds (0 = no expiry).
     #[must_use]
     pub fn new(cache_key: impl Into<String>) -> Self {
         Self {
             cache_key: cache_key.into(),
             map: HashMap::with_hasher(RandomState::new()),
             hits: AtomicUsize::new(0),
+            ttl_secs: 7 * 24 * 60 * 60, // 7 days default
+        }
+    }
+
+    /// Create an empty cache with a custom TTL.
+    ///
+    /// `ttl_secs` is the time-to-live for cache entries in seconds (0 = no expiry).
+    #[must_use]
+    pub fn new_with_ttl(cache_key: impl Into<String>, ttl_secs: u64) -> Self {
+        Self {
+            cache_key: cache_key.into(),
+            map: HashMap::with_hasher(RandomState::new()),
+            hits: AtomicUsize::new(0),
+            ttl_secs,
         }
     }
 
@@ -118,9 +146,17 @@ impl PathCache {
         &self.cache_key
     }
 
+    /// Return the configured TTL in seconds (0 = no expiry).
+    #[must_use]
+    pub fn ttl_secs(&self) -> u64 {
+        self.ttl_secs
+    }
+
     /// Load a cache from `path`, returning `Ok(None)` if the file is missing,
     /// the header magic/version are wrong, or the stored `cache_key` does not
     /// match `expected_key`.
+    ///
+    /// Expired entries are filtered out based on the stored TTL.
     ///
     /// # Errors
     ///
@@ -155,13 +191,26 @@ impl PathCache {
             return Ok(None);
         }
 
-        let cache = Self::new(expected_key);
+        let cache = Self::new_with_ttl(expected_key, payload.ttl_secs);
+        let total_entries = payload.entries.len();
+        let mut expired_count = 0usize;
         {
             let map = cache.map.pin();
             for entry in payload.entries {
+                if entry.is_expired(cache.ttl_secs) {
+                    expired_count += 1;
+                    continue;
+                }
                 let key = entry.store_path.hash().to_string();
                 let _ = map.insert(key, entry);
             }
+        }
+        if expired_count > 0 {
+            tracing::info!(
+                expired_count,
+                total = total_entries,
+                "filtered expired entries from path cache"
+            );
         }
         Ok(Some(cache))
     }
@@ -182,6 +231,7 @@ impl PathCache {
             let entries: Vec<&CachedEntry> = map.iter().map(|(_, entry)| entry).collect();
             let payload = SerializePayload {
                 cache_key: &self.cache_key,
+                ttl_secs: self.ttl_secs,
                 entries,
             };
             let bytes =
@@ -193,28 +243,37 @@ impl PathCache {
         Ok(())
     }
 
-    /// Look up an entry by store-path hash, returning a cloned copy if found.
+    /// Look up an entry by store-path hash, returning a cloned copy if found and not expired.
     #[must_use]
     pub fn get(&self, hash: &str) -> Option<CachedEntry> {
-        self.map.pin().get(hash).cloned()
+        let map = self.map.pin();
+        let entry = map.get(hash)?;
+        if entry.is_expired(self.ttl_secs) {
+            return None;
+        }
+        Some(entry.clone())
     }
 
     /// Look up the cached narinfo references for a store-path hash.
     #[must_use]
     pub fn get_refs(&self, hash: &str) -> Option<Vec<StorePath>> {
-        self.map
-            .pin()
-            .get(hash)
-            .and_then(|entry| entry.refs.clone())
+        let map = self.map.pin();
+        let entry = map.get(hash)?;
+        if entry.is_expired(self.ttl_secs) {
+            return None;
+        }
+        entry.refs.clone()
     }
 
     /// Look up the cached `.ls` tree for a store-path hash.
     #[must_use]
     pub fn get_tree(&self, hash: &str) -> Option<FileTree> {
-        self.map
-            .pin()
-            .get(hash)
-            .and_then(|entry| entry.tree.clone())
+        let map = self.map.pin();
+        let entry = map.get(hash)?;
+        if entry.is_expired(self.ttl_secs) {
+            return None;
+        }
+        entry.tree.clone()
     }
 
     /// Insert or replace an entry keyed by its store-path hash.
@@ -257,6 +316,7 @@ mod tests {
             .expect("load")
             .expect("cache exists");
         assert_eq!(loaded.cache_key(), "<nixpkgs>");
+        assert_eq!(loaded.ttl_secs(), 7 * 24 * 60 * 60);
         let found = loaded.get(sp.hash()).expect("entry");
         assert_eq!(found.store_path.hash(), sp.hash());
         assert!(found.tree.is_some());
@@ -375,5 +435,38 @@ mod tests {
         let now = now_secs();
         assert!(entry.fetched_at <= now);
         assert!(entry.fetched_at > now.saturating_sub(60));
+    }
+
+    #[test]
+    fn expired_entries_are_filtered_on_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("paths.cache");
+
+        let sp = sample_path();
+        let cache = PathCache::new_with_ttl("key", 1); // 1 second TTL
+        let mut entry = CachedEntry::new(sp.clone());
+        entry.tree = Some(FileTree::directory(vec![]));
+        entry.fetched_at = now_secs().saturating_sub(10); // 10 seconds ago
+        cache.insert(sp.hash(), entry);
+        cache.save(&path).expect("save");
+
+        let loaded = PathCache::load(&path, "key")
+            .expect("load")
+            .expect("cache exists");
+        assert!(loaded.get(sp.hash()).is_none());
+    }
+
+    #[test]
+    fn expired_entries_are_filtered_on_lookup() {
+        let sp = sample_path();
+        let cache = PathCache::new_with_ttl("key", 1); // 1 second TTL
+        let mut entry = CachedEntry::new(sp.clone());
+        entry.tree = Some(FileTree::directory(vec![]));
+        entry.fetched_at = now_secs().saturating_sub(10); // 10 seconds ago
+        cache.insert(sp.hash(), entry);
+
+        assert!(cache.get(sp.hash()).is_none());
+        assert!(cache.get_tree(sp.hash()).is_none());
+        assert!(cache.get_refs(sp.hash()).is_none());
     }
 }
