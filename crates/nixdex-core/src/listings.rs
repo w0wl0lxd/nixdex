@@ -12,6 +12,7 @@ use tracing::warn;
 use crate::errors::Result;
 use crate::files::FileTree;
 use crate::hydra::{self, Fetcher};
+use crate::path_cache::{CachedEntry, PathCache};
 use crate::store_path::StorePath;
 
 /// A root path together with an optional `meta.mainProgram` value.
@@ -95,6 +96,77 @@ impl ListingSource for Fetcher {
     }
 }
 
+/// A [`ListingSource`] that consults a `paths.cache` sidecar before hitting the
+/// network and persists new results back into the cache.
+#[derive(Debug, Clone)]
+struct CachedSource {
+    inner: Fetcher,
+    cache: Arc<Mutex<PathCache>>,
+}
+
+#[allow(clippy::manual_async_fn)]
+impl ListingSource for CachedSource {
+    fn fetch_narinfo_details<'a>(
+        &'a self,
+        path: &'a StorePath,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<(Vec<StorePath>, Option<String>), hydra::Error>,
+    > + Send {
+        async move {
+            let hash = path.hash().to_string();
+            if let Some(refs) = {
+                let cache = self.cache.lock().await;
+                cache.get(&hash).and_then(|e| e.refs.clone())
+            } {
+                let mut cache = self.cache.lock().await;
+                cache.hits += 1;
+                return Ok((refs, None));
+            }
+
+            let (refs, nar_url) = self.inner.fetch_narinfo_details(path).await?;
+            {
+                let mut cache = self.cache.lock().await;
+                let mut entry = CachedEntry::new(path.clone());
+                if let Some(existing) = cache.get_mut(&hash) {
+                    entry = existing.clone();
+                }
+                entry.refs = Some(refs.clone());
+                cache.insert(hash, entry);
+            }
+            Ok((refs, nar_url))
+        }
+    }
+
+    fn fetch_file_tree<'a>(
+        &'a self,
+        path: &'a StorePath,
+    ) -> impl std::future::Future<Output = std::result::Result<FileTree, hydra::Error>> + Send {
+        async move {
+            let hash = path.hash().to_string();
+            if let Some(tree) = {
+                let cache = self.cache.lock().await;
+                cache.get(&hash).and_then(|e| e.tree.clone())
+            } {
+                let mut cache = self.cache.lock().await;
+                cache.hits += 1;
+                return Ok(tree);
+            }
+
+            let tree = self.inner.fetch_file_tree(path).await?;
+            {
+                let mut cache = self.cache.lock().await;
+                let mut entry = CachedEntry::new(path.clone());
+                if let Some(existing) = cache.get_mut(&hash) {
+                    entry = existing.clone();
+                }
+                entry.tree = Some(tree.clone());
+                cache.insert(hash, entry);
+            }
+            Ok(tree)
+        }
+    }
+}
+
 /// Fetch `.ls` listings recursively over the runtime closure of `starting_set`.
 ///
 /// The returned receiver yields every store path whose `.ls` listing could be
@@ -105,13 +177,26 @@ impl ListingSource for Fetcher {
 /// narinfo causes a synthetic `/bin/<main_program>` listing to be emitted
 /// instead of being skipped.
 ///
+/// When `path_cache` is `Some`, fetched narinfo references and `.ls` trees are
+/// looked up from the cache before making HTTP requests and written back on
+/// misses.
+///
 /// Concurrency is bounded by `jobs` (clamped to at least 1).
 pub async fn fetch_listings(
     fetcher: &Fetcher,
     jobs: usize,
     starting_set: Vec<PackageEntry>,
+    path_cache: Option<Arc<Mutex<PathCache>>>,
 ) -> Result<mpsc::Receiver<Result<ListingItem>>> {
-    fetch_listings_with_source(fetcher, jobs, starting_set).await
+    if let Some(cache) = path_cache {
+        let source = CachedSource {
+            inner: fetcher.clone(),
+            cache,
+        };
+        fetch_listings_with_source(&source, jobs, starting_set).await
+    } else {
+        fetch_listings_with_source(fetcher, jobs, starting_set).await
+    }
 }
 
 async fn fetch_listings_with_source<S: ListingSource>(

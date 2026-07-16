@@ -1,7 +1,10 @@
 //! Building a nixdex index from nixpkgs and the binary cache.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use indicatif::{MultiProgress, ProgressBar};
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::CACHE_URL;
@@ -10,6 +13,7 @@ use crate::errors::{Error, Result};
 use crate::hydra::Fetcher;
 use crate::listings;
 use crate::nixpkgs;
+use crate::path_cache::PathCache;
 
 /// Options controlling an index build.
 #[derive(Debug, Clone)]
@@ -32,6 +36,12 @@ pub struct UpdateOptions {
     pub filter_prefix: String,
     /// Persist intermediate fetch results into `paths.cache`.
     pub path_cache: bool,
+    /// Ignore the existing `paths.cache` and re-fetch all store paths.
+    pub force: bool,
+    /// Cache-key used to identify a `paths.cache` file; defaults to `nixpkgs`.
+    pub cache_key: Option<String>,
+    /// Synthesize `/bin/<mainProgram>` listings from `meta.mainProgram`.
+    pub main_program: bool,
     /// Extra attribute scopes to walk during evaluation.
     pub extra_scopes: Vec<String>,
 }
@@ -48,6 +58,9 @@ impl Default for UpdateOptions {
             show_trace: false,
             filter_prefix: String::new(),
             path_cache: false,
+            force: false,
+            cache_key: None,
+            main_program: true,
             extra_scopes: vec![
                 String::from("haskellPackages"),
                 String::from("rPackages"),
@@ -86,16 +99,36 @@ impl IndexBuilder {
     pub async fn build(&self) -> Result<()> {
         let opts = &self.options;
 
-        if opts.path_cache {
-            return Err(Error::NotImplemented(
-                "--path-cache is not implemented yet (refusing to silently no-op)",
-            ));
-        }
-
         std::fs::create_dir_all(&opts.database).map_err(|source| Error::CreateDatabaseDir {
             path: opts.database.clone(),
             source,
         })?;
+
+        let cache_path = opts.database.join("paths.cache");
+        let cache_key = if let Some(key) = opts.cache_key.as_deref() {
+            key
+        } else {
+            &opts.nixpkgs
+        };
+        let path_cache: Option<Arc<Mutex<PathCache>>> = if opts.path_cache {
+            if opts.force {
+                Some(Arc::new(Mutex::new(PathCache::new(cache_key))))
+            } else {
+                match PathCache::load(&cache_path, cache_key) {
+                    Ok(Some(cache)) => Some(Arc::new(Mutex::new(cache))),
+                    Ok(None) => {
+                        info!(cache_key, "path cache not found or stale; starting fresh");
+                        Some(Arc::new(Mutex::new(PathCache::new(cache_key))))
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "failed to load path cache; starting fresh");
+                        Some(Arc::new(Mutex::new(PathCache::new(cache_key))))
+                    }
+                }
+            }
+        } else {
+            None
+        };
 
         let db_file = opts.database.join("files");
         let mut writer =
@@ -105,23 +138,23 @@ impl IndexBuilder {
                     source: Box::new(source),
                 })?;
 
+        let progress = MultiProgress::new();
+
         // Root set + each extra scope (mirrors upstream nix-index multi-query).
+        let eval_pb = progress.add(ProgressBar::new_spinner());
+        eval_pb.set_message("Evaluating nixpkgs...");
         let packages = nixpkgs::list_packages_with_scopes(
             &opts.nixpkgs,
             opts.system.as_deref(),
             &opts.extra_scopes,
             opts.show_trace,
+            opts.main_program,
         )
         .await
         .map_err(|source| Error::QueryPackages {
             source: Box::new(source),
         })?;
-
-        info!(
-            packages = packages.packages.len(),
-            scopes = opts.extra_scopes.len(),
-            "listed store paths from nixpkgs"
-        );
+        eval_pb.finish_with_message(format!("Evaluated {} package(s)", packages.packages.len()));
 
         let fetcher = Fetcher::new(CACHE_URL).map_err(|err| {
             Error::Io(std::io::Error::other(format!(
@@ -151,13 +184,17 @@ impl IndexBuilder {
             })
             .collect();
 
-        let mut listings = listings::fetch_listings(&fetcher, jobs, starting_set)
-            .await
-            .map_err(|source| {
-                Error::Io(std::io::Error::other(format!(
-                    "failed to start listing fetcher: {source}"
-                )))
-            })?;
+        let fetch_pb = progress.add(ProgressBar::new_spinner());
+        fetch_pb.set_message("Fetching listings...");
+
+        let mut listings =
+            listings::fetch_listings(&fetcher, jobs, starting_set, path_cache.clone())
+                .await
+                .map_err(|source| {
+                    Error::Io(std::io::Error::other(format!(
+                        "failed to start listing fetcher: {source}"
+                    )))
+                })?;
 
         let mut indexed = 0usize;
         let mut failed = 0usize;
@@ -177,6 +214,27 @@ impl IndexBuilder {
                     failed += 1;
                 }
             }
+            fetch_pb.set_message(format!("Indexed {indexed}, failed {failed}"));
+            fetch_pb.inc(1);
+        }
+        fetch_pb.finish_with_message(format!("Fetched {indexed} listings ({failed} failed)"));
+
+        let cached = if let Some(pc) = path_cache.as_ref() {
+            pc.lock().await.hits
+        } else {
+            0
+        };
+
+        if opts.path_cache {
+            match path_cache {
+                Some(pc) => {
+                    let cache = pc.lock().await;
+                    if let Err(err) = cache.save(&cache_path) {
+                        warn!(error = %err, "failed to save path cache");
+                    }
+                }
+                None => warn!("path cache enabled but not initialized"),
+            }
         }
 
         let size = writer.finish().map_err(|source| Error::WriteDatabase {
@@ -187,6 +245,7 @@ impl IndexBuilder {
         info!(
             indexed,
             failed,
+            cached,
             size_bytes = size,
             db = %db_file.display(),
             "index build complete"
@@ -217,6 +276,7 @@ mod tests {
         assert_eq!(opts.format_version, 2);
         assert_eq!(opts.nixpkgs, "<nixpkgs>");
         assert!(!opts.path_cache);
+        assert!(opts.main_program);
     }
 
     /// Networked end-to-end smoke test against the public binary cache.
@@ -237,6 +297,9 @@ mod tests {
             show_trace: false,
             filter_prefix: "/bin/".into(),
             path_cache: false,
+            force: false,
+            cache_key: None,
+            main_program: true,
             extra_scopes: vec![],
         };
         IndexBuilder::new(opts).build().await.expect("build");
