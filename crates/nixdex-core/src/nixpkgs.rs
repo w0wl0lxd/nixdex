@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use indexmap::IndexMap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -93,6 +93,9 @@ pub struct Meta {
     /// The value of `meta.mainProgram`, if present and a string.
     #[serde(default)]
     pub main_program: Option<String>,
+    /// The value of `meta.description`, if present and a string.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// One successfully decoded derivation job from `nix-eval-jobs` NDJSON.
@@ -135,6 +138,23 @@ pub struct EvalJob {
 
 fn default_store_dir() -> String {
     "/nix/store".to_string()
+}
+
+/// A small, human-readable package record extracted from a `nix-eval-jobs` line.
+///
+/// This is written as a sidecar (`packages.json`) during indexing and searched
+/// by `nixdex search`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageMeta {
+    /// Attribute path, e.g. `nixpkgs#hello` or `hello`.
+    pub attr: String,
+    /// Derivation name, e.g. `hello-2.12.3`.
+    pub name: String,
+    /// `meta.description`, if present.
+    pub description: Option<String>,
+    /// `meta.mainProgram`, if present.
+    pub main_program: Option<String>,
 }
 
 /// One NDJSON line produced by `nix-eval-jobs`.
@@ -211,6 +231,12 @@ impl EvalJob {
     #[must_use]
     pub fn main_program(&self) -> Option<&str> {
         self.meta.as_ref()?.main_program.as_deref()
+    }
+
+    /// Return the value of `meta.description`, if any.
+    #[must_use]
+    pub fn description(&self) -> Option<&str> {
+        self.meta.as_ref()?.description.as_deref()
     }
 }
 
@@ -480,6 +506,7 @@ pub async fn list_packages_async(options: &EvalJobsOptions<'_>) -> Result<Packag
 async fn stream_options_to_entries(
     options: &EvalJobsOptions<'_>,
     tx: &mpsc::Sender<PackageEntry>,
+    meta_tx: Option<&mpsc::Sender<PackageMeta>>,
     main_program: bool,
 ) -> Result<usize> {
     if tx.is_closed() {
@@ -493,6 +520,23 @@ async fn stream_options_to_entries(
         };
         if !job.is_available() {
             continue;
+        }
+        let attr = if job.attr_path.is_empty() {
+            job.attr.clone()
+        } else {
+            job.attr_path.join(".")
+        };
+        if let Some(meta_tx) = meta_tx {
+            let meta = PackageMeta {
+                attr: attr.clone(),
+                name: job.name.clone(),
+                description: job.description().map(String::from),
+                main_program: job.main_program().map(String::from),
+            };
+            if meta_tx.send(meta).await.is_err() {
+                // Consumer dropped; stop reading.
+                return Ok(count);
+            }
         }
         let main = if main_program {
             job.main_program().map(String::from)
@@ -534,7 +578,9 @@ pub async fn stream_package_entries(
     extra_scopes: &[String],
     show_trace: bool,
     main_program: bool,
+    meta: bool,
     tx: mpsc::Sender<PackageEntry>,
+    meta_tx: mpsc::Sender<PackageMeta>,
 ) -> Result<usize> {
     let root_opts = EvalJobsOptions {
         nixpkgs,
@@ -542,10 +588,11 @@ pub async fn stream_package_entries(
         select: None,
         check_cache_status: true,
         show_trace,
-        meta: main_program,
+        meta,
         scope: None,
     };
-    let mut count = stream_options_to_entries(&root_opts, &tx, main_program).await?;
+    let meta_ref = Some(&meta_tx);
+    let mut count = stream_options_to_entries(&root_opts, &tx, meta_ref, main_program).await?;
 
     for scope in extra_scopes {
         if scope.is_empty() {
@@ -560,10 +607,10 @@ pub async fn stream_package_entries(
             select: None,
             check_cache_status: true,
             show_trace,
-            meta: main_program,
+            meta,
             scope: Some(scope.as_str()),
         };
-        match stream_options_to_entries(&scope_opts, &tx, main_program).await {
+        match stream_options_to_entries(&scope_opts, &tx, meta_ref, main_program).await {
             Ok(n) => count += n,
             Err(_) => {
                 // Soft-skip missing scopes (custom nixpkgs without haskellPackages).
@@ -700,6 +747,14 @@ mod tests {
         let line = parse_eval_line(raw).expect("parse");
         let job = line.job.expect("job");
         assert!(job.main_program().is_none());
+    }
+
+    #[test]
+    fn parse_description_from_meta() {
+        let raw = r#"{"attr":"nh","attrPath":["nh"],"cacheStatus":"local","drvPath":"/nix/store/x.drv","isCached":true,"name":"nh-4.3.2","meta":{"mainProgram":"nh","description":"Nix helper"},"outputs":{"out":"/nix/store/k9c04vx63x91fa3k147g5hi7k0ppns80-nh-4.3.2"},"storeDir":"/nix/store","system":"x86_64-linux"}"#;
+        let line = parse_eval_line(raw).expect("parse");
+        let job = line.job.expect("job");
+        assert_eq!(job.description(), Some("Nix helper"));
     }
 
     #[test]

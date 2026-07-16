@@ -46,6 +46,11 @@ axum = { version = "0.8", features = ["json"], optional = true }
 tempfile = "3"
 tokio = { workspace = true }
 proptest = { workspace = true }
+criterion = "0.5"
+
+[[bench]]
+name = "search"
+harness = false
 
 [lints]
 workspace = true
