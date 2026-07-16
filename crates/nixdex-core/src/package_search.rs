@@ -42,11 +42,11 @@ impl FromStr for SearchField {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self> {
-        match s.to_lowercase().as_str() {
+        match s.trim().to_lowercase().as_str() {
+            "" | "both" => Ok(Self::Both),
             "attr" => Ok(Self::Attr),
             "description" | "desc" => Ok(Self::Description),
             "main-program" | "mainprogram" | "main_program" => Ok(Self::MainProgram),
-            "both" => Ok(Self::Both),
             _ => Err(Error::Parse(format!("unknown search field: {s}"))),
         }
     }
