@@ -505,7 +505,8 @@ fn parse_seek_table(data: &[u8], data_start: usize) -> Result<Vec<(usize, usize)
         return Err(Error::Corrupt("v2 database too short for seek table"));
     }
 
-    let payload_len = read_u32_le(data, data.len() - 4)? as usize;
+    let payload_len = usize::try_from(read_u32_le(data, data.len() - 4)?)
+        .map_err(|_| Error::Corrupt("v2 seek table payload length overflow"))?;
     let skippable_size = 8usize
         .checked_add(payload_len)
         .ok_or(Error::Corrupt("v2 seek table size overflow"))?;
@@ -523,7 +524,8 @@ fn parse_seek_table(data: &[u8], data_start: usize) -> Result<Vec<(usize, usize)
         return Err(Error::Corrupt("v2 trailing magic mismatch"));
     }
 
-    let declared_size = read_u32_le(data, skippable_start + 4)? as usize;
+    let declared_size = usize::try_from(read_u32_le(data, skippable_start + 4)?)
+        .map_err(|_| Error::Corrupt("v2 seek table declared size overflow"))?;
     if declared_size != payload_len {
         return Err(Error::Corrupt("v2 seek table size mismatch"));
     }
@@ -536,7 +538,8 @@ fn parse_seek_table(data: &[u8], data_start: usize) -> Result<Vec<(usize, usize)
     if payload.len() < 4 {
         return Err(Error::Corrupt("v2 seek table payload too short"));
     }
-    let frame_count = read_u32_le(payload, 0)? as usize;
+    let frame_count = usize::try_from(read_u32_le(payload, 0)?)
+        .map_err(|_| Error::Corrupt("v2 frame count overflow"))?;
     if frame_count > MAX_FRAME_COUNT {
         return Err(Error::Corrupt("v2 frame count too high"));
     }
@@ -554,9 +557,13 @@ fn parse_seek_table(data: &[u8], data_start: usize) -> Result<Vec<(usize, usize)
 
     let mut lens = Vec::with_capacity(frame_count);
     for i in 0..frame_count {
-        lens.push(read_u32_le(payload, 4 + i * 4)? as usize);
+        lens.push(
+            usize::try_from(read_u32_le(payload, 4 + i * 4)?)
+                .map_err(|_| Error::Corrupt("v2 frame length overflow"))?,
+        );
     }
-    let trailing = read_u32_le(payload, payload_len - 4)? as usize;
+    let trailing = usize::try_from(read_u32_le(payload, payload_len - 4)?)
+        .map_err(|_| Error::Corrupt("v2 trailing payload length overflow"))?;
     if trailing != payload_len {
         return Err(Error::Corrupt("v2 trailing payload length mismatch"));
     }
@@ -618,8 +625,7 @@ fn search_frame(
     let raw = if compressed.is_empty() {
         Vec::new()
     } else {
-        crate::bounded_zstd_decode(compressed, crate::MAX_ZSTD_FRAME_BYTES as usize)
-            .map_err(Error::Io)?
+        crate::bounded_zstd_decode(compressed, crate::MAX_ZSTD_FRAME_BYTES).map_err(Error::Io)?
     };
 
     let mut matches = Vec::new();
@@ -728,12 +734,154 @@ pub struct SearchOptions<'a> {
     pub mode: SearchMode,
 }
 
+/// Resolve the set of candidate package labels from the basename secondary index.
+///
+/// Errors are logged and treated as a full-scan fallback; `None` is returned
+/// when there are no sidecar candidates.
+fn resolve_package_labels(
+    index_file: &Path,
+    exact_basename: Option<&str>,
+) -> Option<IndexSet<String>> {
+    let base = exact_basename?;
+    let dir = index_file.parent()?;
+    if dir.as_os_str().is_empty() {
+        return None;
+    }
+    match BasenameIndex::open(dir) {
+        Ok(index) => match index.lookup_basename(base.as_bytes()) {
+            Ok(labels) => Some(labels.into_iter().collect()),
+            Err(err) => {
+                if sidecars_exist(dir) {
+                    tracing::warn!(%err, "basename index sidecars unreadable; falling back to full scan");
+                }
+                None
+            }
+        },
+        Err(err) => {
+            if sidecars_exist(dir) {
+                tracing::warn!(%err, "basename index sidecars unreadable; falling back to full scan");
+            }
+            None
+        }
+    }
+}
+
+/// Format the `attr.output` label for a result, wrapping non-toplevels in parentheses.
+fn format_attr(store_path: &StorePath) -> String {
+    let mut attr = format!(
+        "{}.{}",
+        store_path.origin().attr,
+        store_path.origin().output
+    );
+    if !store_path.origin().toplevel {
+        attr = format!("({attr})");
+    }
+    attr
+}
+
+/// Returns `true` if `entry` should be printed under the current search options.
+fn should_include_match(
+    options: &SearchOptions<'_>,
+    path_pattern: &Regex,
+    store_path: &StorePath,
+    entry: &FileTreeEntry,
+) -> bool {
+    let group = matches!(options.mode, SearchMode::Full { group: true, .. });
+    if group
+        && path_pattern.find_iter(&entry.path).last().is_some_and(|m| {
+            entry
+                .path
+                .get(m.end()..)
+                .is_some_and(|rest| rest.contains(&b'/'))
+        })
+    {
+        return false;
+    }
+
+    let only_toplevel = matches!(
+        options.mode,
+        SearchMode::Full {
+            only_toplevel: true,
+            ..
+        }
+    );
+    if only_toplevel && !store_path.origin().toplevel {
+        return false;
+    }
+
+    let entry_type = entry.node.get_type();
+    if !options.file_type.is_empty() && !options.file_type.contains(&entry_type) {
+        return false;
+    }
+
+    true
+}
+
+/// Print a single search result according to `SearchMode` and color settings.
+///
+/// Mutates `printed_attrs` for `--minimal` de-duplication.
+#[allow(clippy::print_stdout)] // search is a CLI-facing printer for now
+fn print_match(
+    options: &SearchOptions<'_>,
+    path_pattern: &Regex,
+    printed_attrs: &mut IndexSet<String>,
+    store_path: &StorePath,
+    entry: &FileTreeEntry,
+) {
+    let attr = format_attr(store_path);
+
+    match options.mode {
+        SearchMode::Minimal => {
+            if printed_attrs.insert(attr.clone()) {
+                println!("{attr}");
+            }
+        }
+        SearchMode::Full { color, .. } => {
+            let (typ, size) = match &entry.node {
+                FileNode::Regular { executable, size } => {
+                    (if *executable { "x" } else { "r" }, *size)
+                }
+                FileNode::Directory { size, .. } => ("d", *size),
+                FileNode::Symlink { .. } => ("s", 0),
+            };
+            let size_str = format_grouped(size);
+            print!("{attr:<40} {size_str:>14} {typ:>1} {}", store_path.as_str());
+
+            let path_str = String::from_utf8_lossy(&entry.path);
+            if color {
+                // Highlight all non-empty matches in the path.
+                let mut prev = 0usize;
+                let bytes = path_str.as_bytes();
+                for mat in path_pattern.find_iter(bytes) {
+                    if mat.start() == mat.end() {
+                        continue;
+                    }
+                    // Safe because we only slice on byte offsets from the same str.
+                    if let (Some(before), Some(matched)) = (
+                        path_str.get(prev..mat.start()),
+                        path_str.get(mat.start()..mat.end()),
+                    ) {
+                        print!("{before}\x1b[31m{matched}\x1b[0m");
+                    }
+                    prev = mat.end();
+                }
+                if let Some(rest) = path_str.get(prev..) {
+                    println!("{rest}");
+                } else {
+                    println!();
+                }
+            } else {
+                println!("{path_str}");
+            }
+        }
+    }
+}
+
 /// Search the database for entries matching the supplied options and print them.
 ///
 /// # Errors
 ///
 /// Returns an error if the database cannot be read or the pattern is invalid.
-#[allow(clippy::print_stdout)] // search is a CLI-facing printer for now
 pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
     let index_file = options.database.join("files");
 
@@ -747,30 +895,7 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
         None => None,
     };
 
-    let package_labels = options.exact_basename.as_ref().and_then(|base| {
-        let dir = index_file.parent()?;
-        if dir.as_os_str().is_empty() {
-            return None;
-        }
-        match BasenameIndex::open(dir) {
-            Ok(index) => match index.lookup_basename(base.as_bytes()) {
-                Ok(labels) => Some(labels.into_iter().collect()),
-                Err(err) => {
-                    if sidecars_exist(dir) {
-                        tracing::warn!(%err, "basename index sidecars unreadable; falling back to full scan");
-                    }
-                    None
-                }
-            },
-            Err(err) => {
-                if sidecars_exist(dir) {
-                    tracing::warn!(%err, "basename index sidecars unreadable; falling back to full scan");
-                }
-                None
-            }
-        }
-    });
-
+    let package_labels = resolve_package_labels(&index_file, options.exact_basename.as_deref());
     if package_labels.as_ref().is_some_and(IndexSet::is_empty) {
         return Ok(());
     }
@@ -795,87 +920,15 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
     // Track printed attrs for --minimal de-duplication (ordered set).
     let mut printed_attrs: IndexSet<String> = IndexSet::new();
 
-    for (store_path, FileTreeEntry { path, node }) in results {
-        // Grouping: only print if the last regex match ends in the final path component.
-        let group = matches!(options.mode, SearchMode::Full { group: true, .. });
-        if group
-            && path_pattern
-                .find_iter(&path)
-                .last()
-                .is_some_and(|m| path.get(m.end()..).is_some_and(|rest| rest.contains(&b'/')))
-        {
-            continue;
-        }
-
-        let only_toplevel = matches!(
-            options.mode,
-            SearchMode::Full {
-                only_toplevel: true,
-                ..
-            }
-        );
-        if only_toplevel && !store_path.origin().toplevel {
-            continue;
-        }
-
-        let entry_type = node.get_type();
-        if !options.file_type.is_empty() && !options.file_type.contains(&entry_type) {
-            continue;
-        }
-
-        let mut attr = format!(
-            "{}.{}",
-            store_path.origin().attr,
-            store_path.origin().output
-        );
-        if !store_path.origin().toplevel {
-            attr = format!("({attr})");
-        }
-
-        match options.mode {
-            SearchMode::Minimal => {
-                if printed_attrs.insert(attr.clone()) {
-                    println!("{attr}");
-                }
-            }
-            SearchMode::Full { color, .. } => {
-                let (typ, size) = match &node {
-                    FileNode::Regular { executable, size } => {
-                        (if *executable { "x" } else { "r" }, *size)
-                    }
-                    FileNode::Directory { size, .. } => ("d", *size),
-                    FileNode::Symlink { .. } => ("s", 0),
-                };
-                let size_str = format_grouped(size);
-                print!("{attr:<40} {size_str:>14} {typ:>1} {}", store_path.as_str());
-
-                let path_str = String::from_utf8_lossy(&path);
-                if color {
-                    // Highlight all non-empty matches in the path.
-                    let mut prev = 0usize;
-                    let bytes = path_str.as_bytes();
-                    for mat in path_pattern.find_iter(bytes) {
-                        if mat.start() == mat.end() {
-                            continue;
-                        }
-                        // Safe because we only slice on byte offsets from the same str.
-                        if let (Some(before), Some(matched)) = (
-                            path_str.get(prev..mat.start()),
-                            path_str.get(mat.start()..mat.end()),
-                        ) {
-                            print!("{before}\x1b[31m{matched}\x1b[0m");
-                        }
-                        prev = mat.end();
-                    }
-                    if let Some(rest) = path_str.get(prev..) {
-                        println!("{rest}");
-                    } else {
-                        println!();
-                    }
-                } else {
-                    println!("{path_str}");
-                }
-            }
+    for (store_path, entry) in results {
+        if should_include_match(options, &path_pattern, &store_path, &entry) {
+            print_match(
+                options,
+                &path_pattern,
+                &mut printed_attrs,
+                &store_path,
+                &entry,
+            );
         }
     }
 

@@ -129,7 +129,10 @@ impl<R: BufRead> Decoder<R> {
             });
         }
 
-        let shared_len = self.shared_len as usize;
+        let shared_len = usize::try_from(self.shared_len).map_err(|_| Error::SharedOutOfRange {
+            previous_len: self.pos - self.last_path,
+            shared_len: self.shared_len,
+        })?;
         let previous_len = self.pos - self.last_path;
         if shared_len > previous_len {
             return Err(Error::SharedOutOfRange {
@@ -375,11 +378,10 @@ impl<W: Write> Encoder<W> {
     }
 
     fn encode_diff(&mut self, diff: i16) -> io::Result<()> {
-        let low = (diff & 0xFF) as u8;
+        let [low, high] = diff.to_le_bytes();
         if diff.abs() < i16::from(i8::MAX) {
             self.writer.write_all(&[low])?;
         } else {
-            let high = ((diff >> 8) & 0xFF) as u8;
             self.writer.write_all(&[0x80, high, low])?;
         }
         Ok(())
@@ -405,15 +407,14 @@ impl<W: Write> Encoder<W> {
         validate_bytes(&path)?;
         self.writer.write_all(b"\x00")?;
 
-        let mut shared: isize = 0;
-        let max_shared = i16::MAX as isize;
+        let previous_len = self.last.len();
+        let mut shared: i16 = 0;
         for (a, b) in self.last.iter().zip(path.iter()) {
-            if a != b || shared >= max_shared {
+            if a != b || shared == i16::MAX {
                 break;
             }
             shared += 1;
         }
-        let shared = shared as i16;
 
         let diff = shared - self.shared_len;
         self.encode_diff(diff)?;
@@ -421,7 +422,10 @@ impl<W: Write> Encoder<W> {
         self.last = path;
         self.shared_len = shared;
 
-        let pos = shared as usize;
+        let pos = usize::try_from(shared).map_err(|_| Error::SharedOutOfRange {
+            previous_len,
+            shared_len: isize::from(shared),
+        })?;
         if let Some(rest) = self.last.get(pos..) {
             self.writer.write_all(rest)?;
         }
