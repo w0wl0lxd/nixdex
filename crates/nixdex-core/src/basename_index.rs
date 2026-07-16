@@ -9,10 +9,10 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{LittleEndian, WriteBytesExt};
 use fst::Map;
 use roaring::RoaringBitmap;
 use thiserror::Error;
@@ -23,6 +23,15 @@ const POSTINGS_MAGIC: &[u8] = b"NBPO";
 const NAMES_MAGIC: &[u8] = b"NPKG";
 /// Sidecar format version.
 const SIDE_VERSION: u32 = 1;
+
+/// Maximum total size of the package-names sidecar (defensive cap).
+const MAX_NAMES_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Maximum length of a single package label in the names sidecar.
+const MAX_NAME_BYTES: usize = 64 * 1024;
+
+/// Maximum total size of the postings sidecar (defensive cap).
+const MAX_POSTINGS_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Sidecar basenames relative to the database directory.
 pub const FST_FILE: &str = "files.basename.fst";
@@ -79,8 +88,9 @@ impl BasenameIndexBuilder {
 
     /// Record one package and every basename from its absolute paths (with leading `/`).
     ///
-    /// Returns the assigned package ordinal. Packages with no paths still consume an ordinal
-    /// only when `paths` is non-empty after filtering — callers should skip empty packages.
+    /// Returns the assigned package ordinal. The ordinal is consumed unconditionally;
+    /// callers should skip empty packages before calling if they do not want empty
+    /// packages to consume ordinals.
     pub fn record_package(
         &mut self,
         package_label: String,
@@ -197,8 +207,13 @@ impl BasenameIndex {
 
         let fst_bytes = std::fs::read(&fst_path)?;
         let map = Map::new(fst_bytes).map_err(|err| Error::Fst(err.to_string()))?;
+
         let postings = std::fs::read(&postings_path)?;
+        if postings.len() > MAX_POSTINGS_BYTES as usize {
+            return Err(Error::Corrupt("postings file too large".into()));
+        }
         validate_postings_header(&postings)?;
+
         let package_names = read_package_names(&names_path)?;
 
         Ok(Self {
@@ -331,29 +346,60 @@ fn write_package_names(path: &Path, names: &[String]) -> Result<()> {
 }
 
 fn read_package_names(path: &Path) -> Result<Vec<String>> {
-    let mut r = BufReader::new(File::open(path)?);
-    let mut magic = [0u8; 4];
-    r.read_exact(&mut magic)?;
+    let bytes = std::fs::read(path)?;
+    if bytes.len() > MAX_NAMES_BYTES as usize {
+        return Err(Error::Corrupt("package names file too large".into()));
+    }
+
+    let magic = bytes
+        .get(..NAMES_MAGIC.len())
+        .ok_or(Error::Corrupt("names too short for magic".into()))?;
     if magic != NAMES_MAGIC {
         return Err(Error::Corrupt(format!(
             "names magic {magic:?}, expected {:?}",
             NAMES_MAGIC
         )));
     }
-    let ver = r.read_u32::<LittleEndian>()?;
+
+    let ver = read_u32_le(&bytes, NAMES_MAGIC.len())?;
     if ver != SIDE_VERSION {
         return Err(Error::Corrupt(format!(
             "names version {ver}, expected {SIDE_VERSION}"
         )));
     }
-    let count = r.read_u32::<LittleEndian>()? as usize;
-    let mut names = Vec::with_capacity(count);
+
+    let count = u64::from(read_u32_le(&bytes, NAMES_MAGIC.len() + 4)?);
+    let header_size = NAMES_MAGIC.len() + 4 + 4;
+    if count
+        .checked_mul(4)
+        .is_none_or(|need| need > (bytes.len() as u64).saturating_sub(header_size as u64))
+    {
+        return Err(Error::Corrupt("package name count too large".into()));
+    }
+
+    let mut names = Vec::with_capacity(count as usize);
+    let mut pos = header_size;
     for _ in 0..count {
-        let len = r.read_u32::<LittleEndian>()? as usize;
-        let mut buf = vec![0u8; len];
-        r.read_exact(&mut buf)?;
-        let s = String::from_utf8(buf).map_err(|err| Error::Corrupt(err.to_string()))?;
+        let len = read_u32_le(&bytes, pos)? as usize;
+        if len > MAX_NAME_BYTES {
+            return Err(Error::Corrupt(format!("package name too long: {len}")));
+        }
+        let body_start = pos + 4;
+        let body_end = body_start
+            .checked_add(len)
+            .ok_or(Error::Corrupt("package name length overflow".into()))?;
+        if body_end > bytes.len() {
+            return Err(Error::Corrupt("package name truncated".into()));
+        }
+        let s = String::from_utf8(
+            bytes
+                .get(body_start..body_end)
+                .ok_or(Error::Corrupt("package name slice missing".into()))?
+                .to_vec(),
+        )
+        .map_err(|err| Error::Corrupt(err.to_string()))?;
         names.push(s);
+        pos = body_end;
     }
     Ok(names)
 }

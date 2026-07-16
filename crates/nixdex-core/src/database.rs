@@ -21,7 +21,9 @@ use thiserror::Error;
 
 use indexmap::IndexSet;
 
-use crate::basename_index::{BasenameIndex, BasenameIndexBuilder};
+use crate::basename_index::{
+    BasenameIndex, BasenameIndexBuilder, FST_FILE, NAMES_FILE, POSTINGS_FILE,
+};
 use crate::files::{FileNode, FileTree, FileTreeEntry, FileType};
 use crate::frcode;
 use crate::store_path::StorePath;
@@ -37,6 +39,9 @@ const FILE_MAGIC: &[u8] = b"NIXI";
 
 /// Magic of the trailing zstd skippable frame used by version 2 seek tables.
 const SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
+
+/// Byte offset right after the file magic and version header.
+const DATA_START: usize = 12;
 
 /// Errors that can occur when reading or writing a database.
 #[derive(Error, Debug)]
@@ -219,21 +224,30 @@ impl Writer {
         file.write_all(FILE_MAGIC)?;
         file.write_u64::<LittleEndian>(self.version)?;
 
+        let parallelism = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .max(1);
+
         match self.version {
             1 => {
-                let compressed = zstd::encode_all(&raw[..], self.level)?;
+                let mut encoder = zstd::Encoder::new(Vec::new(), self.level)?;
+                let n_workers = u32::try_from(parallelism)
+                    .map_err(|_| Error::Corrupt("parallelism overflow"))?;
+                encoder.multithread(n_workers)?;
+                encoder.write_all(&raw)?;
+                let compressed = encoder.finish()?;
                 file.write_all(&compressed)?;
             }
             2 => {
-                let mut slices: Vec<&[u8]> = Vec::with_capacity(self.boundaries.len().max(1));
-                let mut prev = 0;
-                for &end in &self.boundaries {
-                    let slice = raw
-                        .get(prev..end)
-                        .ok_or(Error::Corrupt("package boundary out of range"))?;
-                    slices.push(slice);
-                    prev = end;
-                }
+                let frames = frame_ranges(&raw, &self.boundaries, parallelism);
+
+                let slices: Vec<&[u8]> = frames
+                    .iter()
+                    .map(|(start, end)| {
+                        raw.get(*start..*end)
+                            .ok_or(Error::Corrupt("package boundary out of range"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
 
                 let compressed_frames: Vec<Vec<u8>> = slices
                     .par_iter()
@@ -295,13 +309,43 @@ impl Writer {
     }
 }
 
+/// Split `raw` frcode data into contiguous frame ranges, grouped at package
+/// boundaries and targeting one frame per available CPU.
+fn frame_ranges(raw: &[u8], boundaries: &[usize], parallelism: usize) -> Vec<(usize, usize)> {
+    if raw.is_empty() || boundaries.is_empty() {
+        return Vec::new();
+    }
+
+    let target = (raw.len() / parallelism).max(1);
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+
+    for &end in boundaries {
+        // Each range must end at a package boundary. Once we reach the target
+        // size, cut the frame and start the next one.
+        if end - start >= target {
+            ranges.push((start, end));
+            start = end;
+        }
+    }
+
+    if start < raw.len() {
+        ranges.push((start, raw.len()));
+    }
+
+    ranges
+}
+
 /// Reader that opens an existing NIXI database file.
 #[derive(Debug)]
 pub struct Reader {
     path: PathBuf,
     version: u64,
-    /// Each frame is a fully decompressed frcode package stream.
-    frames: Vec<Vec<u8>>,
+    /// Raw file bytes, including the header.
+    data: Vec<u8>,
+    /// Each frame is a `(offset, length)` slice into `data` that holds one
+    /// compressed zstd frame. Frames are decompressed lazily during search.
+    frames: Vec<(usize, usize)>,
 }
 
 impl Reader {
@@ -314,12 +358,12 @@ impl Reader {
         let path_buf = path.as_ref().to_path_buf();
         let data = fs::read(&path_buf)?;
 
-        if data.len() < 12 {
+        if data.len() < DATA_START {
             return Err(Error::Corrupt("database file too short for header"));
         }
 
         let magic = data
-            .get(..4)
+            .get(..FILE_MAGIC.len())
             .ok_or(Error::Corrupt("database header magic missing"))?;
         if magic != FILE_MAGIC {
             return Err(Error::UnsupportedFileType {
@@ -328,7 +372,7 @@ impl Reader {
         }
 
         let version = u64::from_le_bytes(
-            data.get(4..12)
+            data.get(4..DATA_START)
                 .ok_or(Error::Corrupt("database header truncated"))?
                 .try_into()
                 .map_err(|_| Error::Corrupt("database header length"))?,
@@ -337,18 +381,23 @@ impl Reader {
             return Err(Error::UnsupportedVersion { found: version });
         }
 
-        let body = data
-            .get(12..)
-            .ok_or(Error::Corrupt("database header truncated"))?;
         let frames = match version {
-            1 => load_v1_frames(body)?,
-            2 => load_v2_frames(body)?,
+            1 => {
+                let len = data.len() - DATA_START;
+                if len == 0 {
+                    Vec::new()
+                } else {
+                    vec![(DATA_START, len)]
+                }
+            }
+            2 => parse_seek_table(&data, DATA_START)?,
             _ => unreachable!(),
         };
 
         Ok(Self {
             path: path_buf,
             version,
+            data,
             frames,
         })
     }
@@ -383,7 +432,21 @@ impl Reader {
         let per_frame: Vec<Vec<(StorePath, FileTreeEntry)>> = self
             .frames
             .par_iter()
-            .map(|frame| search_frame(frame, path_pattern, package_pattern, hash, package_labels))
+            .map(|(offset, len)| {
+                let start = *offset;
+                let end = start + *len;
+                let compressed = self
+                    .data
+                    .get(start..end)
+                    .ok_or(Error::Corrupt("frame slice out of range"))?;
+                search_frame(
+                    compressed,
+                    path_pattern,
+                    package_pattern,
+                    hash,
+                    package_labels,
+                )
+            })
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let mut matches = Vec::new();
@@ -418,40 +481,33 @@ impl Reader {
     }
 }
 
-fn load_v1_frames(body: &[u8]) -> Result<Vec<Vec<u8>>> {
-    if body.is_empty() {
-        return Ok(Vec::new());
-    }
-    let frame = zstd::decode_all(body)?;
-    Ok(vec![frame])
-}
-
-fn load_v2_frames(body: &[u8]) -> Result<Vec<Vec<u8>>> {
-    if body.len() < 8 {
+fn parse_seek_table(data: &[u8], data_start: usize) -> Result<Vec<(usize, usize)>> {
+    if data.len() < data_start + 8 {
         return Err(Error::Corrupt("v2 database too short for seek table"));
     }
 
-    let payload_len = read_u32_le(body, body.len() - 4)? as usize;
+    let payload_len = read_u32_le(data, data.len() - 4)? as usize;
     let skippable_size = 8usize
         .checked_add(payload_len)
         .ok_or(Error::Corrupt("v2 seek table size overflow"))?;
-    if body.len() < skippable_size {
+    if data.len() < skippable_size {
         return Err(Error::Corrupt("v2 seek table truncated"));
     }
 
-    let skippable_start = body.len() - skippable_size;
-    let magic = read_u32_le(body, skippable_start)?;
+    let skippable_end = data.len();
+    let skippable_start = skippable_end - skippable_size;
+    let magic = read_u32_le(data, skippable_start)?;
     if magic != SKIPPABLE_MAGIC {
         return Err(Error::Corrupt("v2 trailing magic mismatch"));
     }
 
-    let declared_size = read_u32_le(body, skippable_start + 4)? as usize;
+    let declared_size = read_u32_le(data, skippable_start + 4)? as usize;
     if declared_size != payload_len {
         return Err(Error::Corrupt("v2 seek table size mismatch"));
     }
 
     let payload_start = skippable_start + 8;
-    let payload = body
+    let payload = data
         .get(payload_start..payload_start + payload_len)
         .ok_or(Error::Corrupt("v2 seek table payload overflow"))?;
 
@@ -485,27 +541,22 @@ fn load_v2_frames(body: &[u8]) -> Result<Vec<Vec<u8>>> {
         acc.checked_add(len)
             .ok_or(Error::Corrupt("v2 compressed length overflow"))
     })?;
-    if total_compressed != frames_end {
+    if total_compressed != frames_end - data_start {
         return Err(Error::Corrupt("v2 compressed length mismatch"));
     }
 
-    let mut frame_slices: Vec<&[u8]> = Vec::with_capacity(frame_count);
-    let mut offset = 0usize;
+    let mut frames = Vec::with_capacity(frame_count);
+    let mut offset = data_start;
     for len in lens {
         let next = offset
             .checked_add(len)
             .ok_or(Error::Corrupt("v2 frame offset overflow"))?;
-        let compressed = body
-            .get(offset..next)
-            .ok_or(Error::Corrupt("v2 frame slice overflow"))?;
-        frame_slices.push(compressed);
+        if next > data.len() {
+            return Err(Error::Corrupt("v2 frame slice overflow"));
+        }
+        frames.push((offset, len));
         offset = next;
     }
-
-    let frames: Vec<Vec<u8>> = frame_slices
-        .par_iter()
-        .map(|&slice| zstd::decode_all(slice))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
 
     Ok(frames)
 }
@@ -523,16 +574,28 @@ fn read_u32_le(bytes: &[u8], at: usize) -> Result<u32> {
     Ok(u32::from_le_bytes(arr))
 }
 
+fn sidecars_exist(dir: &Path) -> bool {
+    [FST_FILE, POSTINGS_FILE, NAMES_FILE]
+        .iter()
+        .any(|name| dir.join(name).is_file())
+}
+
 fn search_frame(
-    frame: &[u8],
+    compressed: &[u8],
     path_pattern: &Regex,
     package_pattern: Option<&Regex>,
     hash: Option<&str>,
     package_labels: Option<&IndexSet<String>>,
 ) -> Result<Vec<(StorePath, FileTreeEntry)>> {
+    let raw = if compressed.is_empty() {
+        Vec::new()
+    } else {
+        zstd::decode_all(compressed)?
+    };
+
     let mut matches = Vec::new();
     let mut pending: Vec<FileTreeEntry> = Vec::new();
-    let mut decoder = frcode::Decoder::new(std::io::Cursor::new(frame));
+    let mut decoder = frcode::Decoder::new(std::io::Cursor::new(&raw));
 
     loop {
         let block = decoder.decode()?;
@@ -562,9 +625,7 @@ fn search_frame(
 
                 if accept_pkg {
                     for entry in std::mem::take(&mut pending) {
-                        if path_pattern.is_match(&entry.path) {
-                            matches.push((pkg.clone(), entry));
-                        }
+                        matches.push((pkg.clone(), entry));
                     }
                 } else {
                     pending.clear();
@@ -575,7 +636,9 @@ fn search_frame(
             let entry = FileTreeEntry::decode(line).map_err(|_| Error::EntryParse {
                 entry: line.to_vec(),
             })?;
-            pending.push(entry);
+            if path_pattern.is_match(&entry.path) {
+                pending.push(entry);
+            }
         }
     }
 
@@ -629,10 +692,6 @@ pub struct SearchOptions<'a> {
 #[allow(clippy::print_stdout)] // search is a CLI-facing printer for now
 pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
     let index_file = options.database.join("files");
-    let reader = Reader::open(&index_file).map_err(|source| crate::Error::ReadDatabase {
-        path: index_file.clone(),
-        source: Box::new(source),
-    })?;
 
     let path_pattern = Regex::new(&options.pattern).map_err(|err| {
         crate::Error::Parse(format!("invalid path pattern '{}': {err}", options.pattern))
@@ -649,12 +708,33 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
         if dir.as_os_str().is_empty() {
             return None;
         }
-        BasenameIndex::open(dir)
-            .ok()
-            .and_then(|index| index.lookup_basename(base.as_bytes()).ok())
-            .filter(|labels| !labels.is_empty())
-            .map(IndexSet::from_iter)
+        match BasenameIndex::open(dir) {
+            Ok(index) => match index.lookup_basename(base.as_bytes()) {
+                Ok(labels) => Some(labels.into_iter().collect()),
+                Err(err) => {
+                    if sidecars_exist(dir) {
+                        tracing::warn!(%err, "basename index sidecars unreadable; falling back to full scan");
+                    }
+                    None
+                }
+            },
+            Err(err) => {
+                if sidecars_exist(dir) {
+                    tracing::warn!(%err, "basename index sidecars unreadable; falling back to full scan");
+                }
+                None
+            }
+        }
     });
+
+    if package_labels.as_ref().is_some_and(IndexSet::is_empty) {
+        return Ok(());
+    }
+
+    let reader = Reader::open(&index_file).map_err(|source| crate::Error::ReadDatabase {
+        path: index_file.clone(),
+        source: Box::new(source),
+    })?;
 
     let results = reader
         .search_entries(
@@ -968,7 +1048,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_multiple_packages_yield_one_frame_each() {
+    fn v2_multiple_packages_yield_per_cpu_frames() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("files");
 
@@ -1012,7 +1092,8 @@ mod tests {
         // Each tree also emits a synthetic root entry with an empty path.
         assert_eq!(hits.len(), 7);
 
-        // Parse the trailing seek table and confirm there are two frames.
+        // Parse the trailing seek table and confirm the frame count respects
+        // per-CPU grouping: one frame per package, but capped by available CPUs.
         let data = fs::read(&db_path).expect("read db");
         let payload_len_bytes = data
             .get(data.len() - 4..)
@@ -1026,8 +1107,11 @@ mod tests {
             .expect("frame count bytes")
             .try_into()
             .expect("4 bytes");
-        let frame_count = u32::from_le_bytes(frame_count_bytes);
-        assert_eq!(frame_count, 2);
+        let frame_count = u32::from_le_bytes(frame_count_bytes) as usize;
+        let num_cpus = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .max(1);
+        assert!(frame_count >= 1 && frame_count <= num_cpus.max(2));
     }
 
     #[test]

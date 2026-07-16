@@ -11,8 +11,7 @@ default-run = "nix-index"
 
 [dependencies]
 clap = { workspace = true }
-owo-colors = { workspace = true }
-tracing = { workspace = true }
+regex = { workspace = true }
 tracing-subscriber = { workspace = true }
 color-eyre = { workspace = true }
 tokio = { workspace = true }

@@ -32,19 +32,6 @@ fn cache_dir() -> &'static str {
         .as_str()
 }
 
-/// Escape a literal string for safe use inside a regex.
-fn regex_escape(s: &str) -> String {
-    const METACHARACTERS: &str = r"\^.$|?*+()[]{}";
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if METACHARACTERS.contains(c) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
 /// Color policy for terminal output.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum Color {
@@ -125,8 +112,16 @@ fn process_args(matches: Opts) -> ProcessedArgs {
     let as_regex = matches.regex;
 
     let exact_basename = if !matches.regex && matches.whole_name && !matches.pattern.is_empty() {
+        // The FST is an exact-basename index. It is only safe to use when the
+        // whole-name pattern is anchored to a final path component (contains a
+        // '/'); otherwise the regex `ls$` would also match basenames like
+        // `als` and `xls`, which the FST lookup `ls` would omit.
         let base = nixdex_core::basename_index::basename_of(matches.pattern.as_bytes());
-        Some(String::from_utf8_lossy(base).into_owned())
+        if matches.pattern.contains('/') && !base.is_empty() {
+            Some(String::from_utf8_lossy(base).into_owned())
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -135,7 +130,7 @@ fn process_args(matches: Opts) -> ProcessedArgs {
         let body = if as_regex {
             s.to_string()
         } else {
-            regex_escape(s)
+            regex::escape(s)
         };
         if wrap {
             format!("{start_anchor}{body}{end_anchor}")
