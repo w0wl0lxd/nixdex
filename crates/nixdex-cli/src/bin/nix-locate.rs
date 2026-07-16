@@ -114,6 +114,7 @@ struct ProcessedArgs {
     pattern: String,
     hash: Option<String>,
     package_pattern: Option<String>,
+    exact_basename: Option<String>,
     file_type: Vec<FileType>,
     mode: SearchMode,
 }
@@ -122,6 +123,13 @@ fn process_args(matches: Opts) -> ProcessedArgs {
     let start_anchor = if matches.at_root { "^" } else { "" };
     let end_anchor = if matches.whole_name { "$" } else { "" };
     let as_regex = matches.regex;
+
+    let exact_basename = if !matches.regex && matches.whole_name && !matches.pattern.is_empty() {
+        let base = nixdex_core::basename_index::basename_of(matches.pattern.as_bytes());
+        Some(String::from_utf8_lossy(base).into_owned())
+    } else {
+        None
+    };
 
     let make_pattern = |s: &str, wrap: bool| {
         let body = if as_regex {
@@ -165,6 +173,7 @@ fn process_args(matches: Opts) -> ProcessedArgs {
         pattern,
         hash: matches.hash,
         package_pattern,
+        exact_basename,
         file_type,
         mode,
     }
@@ -184,6 +193,7 @@ fn main() -> color_eyre::Result<()> {
         pattern: args.pattern,
         hash: args.hash,
         package_pattern: args.package_pattern,
+        exact_basename: args.exact_basename,
         file_type: &args.file_type,
         mode: args.mode,
     };
