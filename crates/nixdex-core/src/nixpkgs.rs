@@ -8,7 +8,9 @@ use serde::Deserialize;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 
+use crate::listings::PackageEntry;
 use crate::store_path::{Origin, StorePath};
 
 /// Errors that can occur when querying nixpkgs.
@@ -142,6 +144,18 @@ pub struct EvalJobLine {
     pub raw: String,
     /// Successfully decoded job, if the line was valid and non-error.
     pub job: Option<EvalJob>,
+}
+
+/// Streaming output of a running `nix-eval-jobs` invocation.
+///
+/// Receive parsed NDJSON lines from [`rx`](Self::rx) and await
+/// [`handle`](Self::handle) to learn whether the process exited cleanly.
+#[derive(Debug)]
+pub struct EvalJobsStream {
+    /// Parsed NDJSON lines as they are emitted.
+    pub rx: mpsc::Receiver<EvalJobLine>,
+    /// Completion handle for the process reader task.
+    pub handle: tokio::task::JoinHandle<Result<()>>,
 }
 
 impl EvalJob {
@@ -311,12 +325,16 @@ pub fn eval_expr_for_nixpkgs(value: &str, scope: Option<&str>) -> Result<String>
     }
 }
 
-/// Spawn `nix-eval-jobs` and collect NDJSON lines (decoded when possible).
+/// Spawn `nix-eval-jobs` and stream NDJSON lines as they are emitted.
+///
+/// The returned [`EvalJobsStream`] yields decoded lines through its receiver.
+/// Await the `handle` after consuming the receiver to propagate process
+/// errors.
 ///
 /// # Errors
 ///
-/// Returns an error if the process cannot be started or exits unsuccessfully.
-pub async fn run_eval_jobs(options: &EvalJobsOptions<'_>) -> Result<Vec<EvalJobLine>> {
+/// Returns an error if the process cannot be started.
+pub async fn run_eval_jobs(options: &EvalJobsOptions<'_>) -> Result<EvalJobsStream> {
     let mut cmd = Command::new("nix-eval-jobs");
     // Flake refs only when they look like flake URLs, never for bare paths.
     if options.nixpkgs.starts_with("github:")
@@ -372,31 +390,54 @@ pub async fn run_eval_jobs(options: &EvalJobsOptions<'_>) -> Result<Vec<EvalJobL
         .take()
         .ok_or_else(|| Error::Evaluation("nix-eval-jobs produced no stdout pipe".to_string()))?;
 
-    let reader = BufReader::new(stdout);
-    let mut lines = reader.lines();
-    let mut records = Vec::new();
+    let (tx, rx) = mpsc::channel(1024);
 
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
+    let handle = tokio::spawn(async move {
+        let reader = BufReader::new(stdout);
+        let mut lines = reader.lines();
+        let mut records = 0usize;
+
+        while let Some(line) = lines.next_line().await? {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record = match parse_eval_line(&line) {
+                Ok(record) => record,
+                Err(_) => EvalJobLine {
+                    raw: line,
+                    job: None,
+                },
+            };
+            if tx.send(record).await.is_err() {
+                // The consumer dropped; kill the child process and stop reading.
+                let _ = child.kill().await;
+                break;
+            }
+            records += 1;
         }
-        match parse_eval_line(&line) {
-            Ok(record) => records.push(record),
-            Err(_) => records.push(EvalJobLine {
-                raw: line,
-                job: None,
-            }),
+
+        let status = child.wait().await?;
+        if !status.success() && records == 0 {
+            return Err(Error::Evaluation(format!(
+                "nix-eval-jobs exited with status {status}"
+            )));
         }
-    }
+        Ok(())
+    });
 
-    let status = child.wait().await?;
-    if !status.success() && records.is_empty() {
-        return Err(Error::Evaluation(format!(
-            "nix-eval-jobs exited with status {status}"
-        )));
-    }
+    Ok(EvalJobsStream { rx, handle })
+}
 
-    Ok(records)
+/// Await an eval-reader [`tokio::task::JoinHandle`] and map a panic into an
+/// [`Error::Evaluation`].
+async fn await_eval_handle(handle: tokio::task::JoinHandle<Result<()>>) -> Result<()> {
+    match handle.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(err),
+        Err(err) => Err(Error::Evaluation(format!(
+            "eval reader task panicked: {err}"
+        ))),
+    }
 }
 
 /// List packages available in a nixpkgs expression (async evaluator path).
@@ -405,9 +446,9 @@ pub async fn run_eval_jobs(options: &EvalJobsOptions<'_>) -> Result<Vec<EvalJobL
 ///
 /// Propagates evaluation errors from `nix-eval-jobs`.
 pub async fn list_packages_async(options: &EvalJobsOptions<'_>) -> Result<PackageList> {
-    let lines = run_eval_jobs(options).await?;
+    let mut stream = run_eval_jobs(options).await?;
     let mut list = PackageList::default();
-    for line in lines {
+    while let Some(line) = stream.rx.recv().await {
         let Some(job) = line.job else {
             continue;
         };
@@ -427,7 +468,110 @@ pub async fn list_packages_async(options: &EvalJobsOptions<'_>) -> Result<Packag
             main_program,
         });
     }
+    await_eval_handle(stream.handle).await?;
     Ok(list)
+}
+
+/// Stream the decoded NDJSON lines of a single `nix-eval-jobs` run into
+/// [`PackageEntry`] values.
+///
+/// `main_program` is only attached to the `out` output, matching the behaviour
+/// of `build_starting_set`.
+async fn stream_options_to_entries(
+    options: &EvalJobsOptions<'_>,
+    tx: &mpsc::Sender<PackageEntry>,
+    main_program: bool,
+) -> Result<usize> {
+    if tx.is_closed() {
+        return Ok(0);
+    }
+    let mut stream = run_eval_jobs(options).await?;
+    let mut count = 0;
+    while let Some(line) = stream.rx.recv().await {
+        let Some(job) = line.job else {
+            continue;
+        };
+        if !job.is_available() {
+            continue;
+        }
+        let main = if main_program {
+            job.main_program().map(String::from)
+        } else {
+            None
+        };
+        for path in job.store_paths() {
+            let entry_main = if path.origin().output == "out" {
+                main.clone()
+            } else {
+                None
+            };
+            let entry = PackageEntry {
+                path,
+                main_program: entry_main,
+            };
+            if tx.send(entry).await.is_err() {
+                // Consumer dropped; stop reading.
+                return Ok(count);
+            }
+            count += 1;
+        }
+    }
+    await_eval_handle(stream.handle).await?;
+    Ok(count)
+}
+
+/// Stream evaluated package entries for the root set plus each extra scope.
+///
+/// Root evaluation failures are propagated; missing or failing extra scopes are
+/// skipped so custom nixpkgs without `haskellPackages` etc. still work.
+///
+/// # Errors
+///
+/// Propagates evaluation errors for the root set.
+pub async fn stream_package_entries(
+    nixpkgs: &str,
+    system: Option<&str>,
+    extra_scopes: &[String],
+    show_trace: bool,
+    main_program: bool,
+    tx: mpsc::Sender<PackageEntry>,
+) -> Result<usize> {
+    let root_opts = EvalJobsOptions {
+        nixpkgs,
+        system,
+        select: None,
+        check_cache_status: true,
+        show_trace,
+        meta: main_program,
+        scope: None,
+    };
+    let mut count = stream_options_to_entries(&root_opts, &tx, main_program).await?;
+
+    for scope in extra_scopes {
+        if scope.is_empty() {
+            continue;
+        }
+        if validate_scope(scope).is_err() {
+            continue;
+        }
+        let scope_opts = EvalJobsOptions {
+            nixpkgs,
+            system,
+            select: None,
+            check_cache_status: true,
+            show_trace,
+            meta: main_program,
+            scope: Some(scope.as_str()),
+        };
+        match stream_options_to_entries(&scope_opts, &tx, main_program).await {
+            Ok(n) => count += n,
+            Err(_) => {
+                // Soft-skip missing scopes (custom nixpkgs without haskellPackages).
+            }
+        }
+    }
+
+    Ok(count)
 }
 
 /// List root packages plus each non-empty extra scope (sequential eval passes).
