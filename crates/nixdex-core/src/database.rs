@@ -95,10 +95,6 @@ pub enum Error {
     #[error("invalid search pattern: {0}")]
     Regex(#[from] regex::Error),
 
-    /// redb reported a storage failure (legacy / reserved).
-    #[error("redb error: {0}")]
-    Redb(String),
-
     /// Local filesystem I/O failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
