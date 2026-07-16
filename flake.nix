@@ -75,6 +75,10 @@
             pkgs.hyperfine
           ];
 
+          # Rustup-distributed nightly rustc dynamically links libz, which is not
+          # present in the NixOS FHS. Expose it to mise/rustup toolchains.
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.zlib ];
+
           shellHook = ''
             eval "$(mise activate bash)"
             git config core.hooksPath .githooks 2>/dev/null || true
