@@ -121,7 +121,12 @@ proptest! {
             let results = index.lookup_basename(&base).expect("lookup");
             // Results should be a subset of our recorded packages
             for label in &results {
-                prop_assert!(label.starts_with("pkg") || label == "coreutils.out" || label == "hello.out" || label == "busybox.out");
+                prop_assert!(
+                    label.starts_with("pkg")
+                        || *label == "coreutils.out"
+                        || *label == "hello.out"
+                        || *label == "busybox.out"
+                );
             }
         }
     }

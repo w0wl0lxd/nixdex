@@ -1191,6 +1191,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "clap",
+ "fastrand",
  "fst",
  "indexmap",
  "indicatif",
