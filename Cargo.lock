@@ -1310,7 +1310,6 @@ dependencies = [
  "roaring",
  "scc",
  "serde",
- "serde_json",
  "sonic-rs",
  "tempfile",
  "thiserror",
@@ -1324,13 +1323,10 @@ dependencies = [
 name = "nixdex-daemon"
 version = "0.1.0"
 dependencies = [
- "axum",
  "clap",
  "color-eyre",
  "dirs",
  "nixdex-core",
- "serde",
- "serde_json",
  "tokio",
  "tracing-subscriber",
 ]

@@ -25,7 +25,6 @@ zstd = { workspace = true, features = ["zstdmt"] }
 memchr = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 postcard = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
