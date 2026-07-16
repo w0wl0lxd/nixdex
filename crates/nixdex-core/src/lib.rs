@@ -19,6 +19,7 @@ pub mod prebuilt;
 pub mod store_path;
 
 pub use cache_dir::{nix_index_dir, nixdex_dir};
+pub use database::generate_sidecars;
 pub use errors::{Error, Result};
 pub use files::{ALL_FILE_TYPES, FileEntries, FileNode, FileTree, FileTreeEntry, FileType};
 pub use hydra::Fetcher;
