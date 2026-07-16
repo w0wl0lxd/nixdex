@@ -17,23 +17,14 @@ tokio = { workspace = true }
 reqwest = { workspace = true }
 rayon = { workspace = true }
 sonic-rs = { workspace = true }
-redb = { workspace = true }
 fst = { workspace = true }
 roaring = { workspace = true }
-postcard = { workspace = true }
-zstd = { workspace = true }
-moka = { workspace = true }
+zstd = { workspace = true, features = ["zstdmt"] }
 memchr = { workspace = true }
-scc = { workspace = true }
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
-compact_str = { workspace = true }
-smallvec = { workspace = true }
-rustc-hash = { workspace = true }
-ahash = { workspace = true }
 indexmap = { workspace = true }
 byteorder = { workspace = true }
 regex = { workspace = true }

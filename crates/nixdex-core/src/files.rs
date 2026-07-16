@@ -132,7 +132,13 @@ impl<T> FileNode<T> {
     /// Returns whether this node is an executable regular file.
     #[must_use]
     pub fn is_executable(&self) -> bool {
-        matches!(self, Self::Regular { executable: true, .. })
+        matches!(
+            self,
+            Self::Regular {
+                executable: true,
+                ..
+            }
+        )
     }
 }
 
@@ -195,10 +201,7 @@ impl FileNode<()> {
             }),
             b'd' => {
                 let size = str::from_utf8(rest).ok()?.parse().ok()?;
-                Some(Self::Directory {
-                    size,
-                    contents: (),
-                })
+                Some(Self::Directory { size, contents: () })
             }
             _ => None,
         }
@@ -211,10 +214,7 @@ impl FileTreeEntry {
     /// # Errors
     ///
     /// Returns an error when writing to the encoder fails.
-    pub fn encode<W: Write>(
-        self,
-        encoder: &mut frcode::Encoder<W>,
-    ) -> Result<(), frcode::Error> {
+    pub fn encode<W: Write>(self, encoder: &mut frcode::Encoder<W>) -> Result<(), frcode::Error> {
         self.node.encode_meta(encoder)?;
         encoder.write_path(self.path)?;
         Ok(())
@@ -226,15 +226,14 @@ impl FileTreeEntry {
     ///
     /// Returns [`crate::Error::Parse`] when the buffer is not a valid entry.
     pub fn decode(buf: &[u8]) -> crate::Result<Self> {
-        let sep = memchr::memchr(b'\0', buf).ok_or_else(|| {
-            crate::Error::Parse("file entry missing NUL separator".to_string())
-        })?;
+        let sep = memchr::memchr(b'\0', buf)
+            .ok_or_else(|| crate::Error::Parse("file entry missing NUL separator".to_string()))?;
         let node_bytes = buf.get(..sep).ok_or_else(|| {
             crate::Error::Parse("file entry metadata slice out of range".to_string())
         })?;
-        let path = buf.get(sep + 1..).ok_or_else(|| {
-            crate::Error::Parse("file entry path slice out of range".to_string())
-        })?;
+        let path = buf
+            .get(sep + 1..)
+            .ok_or_else(|| crate::Error::Parse("file entry path slice out of range".to_string()))?;
         let node = FileNode::decode_meta(node_bytes).ok_or_else(|| {
             crate::Error::Parse(format!("invalid file entry metadata: {node_bytes:?}"))
         })?;
@@ -464,19 +463,12 @@ mod tests {
                 enc.finish().expect("finish");
             }
             // Decode the first line without the package footer / trailing newline.
-            let line = buf
-                .split(|b| *b == b'\n')
-                .next()
-                .expect("line")
-                .to_vec();
+            let line = buf.split(|b| *b == b'\n').next().expect("line").to_vec();
             // Expand frcode: single-entry encoder emits metadata\0diff path
             // Re-decode via Decoder for a faithful roundtrip.
             let mut dec = frcode::Decoder::new(std::io::Cursor::new(&buf));
             let block = dec.decode().expect("decode block");
-            let entry_line = block
-                .split(|b| *b == b'\n')
-                .next()
-                .expect("entry line");
+            let entry_line = block.split(|b| *b == b'\n').next().expect("entry line");
             // Strip trailing empty etc — the entry line is metadata\0path
             // but still has no trailing newline in the split piece.
             let decoded = FileTreeEntry::decode(entry_line).expect("decode entry");

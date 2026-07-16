@@ -9,7 +9,7 @@ use color_eyre::eyre::WrapErr;
 use tracing_subscriber::EnvFilter;
 
 use nixdex_core::database::{SearchMode, SearchOptions};
-use nixdex_core::{FileType, ALL_FILE_TYPES};
+use nixdex_core::{ALL_FILE_TYPES, FileType};
 
 /// Resolve the default cache directory for the nixdex database.
 fn cache_dir() -> &'static str {
@@ -30,19 +30,6 @@ fn cache_dir() -> &'static str {
             }
         })
         .as_str()
-}
-
-/// Escape a literal string for safe use inside a regex.
-fn regex_escape(s: &str) -> String {
-    const METACHARACTERS: &str = r"\^.$|?*+()[]{}";
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if METACHARACTERS.contains(c) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
 }
 
 /// Color policy for terminal output.
@@ -114,6 +101,7 @@ struct ProcessedArgs {
     pattern: String,
     hash: Option<String>,
     package_pattern: Option<String>,
+    exact_basename: Option<String>,
     file_type: Vec<FileType>,
     mode: SearchMode,
 }
@@ -123,11 +111,26 @@ fn process_args(matches: Opts) -> ProcessedArgs {
     let end_anchor = if matches.whole_name { "$" } else { "" };
     let as_regex = matches.regex;
 
+    let exact_basename = if !matches.regex && matches.whole_name && !matches.pattern.is_empty() {
+        // The FST is an exact-basename index. It is only safe to use when the
+        // whole-name pattern is anchored to a final path component (contains a
+        // '/'); otherwise the regex `ls$` would also match basenames like
+        // `als` and `xls`, which the FST lookup `ls` would omit.
+        let base = nixdex_core::basename_index::basename_of(matches.pattern.as_bytes());
+        if matches.pattern.contains('/') && !base.is_empty() {
+            Some(String::from_utf8_lossy(base).into_owned())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let make_pattern = |s: &str, wrap: bool| {
         let body = if as_regex {
             s.to_string()
         } else {
-            regex_escape(s)
+            regex::escape(s)
         };
         if wrap {
             format!("{start_anchor}{body}{end_anchor}")
@@ -165,6 +168,7 @@ fn process_args(matches: Opts) -> ProcessedArgs {
         pattern,
         hash: matches.hash,
         package_pattern,
+        exact_basename,
         file_type,
         mode,
     }
@@ -184,6 +188,7 @@ fn main() -> color_eyre::Result<()> {
         pattern: args.pattern,
         hash: args.hash,
         package_pattern: args.package_pattern,
+        exact_basename: args.exact_basename,
         file_type: &args.file_type,
         mode: args.mode,
     };

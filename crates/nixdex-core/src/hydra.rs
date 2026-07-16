@@ -4,9 +4,9 @@ use std::io::Read;
 
 use thiserror::Error;
 
+use crate::CACHE_URL;
 use crate::files::FileTree;
 use crate::store_path::{Origin, StorePath};
-use crate::CACHE_URL;
 
 /// Errors that can occur when talking to a binary cache.
 #[derive(Error, Debug)]
@@ -98,10 +98,7 @@ impl Fetcher {
             .await
             .map_err(|err| Error::Request(format!("{url}: {err}")))?;
         if !response.status().is_success() {
-            return Err(Error::Request(format!(
-                "{url}: HTTP {}",
-                response.status()
-            )));
+            return Err(Error::Request(format!("{url}: HTTP {}", response.status())));
         }
         let bytes = response
             .bytes()
@@ -138,10 +135,7 @@ impl Fetcher {
             .await
             .map_err(|err| Error::Request(format!("{url}: {err}")))?;
         if !response.status().is_success() {
-            return Err(Error::Request(format!(
-                "{url}: HTTP {}",
-                response.status()
-            )));
+            return Err(Error::Request(format!("{url}: HTTP {}", response.status())));
         }
         response
             .text()
@@ -236,7 +230,10 @@ References: ias8xacs1h3jy7xgwi2awvim61k2ji6c-glibc-2.42-67 pg2zfrrbm58ynbjshhzkg
 ";
         let refs = parse_narinfo_references(text, "/nix/store").expect("refs");
         assert_eq!(refs.len(), 2);
-        assert_eq!(refs[0].hash(), "ias8xacs1h3jy7xgwi2awvim61k2ji6c");
-        assert_eq!(refs[0].name(), "glibc-2.42-67");
+        assert_eq!(
+            refs.first().map(StorePath::hash),
+            Some("ias8xacs1h3jy7xgwi2awvim61k2ji6c")
+        );
+        assert_eq!(refs.first().map(StorePath::name), Some("glibc-2.42-67"));
     }
 }
