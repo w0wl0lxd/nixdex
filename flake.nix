@@ -77,6 +77,13 @@
 
           shellHook = ''
             eval "$(mise activate bash)"
+
+            # Rustup-distributed nightly rustc dynamically links libz, which is not
+            # present in the NixOS FHS. Expose it to mise/rustup toolchains.
+            export LD_LIBRARY_PATH="${
+              pkgs.lib.makeLibraryPath [ pkgs.zlib ]
+            }''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
             git config core.hooksPath .githooks 2>/dev/null || true
           '';
         };
