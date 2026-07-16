@@ -15,7 +15,9 @@ regex = { workspace = true }
 tracing-subscriber = { workspace = true }
 color-eyre = { workspace = true }
 tokio = { workspace = true }
+sonic-rs = { workspace = true }
 nixdex-core = { workspace = true, features = ["cli"] }
+clap_complete = "4.6.7"
 
 [[bin]]
 name = "nix-index"
