@@ -5,13 +5,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
-use indexmap::IndexSet;
+use scc::HashSet as SccHashSet;
 use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
 use tracing::warn;
 
 use crate::errors::Result;
 use crate::files::FileTree;
 use crate::hydra::{self, Fetcher};
+use crate::path_cache::PathCache;
 use crate::store_path::StorePath;
 
 /// A root path together with an optional `meta.mainProgram` value.
@@ -95,6 +96,64 @@ impl ListingSource for Fetcher {
     }
 }
 
+/// A [`ListingSource`] that consults a `paths.cache` sidecar before hitting the
+/// network and persists new results back into the cache.
+#[derive(Debug, Clone)]
+struct CachedSource {
+    inner: Fetcher,
+    cache: Arc<PathCache>,
+}
+
+#[allow(clippy::manual_async_fn)]
+impl ListingSource for CachedSource {
+    fn fetch_narinfo_details<'a>(
+        &'a self,
+        path: &'a StorePath,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<(Vec<StorePath>, Option<String>), hydra::Error>,
+    > + Send {
+        async move {
+            let hash = path.hash();
+            if let Some(refs) = self.cache.get_refs(hash) {
+                self.cache.hits.fetch_add(1, Ordering::Relaxed);
+                return Ok((refs, None));
+            }
+
+            let (refs, nar_url) = self.inner.fetch_narinfo_details(path).await?;
+
+            // Preserve any already-cached tree for this path while storing refs.
+            let mut entry = crate::path_cache::CachedEntry::new(path.clone());
+            entry.tree = self.cache.get_tree(hash);
+            entry.refs = Some(refs.clone());
+            self.cache.insert(hash, entry);
+
+            Ok((refs, nar_url))
+        }
+    }
+
+    fn fetch_file_tree<'a>(
+        &'a self,
+        path: &'a StorePath,
+    ) -> impl std::future::Future<Output = std::result::Result<FileTree, hydra::Error>> + Send {
+        async move {
+            let hash = path.hash();
+            if let Some(tree) = self.cache.get_tree(hash) {
+                self.cache.hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(tree);
+            }
+
+            let tree = self.inner.fetch_file_tree(path).await?;
+
+            let mut entry = crate::path_cache::CachedEntry::new(path.clone());
+            entry.refs = self.cache.get_refs(hash);
+            entry.tree = Some(tree.clone());
+            self.cache.insert(hash, entry);
+
+            Ok(tree)
+        }
+    }
+}
+
 /// Fetch `.ls` listings recursively over the runtime closure of `starting_set`.
 ///
 /// The returned receiver yields every store path whose `.ls` listing could be
@@ -105,13 +164,26 @@ impl ListingSource for Fetcher {
 /// narinfo causes a synthetic `/bin/<main_program>` listing to be emitted
 /// instead of being skipped.
 ///
+/// When `path_cache` is `Some`, fetched narinfo references and `.ls` trees are
+/// looked up from the cache before making HTTP requests and written back on
+/// misses.
+///
 /// Concurrency is bounded by `jobs` (clamped to at least 1).
 pub async fn fetch_listings(
     fetcher: &Fetcher,
     jobs: usize,
     starting_set: Vec<PackageEntry>,
+    path_cache: Option<Arc<PathCache>>,
 ) -> Result<mpsc::Receiver<Result<ListingItem>>> {
-    fetch_listings_with_source(fetcher, jobs, starting_set).await
+    if let Some(cache) = path_cache {
+        let source = CachedSource {
+            inner: fetcher.clone(),
+            cache,
+        };
+        fetch_listings_with_source(&source, jobs, starting_set).await
+    } else {
+        fetch_listings_with_source(fetcher, jobs, starting_set).await
+    }
 }
 
 async fn fetch_listings_with_source<S: ListingSource>(
@@ -122,16 +194,16 @@ async fn fetch_listings_with_source<S: ListingSource>(
     let jobs = jobs.max(1);
     let (out_tx, out_rx) = mpsc::channel::<Result<ListingItem>>(jobs * 2);
     let queue: Arc<Mutex<VecDeque<PackageEntry>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let seen: Arc<Mutex<IndexSet<String>>> = Arc::new(Mutex::new(IndexSet::new()));
+    let seen: Arc<SccHashSet<String, ahash::RandomState>> =
+        Arc::new(SccHashSet::with_hasher(ahash::RandomState::new()));
     let in_flight = Arc::new(AtomicUsize::new(0));
     let notify = Arc::new(Notify::new());
     let semaphore = Arc::new(Semaphore::new(jobs));
 
     {
         let mut q = queue.lock().await;
-        let mut s = seen.lock().await;
         for entry in starting_set {
-            if s.insert(entry.path.hash().to_string()) {
+            if seen.insert_sync(entry.path.hash().to_string()).is_ok() {
                 in_flight.fetch_add(1, Ordering::SeqCst);
                 q.push_back(entry);
             }
@@ -187,7 +259,7 @@ async fn process_path<S: ListingSource>(
     source: &S,
     entry: &PackageEntry,
     queue: &Mutex<VecDeque<PackageEntry>>,
-    seen: &Mutex<IndexSet<String>>,
+    seen: &SccHashSet<String, ahash::RandomState>,
     in_flight: &AtomicUsize,
     notify: &Notify,
 ) -> Option<ListingItem> {
@@ -205,7 +277,7 @@ async fn process_path_inner<S: ListingSource>(
     source: &S,
     entry: &PackageEntry,
     queue: &Mutex<VecDeque<PackageEntry>>,
-    seen: &Mutex<IndexSet<String>>,
+    seen: &SccHashSet<String, ahash::RandomState>,
     in_flight: &AtomicUsize,
     notify: &Notify,
 ) -> Option<ListingItem> {
@@ -231,11 +303,7 @@ async fn process_path_inner<S: ListingSource>(
 
     for r in refs {
         let hash = r.hash().to_string();
-        let new = {
-            let mut s = seen.lock().await;
-            s.insert(hash)
-        };
-        if new {
+        if seen.insert_sync(hash).is_ok() {
             in_flight.fetch_add(1, Ordering::SeqCst);
             queue.lock().await.push_back(PackageEntry::new(r));
             notify.notify_one();
@@ -423,7 +491,7 @@ mod tests {
         let a = sp("a", "a");
 
         let source = MockSource {
-            missing_narinfo: IndexSet::from_iter(["a".to_string()]),
+            missing_narinfo: indexmap::IndexSet::from_iter(["a".to_string()]),
             ..Default::default()
         };
         let mut rx = fetch_listings_with_source(
@@ -460,7 +528,7 @@ mod tests {
         let a = sp("a", "a");
 
         let source = MockSource {
-            missing_ls: IndexSet::from_iter(["a".to_string()]),
+            missing_ls: indexmap::IndexSet::from_iter(["a".to_string()]),
             ..Default::default()
         };
         let mut rx = fetch_listings_with_source(
@@ -495,7 +563,7 @@ mod tests {
 
         let source = MockSource {
             refs,
-            missing_ls: IndexSet::from_iter(["a".to_string(), "b".to_string()]),
+            missing_ls: indexmap::IndexSet::from_iter(["a".to_string(), "b".to_string()]),
             ..Default::default()
         };
         let mut rx = fetch_listings_with_source(
@@ -523,7 +591,7 @@ mod tests {
         let a = sp("a", "a");
 
         let source = MockSource {
-            missing_narinfo: IndexSet::from_iter(["a".to_string()]),
+            missing_narinfo: indexmap::IndexSet::from_iter(["a".to_string()]),
             ..Default::default()
         };
         let mut rx = fetch_listings_with_source(
