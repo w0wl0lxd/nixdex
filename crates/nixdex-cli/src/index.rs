@@ -74,6 +74,10 @@ pub struct Args {
     #[arg(long, default_value = "")]
     pub filter_prefix: String,
 
+    /// Skip paths starting with PREFIX (can be given multiple times).
+    #[arg(long)]
+    pub exclude_prefix: Vec<String>,
+
     /// Build a small database containing only files under `/bin/`.
     ///
     /// This is equivalent to `--filter-prefix /bin/` and is much faster to build
@@ -203,6 +207,7 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
         extra_scopes: args.extra_scopes,
         only_eval: args.only_eval,
         cache_url: args.cache_url,
+        exclude_prefix: args.exclude_prefix,
     };
 
     nixdex_core::update_index(&options)

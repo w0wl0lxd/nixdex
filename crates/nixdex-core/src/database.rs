@@ -234,14 +234,42 @@ impl Writer {
 
     /// Add a package and its file tree to the database.
     ///
-    /// Entries are only added if their path starts with `filter_prefix`.
+    /// Entries are only added if their path starts with `filter_prefix` and does
+    /// not start with any of `exclude_prefixes`.
     /// Packages with no matching entries are skipped.
     ///
     /// # Errors
     ///
     /// Returns an error when encoding or writing fails.
     pub fn add(&mut self, path: &StorePath, files: &FileTree, filter_prefix: &[u8]) -> Result<()> {
-        let entries = files.to_list(filter_prefix);
+        self.add_excluding(path, files, filter_prefix, &[])
+    }
+
+    /// Add a package and its file tree to the database, excluding paths.
+    ///
+    /// Entries are only added if their path starts with `filter_prefix` and does
+    /// not start with any of `exclude_prefixes`.
+    /// Packages with no matching entries are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when encoding or writing fails.
+    pub fn add_excluding(
+        &mut self,
+        path: &StorePath,
+        files: &FileTree,
+        filter_prefix: &[u8],
+        exclude_prefixes: &[&[u8]],
+    ) -> Result<()> {
+        let entries: Vec<FileTreeEntry> = files
+            .to_list(filter_prefix)
+            .into_iter()
+            .filter(|entry| {
+                !exclude_prefixes
+                    .iter()
+                    .any(|prefix| entry.path.starts_with(prefix))
+            })
+            .collect();
         if entries.is_empty() {
             return Ok(());
         }
@@ -1271,6 +1299,8 @@ pub struct SearchOptions<'a> {
     pub min_size: Option<u64>,
     /// Maximum file size in bytes.
     pub max_size: Option<u64>,
+    /// Exclude results from FHS-style packages (`-fhs` / `-usr-target`).
+    pub exclude_fhs: bool,
 }
 
 /// Resolve the set of candidate package ordinals from the basename secondary index.
@@ -1430,6 +1460,13 @@ fn should_include_match(
     }
     if options.max_size.is_some_and(|max| size > max) {
         return false;
+    }
+
+    if options.exclude_fhs {
+        let name = store_path.name();
+        if name.contains("-fhs") || name.contains("-usr-target") {
+            return false;
+        }
     }
 
     true
@@ -1644,10 +1681,10 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
     match options.sort {
         SearchSort::None => {}
         SearchSort::SizeAsc => {
-            results.sort_by(|(_, a), (_, b)| a.node.size().cmp(&b.node.size()));
+            results.sort_by_key(|(_, entry)| entry.node.size());
         }
         SearchSort::SizeDesc => {
-            results.sort_by(|(_, a), (_, b)| b.node.size().cmp(&a.node.size()));
+            results.sort_by_key(|(_, entry)| std::cmp::Reverse(entry.node.size()));
         }
         SearchSort::AttrAsc => {
             results.sort_by(|(a, _), (b, _)| a.origin().attr.cmp(&b.origin().attr));
@@ -1903,6 +1940,7 @@ mod tests {
             sort: SearchSort::None,
             min_size: None,
             max_size: None,
+            exclude_fhs: false,
         };
         search(&options).expect("search ok");
     }
