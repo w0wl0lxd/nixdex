@@ -21,6 +21,7 @@ use regex::bytes::Regex;
 use thiserror::Error;
 
 use indexmap::IndexSet;
+use roaring::RoaringBitmap;
 
 use crate::basename_index::{
     BasenameIndex, BasenameIndexBuilder, FST_FILE, NAMES_FILE, POSTINGS_FILE,
@@ -597,13 +598,13 @@ impl Reader {
         package_pattern: Option<&Regex>,
         hash: Option<&str>,
         package_labels: Option<&IndexSet<String>>,
-        package_ordinals: Option<&IndexSet<u32>>,
+        package_ordinals: Option<&RoaringBitmap>,
     ) -> Result<Vec<(StorePath, FileTreeEntry)>> {
         // Selective frame decompression: if we have a frame_map and candidate ordinals,
         // only decompress frames that contain at least one candidate ordinal.
         // Ordinals are only meaningful when we also know the ordinal at the start
         // of each frame, so disable the filter if the frame map is missing.
-        let filter_ordinals: Option<&IndexSet<u32>> = if self.frame_starts.is_some() {
+        let filter_ordinals: Option<&RoaringBitmap> = if self.frame_starts.is_some() {
             package_ordinals
         } else {
             None
@@ -614,8 +615,8 @@ impl Reader {
                 (&self.frame_map, filter_ordinals, &self.frame_starts)
             {
                 // Collect the set of frame indices that contain any candidate ordinal.
-                let mut needed_frames = IndexSet::new();
-                for &ord in ordinals {
+                let mut needed_frames = RoaringBitmap::new();
+                for ord in ordinals {
                     let idx = usize::try_from(ord)
                         .map_err(|_| Error::Corrupt("package ordinal overflow"))?;
                     if let Some(&frame_idx) = frame_map.get(idx) {
@@ -629,7 +630,7 @@ impl Reader {
                     .enumerate()
                     .filter_map(|(i, (offset, len))| {
                         let i_u32 = u32::try_from(i).ok()?;
-                        if needed_frames.contains(&i_u32) {
+                        if needed_frames.contains(i_u32) {
                             let start_ord = frame_starts.get(i).copied();
                             Some((*offset, *len, start_ord))
                         } else {
@@ -919,7 +920,7 @@ fn search_frame(
     hash: Option<&str>,
     package_labels: Option<&IndexSet<String>>,
     frame_start_ordinal: Option<u32>,
-    package_ordinals: Option<&IndexSet<u32>>,
+    package_ordinals: Option<&RoaringBitmap>,
 ) -> Result<Vec<(StorePath, FileTreeEntry)>> {
     let raw = if compressed.is_empty() {
         Vec::new()
@@ -960,7 +961,7 @@ fn search_frame(
                     .is_none_or(|re| re.is_match(pkg.name().as_bytes()))
                     && hash.is_none_or(|h| h == pkg.hash())
                     && package_labels.is_none_or(|labels| labels.contains(&label))
-                    && package_ordinals.is_none_or(|ordinals| ordinals.contains(&current_ordinal));
+                    && package_ordinals.is_none_or(|ordinals| ordinals.contains(current_ordinal));
 
                 if accept_pkg {
                     for entry in std::mem::take(&mut pending) {
@@ -1051,7 +1052,7 @@ pub struct SearchOptions<'a> {
 fn resolve_package_ordinals(
     index_file: &Path,
     exact_basename: Option<&str>,
-) -> Option<IndexSet<u32>> {
+) -> Option<RoaringBitmap> {
     let base = exact_basename?;
     let dir = index_file.parent()?;
     if dir.as_os_str().is_empty() {
@@ -1206,7 +1207,10 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
     };
 
     let package_ordinals = resolve_package_ordinals(&index_file, options.exact_basename.as_deref());
-    if package_ordinals.as_ref().is_some_and(IndexSet::is_empty) {
+    if package_ordinals
+        .as_ref()
+        .is_some_and(RoaringBitmap::is_empty)
+    {
         return Ok(());
     }
 
@@ -1562,7 +1566,7 @@ mod tests {
         assert!(reader.frame_starts.is_some());
 
         let re = Regex::new(".*").expect("regex");
-        let mut ordinals = IndexSet::new();
+        let mut ordinals = RoaringBitmap::new();
         ordinals.insert(1u32);
 
         let hits = reader
