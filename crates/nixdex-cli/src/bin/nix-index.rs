@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use clap::Parser;
 use color_eyre::eyre::WrapErr;
@@ -102,6 +103,25 @@ struct Args {
         ]
     )]
     extra_scopes: Vec<String>,
+
+    /// Download a prebuilt `files` database instead of evaluating nixpkgs.
+    #[arg(long)]
+    download_prebuilt: bool,
+
+    /// Base URL for the prebuilt index release assets.
+    #[arg(
+        long,
+        default_value = "https://github.com/nix-community/nix-index-database/releases/latest/download"
+    )]
+    prebuilt_url: String,
+
+    /// Architecture identifier for the prebuilt index (e.g. `x86_64-linux`).
+    #[arg(long)]
+    prebuilt_arch: Option<String>,
+
+    /// Download the `-small` prebuilt variant.
+    #[arg(long)]
+    prebuilt_small: bool,
 }
 
 #[tokio::main]
@@ -112,6 +132,24 @@ async fn main() -> color_eyre::Result<()> {
         .init();
 
     let args = Args::parse();
+
+    if args.download_prebuilt {
+        let config = nixdex_core::prebuilt::PrebuiltConfig {
+            release_url: args.prebuilt_url,
+            architecture: args
+                .prebuilt_arch
+                .unwrap_or_else(nixdex_core::prebuilt::default_architecture),
+            small: args.prebuilt_small,
+            cache_dir: args.database.clone(),
+            refresh_interval: Duration::ZERO,
+        };
+        let dest = args.database.join("files");
+        nixdex_core::prebuilt::download_to(&config, &dest)
+            .await
+            .wrap_err("failed to download prebuilt index")?;
+        return Ok(());
+    }
+
     let options = nixdex_core::index::UpdateOptions {
         jobs: args.jobs,
         database: args.database,
