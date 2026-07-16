@@ -1209,6 +1209,34 @@ pub enum SearchMode {
     Minimal,
 }
 
+/// Sort order for search results.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SearchSort {
+    /// Preserve the order returned by the database reader.
+    #[default]
+    None,
+    /// Sort by file size ascending.
+    SizeAsc,
+    /// Sort by file size descending.
+    SizeDesc,
+    /// Sort by attribute path ascending.
+    AttrAsc,
+}
+
+impl std::str::FromStr for SearchSort {
+    type Err = crate::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "" | "none" | "relevance" => Ok(Self::None),
+            "size" | "size-asc" => Ok(Self::SizeAsc),
+            "size-desc" => Ok(Self::SizeDesc),
+            "attr" | "attr-asc" => Ok(Self::AttrAsc),
+            _ => Err(crate::Error::Parse(format!("unknown sort order: {s}"))),
+        }
+    }
+}
+
 /// Options for a database search.
 #[derive(Debug, Clone)]
 pub struct SearchOptions<'a> {
@@ -1237,6 +1265,12 @@ pub struct SearchOptions<'a> {
     pub limit: Option<usize>,
     /// Print the number of matching entries instead of the entries themselves.
     pub count: bool,
+    /// Sort order for results.
+    pub sort: SearchSort,
+    /// Minimum file size in bytes.
+    pub min_size: Option<u64>,
+    /// Maximum file size in bytes.
+    pub max_size: Option<u64>,
 }
 
 /// Resolve the set of candidate package ordinals from the basename secondary index.
@@ -1387,6 +1421,14 @@ fn should_include_match(
 
     let entry_type = entry.node.get_type();
     if !options.file_type.is_empty() && !options.file_type.contains(&entry_type) {
+        return false;
+    }
+
+    let size = entry.node.size();
+    if options.min_size.is_some_and(|min| size < min) {
+        return false;
+    }
+    if options.max_size.is_some_and(|max| size > max) {
         return false;
     }
 
@@ -1586,7 +1628,7 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
         source: Box::new(source),
     })?;
 
-    let results = reader
+    let mut results = reader
         .search_entries(
             &path_pattern,
             package_re.as_ref(),
@@ -1598,6 +1640,19 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
             path: index_file,
             source: Box::new(source),
         })?;
+
+    match options.sort {
+        SearchSort::None => {}
+        SearchSort::SizeAsc => {
+            results.sort_by(|(_, a), (_, b)| a.node.size().cmp(&b.node.size()));
+        }
+        SearchSort::SizeDesc => {
+            results.sort_by(|(_, a), (_, b)| b.node.size().cmp(&a.node.size()));
+        }
+        SearchSort::AttrAsc => {
+            results.sort_by(|(a, _), (b, _)| a.origin().attr.cmp(&b.origin().attr));
+        }
+    }
 
     // Track printed attrs for --minimal de-duplication (ordered set).
     let mut printed_attrs: IndexSet<String> = IndexSet::new();
@@ -1845,6 +1900,9 @@ mod tests {
             json: false,
             limit: None,
             count: false,
+            sort: SearchSort::None,
+            min_size: None,
+            max_size: None,
         };
         search(&options).expect("search ok");
     }
