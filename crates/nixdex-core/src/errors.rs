@@ -93,6 +93,10 @@ pub enum Error {
     /// Requested functionality is not implemented yet.
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
+
+    /// Prebuilt index management failed.
+    #[error("prebuilt index error: {0}")]
+    Prebuilt(#[from] crate::prebuilt::Error),
 }
 
 /// Convenience alias used throughout the library.
