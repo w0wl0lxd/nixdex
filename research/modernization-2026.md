@@ -16,11 +16,11 @@ Evidence-backed survey of how to modernize, accelerate, and surpass
 | Component | Status |
 |-----------|--------|
 | NIXI magic + version 1 + single zstd frame + frcode | Implemented (`database.rs`) |
-| Linear `search_entries` | Implemented |
-| `Reader::query_fst` | Stub → `Error::NotImplemented` |
+| Parallel lazy `search_entries` (per-CPU zstd frames) | Implemented |
+| `Reader::query_fst` | Implemented (`basename_index.rs`) |
 | `--path-cache` | Hard-errors (by design) until real |
 | Index pipeline eval → concurrent fetch → serial write | Implemented (`index.rs`) |
-| Workspace deps `fst`, `redb`, `roaring`, `moka`, `scc`, `postcard` | Declared, **zero `use` in source** |
+| Workspace deps `fst`, `redb`, `roaring`, `moka`, `scc`, `postcard` | `fst`, `roaring` used; `redb`, `moka`, `scc`, `postcard` removed |
 | Wave 4 small.nix locate | ~700 µs (startup-dominated) |
 | Full `<nixpkgs>` index | Not measured; costly |
 

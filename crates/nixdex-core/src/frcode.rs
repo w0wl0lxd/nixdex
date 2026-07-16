@@ -122,39 +122,53 @@ impl<R: BufRead> Decoder<R> {
     }
 
     fn copy_shared(&mut self) -> Result<bool> {
-        let shared_len = self.shared_len as usize;
-        let new_pos = self.pos + shared_len;
-        let new_last_path = self.pos;
-        if !self.buf.resize(new_pos) {
-            return Ok(false);
-        }
-
-        if self.shared_len < 0 || self.last_path + shared_len > self.pos {
+        if self.shared_len < 0 {
             return Err(Error::SharedOutOfRange {
                 previous_len: self.pos - self.last_path,
                 shared_len: self.shared_len,
             });
         }
 
+        let shared_len = self.shared_len as usize;
+        let previous_len = self.pos - self.last_path;
+        if shared_len > previous_len {
+            return Err(Error::SharedOutOfRange {
+                previous_len,
+                shared_len: self.shared_len,
+            });
+        }
+
+        let new_pos = self
+            .pos
+            .checked_add(shared_len)
+            .ok_or(Error::SharedOutOfRange {
+                previous_len,
+                shared_len: self.shared_len,
+            })?;
+        if !self.buf.resize(new_pos) {
+            return Ok(false);
+        }
+
+        let new_last_path = self.pos;
         let (_, last) = self.buf.split_at_mut(self.last_path);
-        let (last, new) = last.split_at_mut(self.pos - self.last_path);
-        if let Some(dst) = new.get_mut(..shared_len) {
-            if let Some(src) = last.get(..shared_len) {
+        let (src, dst) = last.split_at_mut(previous_len);
+        if let Some(dst) = dst.get_mut(..shared_len) {
+            if let Some(src) = src.get(..shared_len) {
                 dst.copy_from_slice(src);
             } else {
                 return Err(Error::SharedOutOfRange {
-                    previous_len: self.pos - self.last_path,
+                    previous_len,
                     shared_len: self.shared_len,
                 });
             }
         } else {
             return Err(Error::SharedOutOfRange {
-                previous_len: self.pos - self.last_path,
+                previous_len,
                 shared_len: self.shared_len,
             });
         }
 
-        self.pos += shared_len;
+        self.pos = new_pos;
         self.last_path = new_last_path;
         Ok(true)
     }
