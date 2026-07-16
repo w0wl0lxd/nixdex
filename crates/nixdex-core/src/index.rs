@@ -25,6 +25,8 @@ pub struct UpdateOptions {
     pub system: Option<String>,
     /// Zstandard compression level for the on-disk database.
     pub compression_level: i32,
+    /// On-disk database format version (1 or 2).
+    pub format_version: u64,
     /// Pass `--show-trace` to Nix evaluation.
     pub show_trace: bool,
     /// Only index paths starting with this prefix.
@@ -43,6 +45,7 @@ impl Default for UpdateOptions {
             nixpkgs: String::from("<nixpkgs>"),
             system: None,
             compression_level: 22,
+            format_version: 1,
             show_trace: false,
             filter_prefix: String::new(),
             path_cache: false,
@@ -96,12 +99,12 @@ impl IndexBuilder {
         })?;
 
         let db_file = opts.database.join("files");
-        let mut writer = Writer::create(&db_file, opts.compression_level).map_err(|source| {
-            Error::CreateDatabase {
-                path: db_file.clone(),
-                source: Box::new(source),
-            }
-        })?;
+        let mut writer =
+            Writer::create_with_version(&db_file, opts.compression_level, opts.format_version)
+                .map_err(|source| Error::CreateDatabase {
+                    path: db_file.clone(),
+                    source: Box::new(source),
+                })?;
 
         // Root set + each extra scope (mirrors upstream nix-index multi-query).
         let packages = nixpkgs::list_packages_with_scopes(
@@ -215,6 +218,7 @@ mod tests {
         let opts = UpdateOptions::default();
         assert_eq!(opts.jobs, 100);
         assert_eq!(opts.compression_level, 22);
+        assert_eq!(opts.format_version, 1);
         assert_eq!(opts.nixpkgs, "<nixpkgs>");
         assert!(!opts.path_cache);
     }
@@ -233,6 +237,7 @@ mod tests {
             nixpkgs: expr.to_string(),
             system: None,
             compression_level: 3,
+            format_version: 1,
             show_trace: false,
             filter_prefix: "/bin/".into(),
             path_cache: false,
