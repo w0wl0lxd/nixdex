@@ -1262,6 +1262,7 @@ dependencies = [
  "rayon",
  "redb",
  "regex",
+ "regex-syntax",
  "reqwest",
  "roaring",
  "rustc-hash",

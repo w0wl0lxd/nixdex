@@ -1,18 +1,21 @@
 //! Creating and searching NIXI-compatible file databases.
 //!
 //! Format (compatible with upstream `nix-index`):
-//! - magic `NIXI` + `u64` LE version `1`
-//! - zstd stream of frcode blocks
+//! - magic `NIXI` + `u64` LE version `1` or `2`
+//! - v1: single zstd frame of concatenated package frcode data
+//! - v2: independent zstd frames cut only at package boundaries, followed by a
+//!   trailing zstd skippable frame with a seek table
 //! - per package: file entries, then footer entry with metadata `p` and JSON `StorePath`
 //!
 //! Optional secondary index (nixdex): basename FST sidecars next to `files`
 //! (see [`crate::basename_index`]).
 
-use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
+use std::fs::{self, File};
+use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{LittleEndian, WriteBytesExt};
+use rayon::prelude::*;
 use regex::bytes::Regex;
 use thiserror::Error;
 
@@ -23,11 +26,17 @@ use crate::files::{FileNode, FileTree, FileTreeEntry, FileType};
 use crate::frcode;
 use crate::store_path::StorePath;
 
-/// Database format version supported by this build.
-const FORMAT_VERSION: u64 = 1;
+/// Database format versions supported by this build.
+const SUPPORTED_VERSIONS: &[u64] = &[1, 2];
+
+/// Default on-disk format version written by [`Writer::create`].
+const DEFAULT_WRITE_VERSION: u64 = 1;
 
 /// Magic bytes identifying a nix-index / nixdex database file.
 const FILE_MAGIC: &[u8] = b"NIXI";
+
+/// Magic of the trailing zstd skippable frame used by version 2 seek tables.
+const SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
 
 /// Errors that can occur when reading or writing a database.
 #[derive(Error, Debug)]
@@ -44,13 +53,16 @@ pub enum Error {
 
     /// Database format version is newer (or older) than supported.
     #[error(
-        "this executable only supports the nix-index database version {}, but found a database with version {found}",
-        FORMAT_VERSION
+        "this executable only supports the nix-index database versions 1 and 2, but found a database with version {found}"
     )]
     UnsupportedVersion {
         /// Version number found in the header.
         found: u64,
     },
+
+    /// Database payload is internally inconsistent or truncated.
+    #[error("database corrupt: {0}")]
+    Corrupt(&'static str),
 
     /// Package entry required by a file listing was missing.
     #[error("database corrupt: missing package entry")]
@@ -103,21 +115,28 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Writer that creates a new NIXI database file.
-#[allow(clippy::struct_field_names)] // encoder field names mirror the stream lifecycle
 pub struct Writer {
-    /// Inner encoder; `None` after finish / drop.
-    encoder: Option<BufWriter<zstd::Encoder<'static, File>>>,
     /// Path of the NIXI `files` blob (used to place sidecars beside it).
     path: PathBuf,
+    /// Zstd compression level used during `finish`.
+    level: i32,
+    /// On-disk format version to write (1 or 2).
+    version: u64,
+    /// Accumulated raw frcode data for all packages added so far.
+    raw: Vec<u8>,
+    /// End offsets in `raw` for each complete package frame.
+    boundaries: Vec<usize>,
     /// Optional basename index accumulated during `add`.
     basename_index: BasenameIndexBuilder,
+    /// Whether `finish` has already materialized the on-disk file.
+    finished: bool,
 }
 
 impl Drop for Writer {
     fn drop(&mut self) {
-        if self.encoder.is_some() {
+        if !self.finished {
             // Best-effort finish; callers should prefer `finish()` for error reporting.
-            let _ = self.finish_encoder();
+            let _ = self.do_finish();
         }
     }
 }
@@ -125,21 +144,36 @@ impl Drop for Writer {
 impl Writer {
     /// Creates a new database at the given path with the specified zstd compression level.
     ///
+    /// Writes version 1 for backwards compatibility. Use
+    /// [`create_with_version`](Self::create_with_version) to request version 2.
+    ///
     /// # Errors
     ///
-    /// Returns an I/O error if the file cannot be created or the header written.
+    /// Returns an error if the version is unsupported.
     pub fn create<P: AsRef<Path>>(path: P, level: i32) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let mut file = File::create(&path)?;
-        file.write_all(FILE_MAGIC)?;
-        file.write_u64::<LittleEndian>(FORMAT_VERSION)?;
-        let encoder = zstd::Encoder::new(file, level)?;
-        // Multithreading is optional; ignore failure on platforms that disallow it.
-        // (zstd::Encoder::multithread returns Result on some versions.)
+        Self::create_with_version(path, level, DEFAULT_WRITE_VERSION)
+    }
+
+    /// Creates a new database at the given path with the specified zstd compression level
+    /// and on-disk format version.
+    ///
+    /// `version` must be `1` or `2`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the version is unsupported.
+    pub fn create_with_version<P: AsRef<Path>>(path: P, level: i32, version: u64) -> Result<Self> {
+        if !SUPPORTED_VERSIONS.contains(&version) {
+            return Err(Error::UnsupportedVersion { found: version });
+        }
         Ok(Self {
-            encoder: Some(BufWriter::new(encoder)),
-            path,
+            path: path.as_ref().to_path_buf(),
+            level,
+            version,
+            raw: Vec::new(),
+            boundaries: Vec::new(),
             basename_index: BasenameIndexBuilder::new(),
+            finished: false,
         })
     }
 
@@ -151,12 +185,7 @@ impl Writer {
     /// # Errors
     ///
     /// Returns an error when encoding or writing fails.
-    pub fn add(
-        &mut self,
-        path: &StorePath,
-        files: &FileTree,
-        filter_prefix: &[u8],
-    ) -> Result<()> {
+    pub fn add(&mut self, path: &StorePath, files: &FileTree, filter_prefix: &[u8]) -> Result<()> {
         let entries = files.to_list(filter_prefix);
         if entries.is_empty() {
             return Ok(());
@@ -166,27 +195,88 @@ impl Writer {
         let paths: Vec<Vec<u8>> = entries.iter().map(|e| e.path.clone()).collect();
         self.basename_index.record_package(label, paths)?;
 
-        let stream = self.encoder.as_mut().ok_or_else(|| {
-            Error::Io(io::Error::other("database writer already finished"))
-        })?;
-
+        let mut package = Vec::new();
         let json = sonic_rs::to_vec(path).map_err(|err| Error::Json(err.to_string()))?;
-        let mut fr = frcode::Encoder::new(stream, b"p".to_vec(), json)?;
+        let mut fr = frcode::Encoder::new(&mut package, b"p".to_vec(), json)?;
         for entry in entries {
             entry.encode(&mut fr)?;
         }
         fr.finish()?;
+
+        self.raw.extend_from_slice(&package);
+        self.boundaries.push(self.raw.len());
         Ok(())
     }
 
-    fn finish_encoder(&mut self) -> Result<File> {
-        let buffered = self.encoder.take().ok_or_else(|| {
-            Error::Io(io::Error::other("database writer already finished"))
-        })?;
-        let encoder = buffered
-            .into_inner()
-            .map_err(|err| io::Error::other(err.to_string()))?;
-        Ok(encoder.finish()?)
+    fn do_finish(&mut self) -> Result<u64> {
+        if self.finished {
+            return Ok(0);
+        }
+        self.finished = true;
+
+        let raw = std::mem::take(&mut self.raw);
+        let mut file = File::create(&self.path)?;
+        file.write_all(FILE_MAGIC)?;
+        file.write_u64::<LittleEndian>(self.version)?;
+
+        match self.version {
+            1 => {
+                let compressed = zstd::encode_all(&raw[..], self.level)?;
+                file.write_all(&compressed)?;
+            }
+            2 => {
+                let mut compressed_frames: Vec<Vec<u8>> =
+                    Vec::with_capacity(self.boundaries.len().max(1));
+                let mut prev = 0;
+                for &end in &self.boundaries {
+                    let slice = raw
+                        .get(prev..end)
+                        .ok_or(Error::Corrupt("package boundary out of range"))?;
+                    compressed_frames.push(zstd::encode_all(slice, self.level)?);
+                    prev = end;
+                }
+
+                for frame in &compressed_frames {
+                    file.write_all(frame)?;
+                }
+
+                let frame_count = u32::try_from(compressed_frames.len())
+                    .map_err(|_| Error::Corrupt("frame count overflow"))?;
+                let payload_len = 4usize
+                    .checked_add(
+                        compressed_frames
+                            .len()
+                            .checked_mul(4)
+                            .ok_or(Error::Corrupt("seek table length overflow"))?,
+                    )
+                    .and_then(|len| len.checked_add(4))
+                    .ok_or(Error::Corrupt("seek table length overflow"))?;
+                let payload_len_u32 = u32::try_from(payload_len)
+                    .map_err(|_| Error::Corrupt("seek table length overflow"))?;
+
+                file.write_all(&SKIPPABLE_MAGIC.to_le_bytes())?;
+                file.write_all(&payload_len_u32.to_le_bytes())?;
+                file.write_all(&frame_count.to_le_bytes())?;
+                for frame in &compressed_frames {
+                    let len_u32 = u32::try_from(frame.len())
+                        .map_err(|_| Error::Corrupt("compressed frame length overflow"))?;
+                    file.write_all(&len_u32.to_le_bytes())?;
+                }
+                file.write_all(&payload_len_u32.to_le_bytes())?;
+            }
+            _ => unreachable!(),
+        }
+
+        file.flush()?;
+        let size = file.stream_position()?;
+
+        if let Some(dir) = self.path.parent()
+            && !dir.as_os_str().is_empty()
+        {
+            self.basename_index.write_sidecars(dir)?;
+        }
+
+        Ok(size)
     }
 
     /// Finish writing the NIXI stream and basename sidecars; return compressed size.
@@ -197,21 +287,17 @@ impl Writer {
     ///
     /// Returns an I/O or secondary-index error if finalization fails.
     pub fn finish(mut self) -> Result<u64> {
-        let mut file = self.finish_encoder()?;
-        let size = file.stream_position()?;
-        if let Some(dir) = self.path.parent()
-            && !dir.as_os_str().is_empty()
-        {
-            self.basename_index.write_sidecars(dir)?;
-        }
-        Ok(size)
+        self.do_finish()
     }
 }
 
 /// Reader that opens an existing NIXI database file.
+#[derive(Debug)]
 pub struct Reader {
-    decoder: frcode::Decoder<BufReader<zstd::Decoder<'static, BufReader<File>>>>,
     path: PathBuf,
+    version: u64,
+    /// Each frame is a fully decompressed frcode package stream.
+    frames: Vec<Vec<u8>>,
 }
 
 impl Reader {
@@ -222,25 +308,44 @@ impl Reader {
     /// Returns an error if the path does not exist or is not a valid database.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path_buf = path.as_ref().to_path_buf();
-        let mut file = File::open(&path_buf)?;
-        let mut magic = [0u8; 4];
-        file.read_exact(&mut magic)?;
+        let data = fs::read(&path_buf)?;
 
+        if data.len() < 12 {
+            return Err(Error::Corrupt("database file too short for header"));
+        }
+
+        let magic = data
+            .get(..4)
+            .ok_or(Error::Corrupt("database header magic missing"))?;
         if magic != FILE_MAGIC {
             return Err(Error::UnsupportedFileType {
                 found: magic.to_vec(),
             });
         }
 
-        let version = file.read_u64::<LittleEndian>()?;
-        if version != FORMAT_VERSION {
+        let version = u64::from_le_bytes(
+            data.get(4..12)
+                .ok_or(Error::Corrupt("database header truncated"))?
+                .try_into()
+                .map_err(|_| Error::Corrupt("database header length"))?,
+        );
+        if !SUPPORTED_VERSIONS.contains(&version) {
             return Err(Error::UnsupportedVersion { found: version });
         }
 
-        let decoder = zstd::Decoder::new(file)?;
+        let body = data
+            .get(12..)
+            .ok_or(Error::Corrupt("database header truncated"))?;
+        let frames = match version {
+            1 => load_v1_frames(body)?,
+            2 => load_v2_frames(body)?,
+            _ => unreachable!(),
+        };
+
         Ok(Self {
-            decoder: frcode::Decoder::new(BufReader::new(decoder)),
             path: path_buf,
+            version,
+            frames,
         })
     }
 
@@ -250,74 +355,36 @@ impl Reader {
         &self.path
     }
 
-    /// Linearly scan the database, yielding `(StorePath, FileTreeEntry)` matches.
+    /// Return the on-disk format version of the opened database.
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Scan every frame in parallel, yielding `(StorePath, FileTreeEntry)` matches.
     ///
-    /// Wave 3 uses a simple linear frcode scan. An FST-backed path index may be
-    /// layered on later for sub-millisecond cold queries.
+    /// Each frame is a complete frcode package stream, so decompression and
+    /// decoding can be parallelized.
     ///
     /// # Errors
     ///
-    /// Returns an error if the database stream is corrupt or I/O fails.
+    /// Returns an error if a frame is corrupt or I/O fails.
     pub fn search_entries(
-        &mut self,
+        &self,
         path_pattern: &Regex,
         package_pattern: Option<&Regex>,
         hash: Option<&str>,
     ) -> Result<Vec<(StorePath, FileTreeEntry)>> {
+        let per_frame: Vec<Vec<(StorePath, FileTreeEntry)>> = self
+            .frames
+            .par_iter()
+            .map(|frame| search_frame(frame, path_pattern, package_pattern, hash))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
         let mut matches = Vec::new();
-        // Current package being accumulated: entries first, package marker last.
-        let mut pending: Vec<FileTreeEntry> = Vec::new();
-
-        loop {
-            let block = self.decoder.decode()?;
-            if block.is_empty() {
-                break;
-            }
-
-            for line in block.split(|c| *c == b'\n') {
-                if line.is_empty() {
-                    continue;
-                }
-
-                // Package terminator: metadata starts with 'p' and path is JSON.
-                if line.starts_with(b"p\0") {
-                    let Some(json) = line.get(2..) else {
-                        return Err(Error::StorePathParse {
-                            path: line.to_vec(),
-                        });
-                    };
-                    let pkg: StorePath =
-                        sonic_rs::from_slice(json).map_err(|_| Error::StorePathParse {
-                            path: json.to_vec(),
-                        })?;
-
-                    let accept_pkg = package_pattern
-                        .is_none_or(|re| re.is_match(pkg.name().as_bytes()))
-                        && hash.is_none_or(|h| h == pkg.hash());
-
-                    if accept_pkg {
-                        for entry in std::mem::take(&mut pending) {
-                            if path_pattern.is_match(&entry.path) {
-                                matches.push((pkg.clone(), entry));
-                            }
-                        }
-                    } else {
-                        pending.clear();
-                    }
-                    continue;
-                }
-
-                let entry = FileTreeEntry::decode(line).map_err(|_| Error::EntryParse {
-                    entry: line.to_vec(),
-                })?;
-                pending.push(entry);
-            }
+        for frame_matches in per_frame {
+            matches.extend(frame_matches);
         }
-
-        if !pending.is_empty() {
-            return Err(Error::MissingPackageEntry);
-        }
-
         Ok(matches)
     }
 
@@ -344,6 +411,166 @@ impl Reader {
         let index = BasenameIndex::open(dir)?;
         Ok(index.lookup_basename(pattern.as_bytes())?)
     }
+}
+
+fn load_v1_frames(body: &[u8]) -> Result<Vec<Vec<u8>>> {
+    if body.is_empty() {
+        return Ok(Vec::new());
+    }
+    let frame = zstd::decode_all(body)?;
+    Ok(vec![frame])
+}
+
+fn load_v2_frames(body: &[u8]) -> Result<Vec<Vec<u8>>> {
+    if body.len() < 8 {
+        return Err(Error::Corrupt("v2 database too short for seek table"));
+    }
+
+    let payload_len = read_u32_le(body, body.len() - 4)? as usize;
+    let skippable_size = 8usize
+        .checked_add(payload_len)
+        .ok_or(Error::Corrupt("v2 seek table size overflow"))?;
+    if body.len() < skippable_size {
+        return Err(Error::Corrupt("v2 seek table truncated"));
+    }
+
+    let skippable_start = body.len() - skippable_size;
+    let magic = read_u32_le(body, skippable_start)?;
+    if magic != SKIPPABLE_MAGIC {
+        return Err(Error::Corrupt("v2 trailing magic mismatch"));
+    }
+
+    let declared_size = read_u32_le(body, skippable_start + 4)? as usize;
+    if declared_size != payload_len {
+        return Err(Error::Corrupt("v2 seek table size mismatch"));
+    }
+
+    let payload_start = skippable_start + 8;
+    let payload = body
+        .get(payload_start..payload_start + payload_len)
+        .ok_or(Error::Corrupt("v2 seek table payload overflow"))?;
+
+    if payload.len() < 4 {
+        return Err(Error::Corrupt("v2 seek table payload too short"));
+    }
+    let frame_count = read_u32_le(payload, 0)? as usize;
+    let expected_payload_len = 4usize
+        .checked_add(
+            frame_count
+                .checked_mul(4)
+                .ok_or(Error::Corrupt("v2 seek table length overflow"))?,
+        )
+        .and_then(|len| len.checked_add(4))
+        .ok_or(Error::Corrupt("v2 seek table length overflow"))?;
+    if expected_payload_len != payload_len {
+        return Err(Error::Corrupt("v2 seek table length mismatch"));
+    }
+
+    let mut lens = Vec::with_capacity(frame_count);
+    for i in 0..frame_count {
+        lens.push(read_u32_le(payload, 4 + i * 4)? as usize);
+    }
+    let trailing = read_u32_le(payload, payload_len - 4)? as usize;
+    if trailing != payload_len {
+        return Err(Error::Corrupt("v2 trailing payload length mismatch"));
+    }
+
+    let frames_end = skippable_start;
+    let total_compressed = lens.iter().try_fold(0usize, |acc, &len| {
+        acc.checked_add(len)
+            .ok_or(Error::Corrupt("v2 compressed length overflow"))
+    })?;
+    if total_compressed != frames_end {
+        return Err(Error::Corrupt("v2 compressed length mismatch"));
+    }
+
+    let mut frames = Vec::with_capacity(frame_count);
+    let mut offset = 0usize;
+    for len in lens {
+        let next = offset
+            .checked_add(len)
+            .ok_or(Error::Corrupt("v2 frame offset overflow"))?;
+        let compressed = body
+            .get(offset..next)
+            .ok_or(Error::Corrupt("v2 frame slice overflow"))?;
+        frames.push(zstd::decode_all(compressed)?);
+        offset = next;
+    }
+
+    Ok(frames)
+}
+
+fn read_u32_le(bytes: &[u8], at: usize) -> Result<u32> {
+    let end = at
+        .checked_add(4)
+        .ok_or(Error::Corrupt("u32 offset overflow"))?;
+    let slice = bytes
+        .get(at..end)
+        .ok_or(Error::Corrupt("u32 read past end"))?;
+    let arr: [u8; 4] = slice
+        .try_into()
+        .map_err(|_| Error::Corrupt("u32 slice length"))?;
+    Ok(u32::from_le_bytes(arr))
+}
+
+fn search_frame(
+    frame: &[u8],
+    path_pattern: &Regex,
+    package_pattern: Option<&Regex>,
+    hash: Option<&str>,
+) -> Result<Vec<(StorePath, FileTreeEntry)>> {
+    let mut matches = Vec::new();
+    let mut pending: Vec<FileTreeEntry> = Vec::new();
+    let mut decoder = frcode::Decoder::new(std::io::Cursor::new(frame));
+
+    loop {
+        let block = decoder.decode()?;
+        if block.is_empty() {
+            break;
+        }
+
+        for line in block.split(|c| *c == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+
+            if line.starts_with(b"p\0") {
+                let json = line.get(2..).ok_or_else(|| Error::StorePathParse {
+                    path: line.to_vec(),
+                })?;
+                let pkg: StorePath =
+                    sonic_rs::from_slice(json).map_err(|_| Error::StorePathParse {
+                        path: json.to_vec(),
+                    })?;
+
+                let accept_pkg = package_pattern
+                    .is_none_or(|re| re.is_match(pkg.name().as_bytes()))
+                    && hash.is_none_or(|h| h == pkg.hash());
+
+                if accept_pkg {
+                    for entry in std::mem::take(&mut pending) {
+                        if path_pattern.is_match(&entry.path) {
+                            matches.push((pkg.clone(), entry));
+                        }
+                    }
+                } else {
+                    pending.clear();
+                }
+                continue;
+            }
+
+            let entry = FileTreeEntry::decode(line).map_err(|_| Error::EntryParse {
+                entry: line.to_vec(),
+            })?;
+            pending.push(entry);
+        }
+    }
+
+    if !pending.is_empty() {
+        return Err(Error::MissingPackageEntry);
+    }
+
+    Ok(matches)
 }
 
 /// Output mode for a search request.
@@ -387,7 +614,7 @@ pub struct SearchOptions<'a> {
 #[allow(clippy::print_stdout)] // search is a CLI-facing printer for now
 pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
     let index_file = options.database.join("files");
-    let mut reader = Reader::open(&index_file).map_err(|source| crate::Error::ReadDatabase {
+    let reader = Reader::open(&index_file).map_err(|source| crate::Error::ReadDatabase {
         path: index_file.clone(),
         source: Box::new(source),
     })?;
@@ -403,11 +630,7 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
     };
 
     let results = reader
-        .search_entries(
-            &path_pattern,
-            package_re.as_ref(),
-            options.hash.as_deref(),
-        )
+        .search_entries(&path_pattern, package_re.as_ref(), options.hash.as_deref())
         .map_err(|source| crate::Error::ReadDatabase {
             path: index_file,
             source: Box::new(source),
@@ -525,6 +748,7 @@ mod tests {
     use crate::files::FileTree;
     use crate::store_path::Origin;
     use bytes::Bytes;
+    use std::io::Read;
 
     fn sample_store_path() -> StorePath {
         StorePath::new(
@@ -571,11 +795,9 @@ mod tests {
         f.read_exact(&mut magic).expect("magic");
         assert_eq!(&magic, b"NIXI");
 
-        let mut reader = Reader::open(&db_path).expect("reader");
+        let reader = Reader::open(&db_path).expect("reader");
         let re = Regex::new("bin/hello").expect("regex");
-        let hits = reader
-            .search_entries(&re, None, None)
-            .expect("search");
+        let hits = reader.search_entries(&re, None, None).expect("search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0.name(), "hello-2.12");
         assert_eq!(hits[0].1.path, b"/bin/hello");
@@ -606,7 +828,7 @@ mod tests {
             writer.finish().expect("finish");
         }
 
-        let mut reader = Reader::open(&db_path).expect("reader");
+        let reader = Reader::open(&db_path).expect("reader");
         let re = Regex::new(".*").expect("regex");
         let hits = reader.search_entries(&re, None, None).expect("search");
         assert!(hits.is_empty());
@@ -670,5 +892,119 @@ mod tests {
 
         let none = reader.query_fst("missing-binary").expect("missing");
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn v2_writer_reader_roundtrip_and_search() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+
+        let path = sample_store_path();
+        let tree = sample_tree();
+
+        {
+            let mut writer = Writer::create_with_version(&db_path, 3, 2).expect("create v2");
+            writer.add(&path, &tree, b"").expect("add");
+            let size = writer.finish().expect("finish");
+            assert!(size > 0);
+        }
+
+        let reader = Reader::open(&db_path).expect("reader");
+        assert_eq!(reader.version(), 2);
+
+        let re = Regex::new("bin/hello").expect("regex");
+        let hits = reader.search_entries(&re, None, None).expect("search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0.name(), "hello-2.12");
+        assert_eq!(hits[0].1.path, b"/bin/hello");
+
+        // Sidecars are still produced on finish.
+        assert!(dir.path().join("files.basename.fst").is_file());
+    }
+
+    #[test]
+    fn v2_multiple_packages_yield_one_frame_each() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+
+        let hello = sample_store_path();
+        let hello_tree = sample_tree();
+        let coreutils = StorePath::new(
+            "/nix/store".into(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            "coreutils-9.11".into(),
+            Origin {
+                attr: "coreutils".into(),
+                output: "out".into(),
+                toplevel: true,
+                system: Some("x86_64-linux".into()),
+            },
+        );
+        let coreutils_tree = FileTree::directory(vec![(
+            Bytes::from_static(b"bin"),
+            FileTree::directory(vec![
+                (Bytes::from_static(b"ls"), FileTree::regular(0, true)),
+                (Bytes::from_static(b"cat"), FileTree::regular(0, true)),
+            ]),
+        )]);
+
+        {
+            let mut writer = Writer::create_with_version(&db_path, 1, 2).expect("create v2");
+            writer.add(&hello, &hello_tree, b"").expect("add hello");
+            writer
+                .add(&coreutils, &coreutils_tree, b"")
+                .expect("add coreutils");
+            writer.finish().expect("finish");
+        }
+
+        let reader = Reader::open(&db_path).expect("reader");
+        assert_eq!(reader.version(), 2);
+
+        let re = Regex::new(".*").expect("regex");
+        let hits = reader.search_entries(&re, None, None).expect("search");
+        // Each tree also emits a synthetic root entry with an empty path.
+        assert_eq!(hits.len(), 7);
+
+        // Parse the trailing seek table and confirm there are two frames.
+        let data = fs::read(&db_path).expect("read db");
+        let payload_len_bytes = data
+            .get(data.len() - 4..)
+            .expect("last 4 bytes")
+            .try_into()
+            .expect("4 bytes");
+        let payload_len = u32::from_le_bytes(payload_len_bytes) as usize;
+        let payload_start = data.len() - payload_len;
+        let frame_count_bytes = data
+            .get(payload_start..payload_start + 4)
+            .expect("frame count bytes")
+            .try_into()
+            .expect("4 bytes");
+        let frame_count = u32::from_le_bytes(frame_count_bytes);
+        assert_eq!(frame_count, 2);
+    }
+
+    #[test]
+    fn v2_corrupt_seek_table_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+
+        let path = sample_store_path();
+        let tree = sample_tree();
+
+        {
+            let mut writer = Writer::create_with_version(&db_path, 1, 2).expect("create v2");
+            writer.add(&path, &tree, b"").expect("add");
+            writer.finish().expect("finish");
+        }
+
+        let mut data = fs::read(&db_path).expect("read db");
+        // Corrupt the trailing payload-length duplicate so it no longer matches
+        // the declared frame size.
+        let last = data.len() - 1;
+        data[last] = data[last].wrapping_add(1);
+        fs::write(&db_path, &data).expect("rewrite corrupt db");
+
+        let err = Reader::open(&db_path).expect_err("corrupt db should fail");
+        assert!(matches!(err, Error::Corrupt(_)));
     }
 }

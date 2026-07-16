@@ -37,6 +37,7 @@ ahash = { workspace = true }
 indexmap = { workspace = true }
 byteorder = { workspace = true }
 regex = { workspace = true }
+regex-syntax = { workspace = true }
 clap = { workspace = true, optional = true }
 
 [dev-dependencies]

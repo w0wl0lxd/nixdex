@@ -188,9 +188,7 @@ impl<R: BufRead> Decoder<R> {
 
                 let new_pos = *pos + len;
                 if buf.resize(new_pos) {
-                    if let (Some(dst), Some(src)) =
-                        (buf.get_mut(*pos..new_pos), input.get(..len))
-                    {
+                    if let (Some(dst), Some(src)) = (buf.get_mut(*pos..new_pos), input.get(..len)) {
                         dst.copy_from_slice(src);
                     }
                     *pos = new_pos;
@@ -256,11 +254,8 @@ impl<R: BufRead> Decoder<R> {
 
         self.buf.allow_resize = true;
 
-        let mut found_nul = self.pos > 0
-            && self
-                .buf
-                .get(self.pos - 1)
-                .is_some_and(|b| *b == b'\x00');
+        let mut found_nul =
+            self.pos > 0 && self.buf.get(self.pos - 1).is_some_and(|b| *b == b'\x00');
         if found_nul {
             self.copy_shared()?;
         }
@@ -461,8 +456,7 @@ mod tests {
     fn encode_paths(paths: &[&[u8]]) -> Vec<u8> {
         let mut out = Vec::new();
         {
-            let mut enc =
-                Encoder::new(&mut out, b"p".to_vec(), b"{}".to_vec()).expect("encoder");
+            let mut enc = Encoder::new(&mut out, b"p".to_vec(), b"{}".to_vec()).expect("encoder");
             for path in paths {
                 enc.write_meta(b"1r").expect("meta");
                 enc.write_path(path.to_vec()).expect("path");
@@ -516,8 +510,7 @@ mod tests {
 
         let mut out = Vec::new();
         {
-            let mut enc =
-                Encoder::new(&mut out, b"p".to_vec(), b"{}".to_vec()).expect("encoder");
+            let mut enc = Encoder::new(&mut out, b"p".to_vec(), b"{}".to_vec()).expect("encoder");
             enc.write_meta(b"d").unwrap();
             enc.write_path(long_a).unwrap();
             enc.write_meta(b"d").unwrap();

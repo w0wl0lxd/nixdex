@@ -178,8 +178,8 @@ pub fn parse_eval_line(raw: &str) -> Result<EvalJobLine> {
         });
     }
 
-    let job: EvalJob = sonic_rs::from_str(trimmed)
-        .map_err(|err| Error::Json(format!("{err}: {trimmed}")))?;
+    let job: EvalJob =
+        sonic_rs::from_str(trimmed).map_err(|err| Error::Json(format!("{err}: {trimmed}")))?;
 
     let job = if job.is_success() { Some(job) } else { None };
     Ok(EvalJobLine {
@@ -316,13 +316,14 @@ pub async fn run_eval_jobs(options: &EvalJobsOptions<'_>) -> Result<Vec<EvalJobL
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|err| {
-        Error::Evaluation(format!("failed to spawn nix-eval-jobs: {err}"))
-    })?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|err| Error::Evaluation(format!("failed to spawn nix-eval-jobs: {err}")))?;
 
-    let stdout = child.stdout.take().ok_or_else(|| {
-        Error::Evaluation("nix-eval-jobs produced no stdout pipe".to_string())
-    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Error::Evaluation("nix-eval-jobs produced no stdout pipe".to_string()))?;
 
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
