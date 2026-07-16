@@ -479,7 +479,10 @@ mod tests {
         assert!(job.is_available());
         let paths = job.store_paths();
         assert_eq!(paths.len(), 1);
-        assert_eq!(paths[0].hash(), "pg2zfrrbm58ynbjshhzkgg4q466spinf");
+        assert_eq!(
+            paths.first().map(StorePath::hash),
+            Some("pg2zfrrbm58ynbjshhzkgg4q466spinf")
+        );
     }
 
     #[test]
@@ -491,7 +494,7 @@ mod tests {
 
     #[test]
     fn rejects_injection_in_nixpkgs_arg() {
-        assert!(eval_expr_for_nixpkgs(r#"$(rm -rf /)"#, None).is_err());
+        assert!(eval_expr_for_nixpkgs(r"$(rm -rf /)", None).is_err());
         assert!(eval_expr_for_nixpkgs(r#"foo"; builtins.trace "x" 1#"#, None).is_err());
         assert!(eval_expr_for_nixpkgs("<nixpkgs/../../etc>", None).is_err());
     }
