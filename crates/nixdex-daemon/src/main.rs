@@ -7,38 +7,33 @@ use clap::Parser;
 use color_eyre::eyre::WrapErr;
 use tracing_subscriber::EnvFilter;
 
-/// Periodically refresh the nixdex index.
+/// Periodically refresh the nixdex prebuilt index and serve HTTP lookups.
 #[derive(Debug, Parser)]
 #[command(author, about, version)]
 struct Args {
-    /// Directory where the index is stored.
-    #[arg(
-        short,
-        long = "db",
-        env = "NIX_INDEX_DATABASE",
-        default_value = "/tmp/nix-index"
-    )]
-    database: PathBuf,
+    /// Release URL pattern for nix-index-database.
+    #[arg(long, default_value = "https://github.com/nix-community/nix-index-database/releases/download")]
+    release_url: String,
+
+    /// Architecture identifier (e.g., x86_64-linux).
+    #[arg(long, default_value = "x86_64-linux")]
+    architecture: String,
+
+    /// Use the -small variant of the prebuilt index.
+    #[arg(long)]
+    small: bool,
+
+    /// Cache directory for prebuilt indexes.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
 
     /// Refresh interval in seconds.
-    #[arg(long, default_value = "86400")]
+    #[arg(long, default_value = "3600")]
     interval: u64,
 
-    /// Store and load results of the fetch phase in `paths.cache`.
-    #[arg(long)]
-    path_cache: bool,
-
-    /// Ignore the existing `paths.cache` and re-fetch all store paths.
-    #[arg(long)]
-    force: bool,
-
-    /// Cache-key used to identify a `paths.cache` file; defaults to `nixpkgs`.
-    #[arg(long)]
-    cache_key: Option<String>,
-
-    /// Do not synthesize `/bin/<mainProgram>` listings from `meta.mainProgram`.
-    #[arg(long)]
-    no_main_program: bool,
+    /// HTTP server listen address.
+    #[arg(long, default_value = "127.0.0.1:3750")]
+    http_addr: String,
 }
 
 #[tokio::main]
@@ -49,18 +44,25 @@ async fn main() -> color_eyre::Result<()> {
         .init();
 
     let args = Args::parse();
-    let update_options = nixdex_core::index::UpdateOptions {
-        database: args.database,
-        path_cache: args.path_cache,
-        force: args.force,
-        cache_key: args.cache_key,
-        main_program: !args.no_main_program,
-        ..nixdex_core::index::UpdateOptions::default()
+
+    let cache_dir = args.cache_dir.unwrap_or_else(|| {
+        dirs::cache_dir()
+            .unwrap_or_else(|| PathBuf::from(".cache"))
+            .join("nixdex")
+            .join("prebuilt")
+    });
+
+    let prebuilt_config = nixdex_core::prebuilt::PrebuiltConfig {
+        release_url: args.release_url,
+        architecture: args.architecture,
+        small: args.small,
+        cache_dir,
+        refresh_interval: Duration::from_secs(args.interval),
     };
 
     let config = nixdex_core::daemon::DaemonConfig {
-        update_options,
-        interval: Duration::from_secs(args.interval),
+        prebuilt: prebuilt_config,
+        http_addr: args.http_addr,
     };
 
     match nixdex_core::daemon::run(&config).await {
