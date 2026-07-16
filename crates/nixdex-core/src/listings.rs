@@ -275,6 +275,7 @@ async fn process_path<S: ListingSource>(
     result
 }
 
+#[allow(clippy::cognitive_complexity)]
 async fn process_path_inner<S: ListingSource>(
     source: &S,
     entry: &PackageEntry,

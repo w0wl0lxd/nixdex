@@ -117,6 +117,7 @@ impl Fetcher {
     /// Retries on timeouts, connection errors, and HTTP 5xx responses.
     /// HTTP 404 and other client errors are not retried.
     /// Uses exponential backoff with jitter.
+    #[allow(clippy::cognitive_complexity)]
     async fn get_with_retry(&self, url: &str) -> Result<reqwest::Response> {
         const MAX_ATTEMPTS: u32 = 5;
         let mut backoff = Duration::from_secs(1);

@@ -13,6 +13,7 @@ pub mod index;
 pub mod listings;
 pub mod nixpkgs;
 pub mod path_cache;
+pub mod prebuilt;
 pub mod store_path;
 
 pub use errors::{Error, Result};
