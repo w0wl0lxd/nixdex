@@ -111,6 +111,10 @@ pub struct Opts {
     /// Only print files with size <= MAX_SIZE bytes.
     #[arg(long)]
     pub max_size: Option<u64>,
+
+    /// Exclude results from FHS-style packages (`-fhs` / `-usr-target`).
+    #[arg(long)]
+    pub exclude_fhs: bool,
 }
 
 /// Processed form of the CLI options ready for the core search API.
@@ -130,6 +134,7 @@ struct ProcessedArgs {
     sort: nixdex_core::database::SearchSort,
     min_size: Option<u64>,
     max_size: Option<u64>,
+    exclude_fhs: bool,
 }
 
 fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
@@ -235,6 +240,7 @@ fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
         sort,
         min_size: matches.min_size,
         max_size: matches.max_size,
+        exclude_fhs: matches.exclude_fhs,
     })
 }
 
@@ -263,6 +269,7 @@ pub fn run(matches: Opts) -> color_eyre::Result<()> {
         sort: args.sort,
         min_size: args.min_size,
         max_size: args.max_size,
+        exclude_fhs: args.exclude_fhs,
     };
 
     nixdex_core::search_database(&options).wrap_err("nix-locate failed")?;
