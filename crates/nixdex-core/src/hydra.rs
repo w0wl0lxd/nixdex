@@ -1,7 +1,5 @@
 //! Fetching file listings and references from the Nix binary cache.
 
-use std::io::Read;
-
 use thiserror::Error;
 
 use crate::CACHE_URL;
@@ -163,11 +161,7 @@ impl Fetcher {
 /// Returns [`Error::Parse`] when decompression fails.
 pub fn decompress_listing(bytes: &[u8]) -> Result<Vec<u8>> {
     if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-        let mut decoder = zstd::stream::read::Decoder::new(bytes)
-            .map_err(|err| Error::Parse(format!("zstd init: {err}")))?;
-        let mut out = Vec::new();
-        decoder
-            .read_to_end(&mut out)
+        let out = crate::bounded_zstd_decode(bytes, crate::files::MAX_LS_BYTES)
             .map_err(|err| Error::Parse(format!("zstd decode: {err}")))?;
         return Ok(out);
     }

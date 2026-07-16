@@ -56,7 +56,7 @@ revision confirms:
 ### Compatibility
 
 - `--format-version 1` retained for **nix-index-database** and older `nix-locate`.
-- nixdex today writes only v1 and **cannot** read v2 (version check is exact `== 1`).
+- nixdex now writes v2 by default and reads both v1 and v2 (format selected via `--format-version`).
 
 **Implication:** A pure FST on basenames without multi-frame parallel decode will lose
 the full-index cold-scan race to upstream. **Best end-state = FST (or postings) for

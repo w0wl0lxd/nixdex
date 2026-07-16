@@ -188,6 +188,15 @@ pub fn parse_eval_line(raw: &str) -> Result<EvalJobLine> {
     })
 }
 
+/// Escape a filesystem path so it can be safely embedded in a Nix double-quoted
+/// string literal used in a `nix-eval-jobs --expr` argument.
+fn nix_string_escape(s: &str) -> String {
+    // Backslashes must be escaped first so the later escapes are not doubled.
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace("${", "\\${")
+}
+
 /// Validate a scope attribute path component sequence (`haskellPackages`, `a.b`).
 fn validate_scope(scope: &str) -> Result<()> {
     if scope.is_empty() {
@@ -246,14 +255,13 @@ pub fn eval_expr_for_nixpkgs(value: &str, scope: Option<&str>) -> Result<String>
                 "nixpkgs path must exist and be resolvable: {value}: {err}"
             ))
         })?;
+        let abs_str = abs.as_os_str().to_string_lossy();
+        let escaped = nix_string_escape(&abs_str);
         if abs.is_file() {
             // File roots are evaluated as-is (fixtures like research/small.nix).
-            format!("import {}", abs.display())
+            format!("import \"{escaped}\"")
         } else if abs.is_dir() {
-            format!(
-                "import {} {{ config = {{ allowAliases = false; }}; }}",
-                abs.display()
-            )
+            format!("import \"{escaped}\" {{ config = {{ allowAliases = false; }}; }}")
         } else {
             return Err(Error::InvalidArgument(format!(
                 "nixpkgs path is neither a file nor a directory: {}",
@@ -510,5 +518,20 @@ mod tests {
     fn rejects_bad_scope() {
         assert!(eval_expr_for_nixpkgs("<nixpkgs>", Some("foo;bar")).is_err());
         assert!(eval_expr_for_nixpkgs("<nixpkgs>", Some("../x")).is_err());
+    }
+
+    #[test]
+    fn escapes_nix_metacharacters_in_file_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_name = r#"test"; ${builtins.trace "x" 1}.nix"#;
+        let path = dir.path().join(file_name);
+        std::fs::File::create(&path).expect("create file");
+
+        let expr = eval_expr_for_nixpkgs(path.to_str().expect("utf-8 path"), None)
+            .expect("build expression");
+
+        assert!(expr.starts_with("import \""), "expr: {expr}");
+        assert!(expr.contains(r#"\""#), "expr: {expr}");
+        assert!(expr.contains(r"\${builtins"), "expr: {expr}");
     }
 }
