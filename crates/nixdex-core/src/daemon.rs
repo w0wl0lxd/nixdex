@@ -1,15 +1,16 @@
 //! Background daemon support for keeping the nixdex index up to date.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::errors::{Error, Result};
+use crate::errors::Result;
+use crate::index::UpdateOptions;
+use crate::update_index;
 
 /// Configuration for a one-shot or looping daemon run.
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
-    /// Directory that holds the index database.
-    pub database: PathBuf,
+    /// Options passed through to each index refresh.
+    pub update_options: UpdateOptions,
     /// Interval between refresh attempts.
     pub interval: Duration,
 }
@@ -17,34 +18,71 @@ pub struct DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            database: PathBuf::from("/tmp/nix-index"),
+            update_options: UpdateOptions::default(),
             interval: Duration::from_hours(24),
         }
     }
 }
 
-/// Run a single daemon cycle (log, optional sleep, exit).
+/// Run the daemon loop, refreshing the index at `config.interval` until a
+/// termination signal is received.
 ///
-/// Scaffold behaviour: log the configured path/interval and return successfully
-/// without building an index.
+/// Listens for `SIGTERM` and `SIGINT` on Unix, and `Ctrl+C` elsewhere. A
+/// refresh that fails is logged and the loop continues.
 ///
 /// # Errors
 ///
-/// Returns an error only when configuration is invalid.
+/// Returns an error when the interval is zero or signal setup fails.
 pub async fn run(config: &DaemonConfig) -> Result<()> {
-    tracing::info!(
-        database = %config.database.display(),
-        interval_secs = config.interval.as_secs(),
-        "nixdex daemon cycle (scaffold — no refresh performed)"
-    );
-
     if config.interval.is_zero() {
-        return Err(Error::NotImplemented(
-            "daemon interval of zero is reserved for future multi-cycle mode",
-        ));
+        return Err(crate::errors::Error::Io(std::io::Error::other(
+            "daemon interval must be non-zero",
+        )));
     }
 
-    // Single short sleep so the binary exercises async runtime without hanging.
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    let mut interval = tokio::time::interval(config.interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    tracing::info!(
+        database = %config.update_options.database.display(),
+        interval_secs = config.interval.as_secs(),
+        "nixdex daemon started"
+    );
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                tracing::info!("refreshing index");
+                match update_index(&config.update_options).await {
+                    Ok(()) => tracing::info!("refresh complete"),
+                    Err(err) => tracing::error!(error = %err, "refresh failed"),
+                }
+            }
+            _ = wait_signal() => {
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn wait_signal() -> Result<()> {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+
+    tokio::select! {
+        _ = sigterm.recv() => tracing::info!("received SIGTERM, shutting down"),
+        _ = sigint.recv() => tracing::info!("received SIGINT, shutting down"),
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn wait_signal() -> Result<()> {
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("received Ctrl+C, shutting down");
     Ok(())
 }

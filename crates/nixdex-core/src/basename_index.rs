@@ -25,19 +25,19 @@ const NAMES_MAGIC: &[u8] = b"NPKG";
 const SIDE_VERSION: u32 = 1;
 
 /// Maximum total size of the package-names sidecar (defensive cap).
-const MAX_NAMES_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_NAMES_BYTES: usize = 64 * 1024 * 1024;
 
 /// Maximum number of package labels in the names sidecar.
 ///
 /// This prevents a malicious sidecar full of zero-length names from causing a
 /// huge `Vec<String>` allocation (the file-size cap alone is not enough).
-const MAX_NAME_COUNT: u64 = 2_000_000;
+const MAX_NAME_COUNT: usize = 2_000_000;
 
 /// Maximum length of a single package label in the names sidecar.
 const MAX_NAME_BYTES: usize = 64 * 1024;
 
 /// Maximum total size of the postings sidecar (defensive cap).
-const MAX_POSTINGS_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_POSTINGS_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Maximum number of package ordinals returned for a single basename.
 ///
@@ -46,7 +46,7 @@ const MAX_POSTINGS_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_ORDINALS_PER_BASENAME: usize = 1_000_000;
 
 /// Maximum total size of the FST sidecar (defensive cap).
-const MAX_FST_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_FST_BYTES: usize = 128 * 1024 * 1024;
 
 /// Sidecar basenames relative to the database directory.
 pub const FST_FILE: &str = "files.basename.fst";
@@ -221,13 +221,13 @@ impl BasenameIndex {
         }
 
         let fst_bytes = std::fs::read(&fst_path)?;
-        if fst_bytes.len() > MAX_FST_BYTES as usize {
+        if fst_bytes.len() > MAX_FST_BYTES {
             return Err(Error::Corrupt("fst file too large".into()));
         }
         let map = Map::new(fst_bytes).map_err(|err| Error::Fst(err.to_string()))?;
 
         let postings = std::fs::read(&postings_path)?;
-        if postings.len() > MAX_POSTINGS_BYTES as usize {
+        if postings.len() > MAX_POSTINGS_BYTES {
             return Err(Error::Corrupt("postings file too large".into()));
         }
         validate_postings_header(&postings)?;
@@ -255,7 +255,9 @@ impl BasenameIndex {
         let ordinals = read_ordinals_at(&self.postings, cookie)?;
         let mut labels = Vec::with_capacity(ordinals.len());
         for ord in ordinals {
-            let Some(name) = self.package_names.get(ord as usize) else {
+            let index = usize::try_from(ord)
+                .map_err(|_| Error::Corrupt(format!("package ordinal {ord} does not fit usize")))?;
+            let Some(name) = self.package_names.get(index) else {
                 return Err(Error::Corrupt(format!(
                     "package ordinal {ord} out of range (names={})",
                     self.package_names.len()
@@ -323,7 +325,8 @@ fn validate_postings_header(postings: &[u8]) -> Result<()> {
 fn read_ordinals_at(postings: &[u8], cookie: u64) -> Result<Vec<u32>> {
     let start = usize::try_from(cookie)
         .map_err(|_| Error::Corrupt(format!("cookie {cookie} does not fit usize")))?;
-    let count = read_u32_le(postings, start)? as usize;
+    let count = usize::try_from(read_u32_le(postings, start)?)
+        .map_err(|_| Error::Corrupt("ordinal count too large".into()))?;
     if count > MAX_ORDINALS_PER_BASENAME {
         return Err(Error::Corrupt(format!(
             "too many ordinals for one basename: {count} (max {MAX_ORDINALS_PER_BASENAME})"
@@ -370,7 +373,7 @@ fn write_package_names(path: &Path, names: &[String]) -> Result<()> {
 
 fn read_package_names(path: &Path) -> Result<Vec<String>> {
     let bytes = std::fs::read(path)?;
-    if bytes.len() > MAX_NAMES_BYTES as usize {
+    if bytes.len() > MAX_NAMES_BYTES {
         return Err(Error::Corrupt("package names file too large".into()));
     }
 
@@ -391,7 +394,8 @@ fn read_package_names(path: &Path) -> Result<Vec<String>> {
         )));
     }
 
-    let count = u64::from(read_u32_le(&bytes, NAMES_MAGIC.len() + 4)?);
+    let count = usize::try_from(read_u32_le(&bytes, NAMES_MAGIC.len() + 4)?)
+        .map_err(|_| Error::Corrupt("package name count too large".into()))?;
     if count > MAX_NAME_COUNT {
         return Err(Error::Corrupt(format!(
             "package name count too large: {count} (max {MAX_NAME_COUNT})"
@@ -400,15 +404,16 @@ fn read_package_names(path: &Path) -> Result<Vec<String>> {
     let header_size = NAMES_MAGIC.len() + 4 + 4;
     if count
         .checked_mul(4)
-        .is_none_or(|need| need > (bytes.len() as u64).saturating_sub(header_size as u64))
+        .is_none_or(|need| need > bytes.len().saturating_sub(header_size))
     {
         return Err(Error::Corrupt("package name count too large".into()));
     }
 
-    let mut names = Vec::with_capacity(count as usize);
+    let mut names = Vec::with_capacity(count);
     let mut pos = header_size;
     for _ in 0..count {
-        let len = read_u32_le(&bytes, pos)? as usize;
+        let len = usize::try_from(read_u32_le(&bytes, pos)?)
+            .map_err(|_| Error::Corrupt("package name length too large".into()))?;
         if len == 0 {
             return Err(Error::Corrupt("empty package name".into()));
         }
