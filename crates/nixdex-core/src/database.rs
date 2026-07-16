@@ -30,7 +30,7 @@ use crate::store_path::StorePath;
 const SUPPORTED_VERSIONS: &[u64] = &[1, 2];
 
 /// Default on-disk format version written by [`Writer::create`].
-const DEFAULT_WRITE_VERSION: u64 = 1;
+const DEFAULT_WRITE_VERSION: u64 = 2;
 
 /// Magic bytes identifying a nix-index / nixdex database file.
 const FILE_MAGIC: &[u8] = b"NIXI";
@@ -144,8 +144,8 @@ impl Drop for Writer {
 impl Writer {
     /// Creates a new database at the given path with the specified zstd compression level.
     ///
-    /// Writes version 1 for backwards compatibility. Use
-    /// [`create_with_version`](Self::create_with_version) to request version 2.
+    /// Writes version 2 by default. Use
+    /// [`create_with_version`](Self::create_with_version) to request version 1.
     ///
     /// # Errors
     ///
@@ -225,16 +225,20 @@ impl Writer {
                 file.write_all(&compressed)?;
             }
             2 => {
-                let mut compressed_frames: Vec<Vec<u8>> =
-                    Vec::with_capacity(self.boundaries.len().max(1));
+                let mut slices: Vec<&[u8]> = Vec::with_capacity(self.boundaries.len().max(1));
                 let mut prev = 0;
                 for &end in &self.boundaries {
                     let slice = raw
                         .get(prev..end)
                         .ok_or(Error::Corrupt("package boundary out of range"))?;
-                    compressed_frames.push(zstd::encode_all(slice, self.level)?);
+                    slices.push(slice);
                     prev = end;
                 }
+
+                let compressed_frames: Vec<Vec<u8>> = slices
+                    .par_iter()
+                    .map(|&slice| zstd::encode_all(slice, self.level))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
 
                 for frame in &compressed_frames {
                     file.write_all(frame)?;
@@ -374,11 +378,12 @@ impl Reader {
         path_pattern: &Regex,
         package_pattern: Option<&Regex>,
         hash: Option<&str>,
+        package_labels: Option<&IndexSet<String>>,
     ) -> Result<Vec<(StorePath, FileTreeEntry)>> {
         let per_frame: Vec<Vec<(StorePath, FileTreeEntry)>> = self
             .frames
             .par_iter()
-            .map(|frame| search_frame(frame, path_pattern, package_pattern, hash))
+            .map(|frame| search_frame(frame, path_pattern, package_pattern, hash, package_labels))
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let mut matches = Vec::new();
@@ -484,7 +489,7 @@ fn load_v2_frames(body: &[u8]) -> Result<Vec<Vec<u8>>> {
         return Err(Error::Corrupt("v2 compressed length mismatch"));
     }
 
-    let mut frames = Vec::with_capacity(frame_count);
+    let mut frame_slices: Vec<&[u8]> = Vec::with_capacity(frame_count);
     let mut offset = 0usize;
     for len in lens {
         let next = offset
@@ -493,9 +498,14 @@ fn load_v2_frames(body: &[u8]) -> Result<Vec<Vec<u8>>> {
         let compressed = body
             .get(offset..next)
             .ok_or(Error::Corrupt("v2 frame slice overflow"))?;
-        frames.push(zstd::decode_all(compressed)?);
+        frame_slices.push(compressed);
         offset = next;
     }
+
+    let frames: Vec<Vec<u8>> = frame_slices
+        .par_iter()
+        .map(|&slice| zstd::decode_all(slice))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
     Ok(frames)
 }
@@ -518,6 +528,7 @@ fn search_frame(
     path_pattern: &Regex,
     package_pattern: Option<&Regex>,
     hash: Option<&str>,
+    package_labels: Option<&IndexSet<String>>,
 ) -> Result<Vec<(StorePath, FileTreeEntry)>> {
     let mut matches = Vec::new();
     let mut pending: Vec<FileTreeEntry> = Vec::new();
@@ -543,9 +554,11 @@ fn search_frame(
                         path: json.to_vec(),
                     })?;
 
+                let label = format!("{}.{}", pkg.origin().attr, pkg.origin().output);
                 let accept_pkg = package_pattern
                     .is_none_or(|re| re.is_match(pkg.name().as_bytes()))
-                    && hash.is_none_or(|h| h == pkg.hash());
+                    && hash.is_none_or(|h| h == pkg.hash())
+                    && package_labels.is_none_or(|labels| labels.contains(&label));
 
                 if accept_pkg {
                     for entry in std::mem::take(&mut pending) {
@@ -600,6 +613,8 @@ pub struct SearchOptions<'a> {
     pub hash: Option<String>,
     /// Restrict results to package names matching this pattern.
     pub package_pattern: Option<String>,
+    /// Exact basename (final path component) to look up via the FST sidecar.
+    pub exact_basename: Option<String>,
     /// File-type filter (empty means "all types").
     pub file_type: &'a [FileType],
     /// Output formatting mode.
@@ -629,8 +644,25 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
         None => None,
     };
 
+    let package_labels = options.exact_basename.as_ref().and_then(|base| {
+        let dir = index_file.parent()?;
+        if dir.as_os_str().is_empty() {
+            return None;
+        }
+        BasenameIndex::open(dir)
+            .ok()
+            .and_then(|index| index.lookup_basename(base.as_bytes()).ok())
+            .filter(|labels| !labels.is_empty())
+            .map(IndexSet::from_iter)
+    });
+
     let results = reader
-        .search_entries(&path_pattern, package_re.as_ref(), options.hash.as_deref())
+        .search_entries(
+            &path_pattern,
+            package_re.as_ref(),
+            options.hash.as_deref(),
+            package_labels.as_ref(),
+        )
         .map_err(|source| crate::Error::ReadDatabase {
             path: index_file,
             source: Box::new(source),
@@ -796,11 +828,16 @@ mod tests {
         assert_eq!(&magic, b"NIXI");
 
         let reader = Reader::open(&db_path).expect("reader");
-        let re = Regex::new("bin/hello").expect("regex");
-        let hits = reader.search_entries(&re, None, None).expect("search");
+        let re = Regex::new(&regex::escape("bin/hello")).expect("regex");
+        let hits = reader
+            .search_entries(&re, None, None, None)
+            .expect("search");
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].0.name(), "hello-2.12");
-        assert_eq!(hits[0].1.path, b"/bin/hello");
+        assert_eq!(hits.first().map(|(p, _)| p.name()), Some("hello-2.12"));
+        assert_eq!(
+            hits.first().map(|(_, e)| e.path.as_slice()),
+            Some(b"/bin/hello".as_slice())
+        );
 
         // Public search() printer
         let options = SearchOptions {
@@ -808,6 +845,7 @@ mod tests {
             pattern: "bin/hello".into(),
             hash: None,
             package_pattern: None,
+            exact_basename: None,
             file_type: &[],
             mode: SearchMode::Minimal,
         };
@@ -830,7 +868,9 @@ mod tests {
 
         let reader = Reader::open(&db_path).expect("reader");
         let re = Regex::new(".*").expect("regex");
-        let hits = reader.search_entries(&re, None, None).expect("search");
+        let hits = reader
+            .search_entries(&re, None, None, None)
+            .expect("search");
         assert!(hits.is_empty());
     }
 
@@ -912,11 +952,16 @@ mod tests {
         let reader = Reader::open(&db_path).expect("reader");
         assert_eq!(reader.version(), 2);
 
-        let re = Regex::new("bin/hello").expect("regex");
-        let hits = reader.search_entries(&re, None, None).expect("search");
+        let re = Regex::new(&regex::escape("bin/hello")).expect("regex");
+        let hits = reader
+            .search_entries(&re, None, None, None)
+            .expect("search");
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].0.name(), "hello-2.12");
-        assert_eq!(hits[0].1.path, b"/bin/hello");
+        assert_eq!(hits.first().map(|(p, _)| p.name()), Some("hello-2.12"));
+        assert_eq!(
+            hits.first().map(|(_, e)| e.path.as_slice()),
+            Some(b"/bin/hello".as_slice())
+        );
 
         // Sidecars are still produced on finish.
         assert!(dir.path().join("files.basename.fst").is_file());
@@ -961,7 +1006,9 @@ mod tests {
         assert_eq!(reader.version(), 2);
 
         let re = Regex::new(".*").expect("regex");
-        let hits = reader.search_entries(&re, None, None).expect("search");
+        let hits = reader
+            .search_entries(&re, None, None, None)
+            .expect("search");
         // Each tree also emits a synthetic root entry with an empty path.
         assert_eq!(hits.len(), 7);
 
@@ -1000,8 +1047,9 @@ mod tests {
         let mut data = fs::read(&db_path).expect("read db");
         // Corrupt the trailing payload-length duplicate so it no longer matches
         // the declared frame size.
-        let last = data.len() - 1;
-        data[last] = data[last].wrapping_add(1);
+        if let Some(last) = data.last_mut() {
+            *last = last.wrapping_add(1);
+        }
         fs::write(&db_path, &data).expect("rewrite corrupt db");
 
         let err = Reader::open(&db_path).expect_err("corrupt db should fail");
