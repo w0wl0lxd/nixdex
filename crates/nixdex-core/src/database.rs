@@ -19,6 +19,8 @@ use memchr;
 use mmap_guard;
 use rayon::prelude::*;
 use regex::bytes::Regex;
+use serde::Serialize;
+use sonic_rs;
 use thiserror::Error;
 
 use indexmap::IndexSet;
@@ -1228,6 +1230,13 @@ pub struct SearchOptions<'a> {
     pub file_type: &'a [FileType],
     /// Output formatting mode.
     pub mode: SearchMode,
+    /// Emit each match as a JSON object (one per line) instead of the default
+    /// human-readable format.
+    pub json: bool,
+    /// Maximum number of results to print. `None` means unlimited.
+    pub limit: Option<usize>,
+    /// Print the number of matching entries instead of the entries themselves.
+    pub count: bool,
 }
 
 /// Resolve the set of candidate package ordinals from the basename secondary index.
@@ -1384,6 +1393,23 @@ fn should_include_match(
     true
 }
 
+/// JSON-serializable full search result emitted by `--json`.
+#[derive(Serialize)]
+struct MatchJson {
+    attr: String,
+    size: u64,
+    #[serde(rename = "type")]
+    kind: String,
+    path: String,
+    store_path: String,
+}
+
+/// JSON-serializable minimal search result emitted by `--minimal --json`.
+#[derive(Serialize)]
+struct MinimalMatchJson {
+    attr: String,
+}
+
 /// Print a single search result according to `SearchMode` and color settings.
 ///
 /// Mutates `printed_attrs` for `--minimal` de-duplication.
@@ -1397,9 +1423,73 @@ fn print_match(
 ) {
     let attr = format_attr(store_path);
 
+    if options.json {
+        print_match_json(options, printed_attrs, store_path, entry, &attr);
+    } else {
+        print_match_text(
+            options,
+            path_pattern,
+            printed_attrs,
+            store_path,
+            entry,
+            &attr,
+        );
+    }
+}
+
+#[allow(clippy::print_stdout)]
+fn print_match_json(
+    options: &SearchOptions<'_>,
+    printed_attrs: &mut IndexSet<String>,
+    store_path: &StorePath,
+    entry: &FileTreeEntry,
+    attr: &str,
+) {
     match options.mode {
         SearchMode::Minimal => {
-            if printed_attrs.insert(attr.clone()) {
+            if printed_attrs.insert(attr.into()) {
+                let record = MinimalMatchJson {
+                    attr: attr.to_string(),
+                };
+                if let Ok(line) = sonic_rs::to_string(&record) {
+                    println!("{line}");
+                }
+            }
+        }
+        SearchMode::Full { .. } => {
+            let (kind, size) = match &entry.node {
+                FileNode::Regular { executable, size } => {
+                    (if *executable { "x" } else { "r" }, *size)
+                }
+                FileNode::Directory { size, .. } => ("d", *size),
+                FileNode::Symlink { .. } => ("s", 0),
+            };
+            let record = MatchJson {
+                attr: attr.to_string(),
+                size,
+                kind: kind.to_string(),
+                path: String::from_utf8_lossy(&entry.path).into_owned(),
+                store_path: store_path.as_str(),
+            };
+            if let Ok(line) = sonic_rs::to_string(&record) {
+                println!("{line}");
+            }
+        }
+    }
+}
+
+#[allow(clippy::print_stdout)]
+fn print_match_text(
+    options: &SearchOptions<'_>,
+    path_pattern: &Regex,
+    printed_attrs: &mut IndexSet<String>,
+    store_path: &StorePath,
+    entry: &FileTreeEntry,
+    attr: &str,
+) {
+    match options.mode {
+        SearchMode::Minimal => {
+            if printed_attrs.insert(attr.into()) {
                 println!("{attr}");
             }
         }
@@ -1512,16 +1602,36 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
     // Track printed attrs for --minimal de-duplication (ordered set).
     let mut printed_attrs: IndexSet<String> = IndexSet::new();
 
+    let mut matched = 0usize;
+    let mut printed = 0usize;
+
     for (store_path, entry) in results {
-        if should_include_match(options, &path_pattern, &store_path, &entry) {
-            print_match(
-                options,
-                &path_pattern,
-                &mut printed_attrs,
-                &store_path,
-                &entry,
-            );
+        if !should_include_match(options, &path_pattern, &store_path, &entry) {
+            continue;
         }
+
+        matched += 1;
+
+        if options.count {
+            continue;
+        }
+
+        if options.limit.is_some_and(|limit| printed >= limit) {
+            break;
+        }
+
+        print_match(
+            options,
+            &path_pattern,
+            &mut printed_attrs,
+            &store_path,
+            &entry,
+        );
+        printed += 1;
+    }
+
+    if options.count {
+        println!("{matched}");
     }
 
     Ok(())
@@ -1732,6 +1842,9 @@ mod tests {
             path_prefix: None,
             file_type: &[],
             mode: SearchMode::Minimal,
+            json: false,
+            limit: None,
+            count: false,
         };
         search(&options).expect("search ok");
     }

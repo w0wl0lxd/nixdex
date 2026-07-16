@@ -57,6 +57,8 @@ enum Cmd {
     Index(index::Args),
     /// Find files in nixpkgs packages (alias for `nix-locate`).
     Locate(locate::Opts),
+    /// Run the background daemon (alias for `nixdex-daemon`).
+    Daemon(DaemonOpts),
 }
 
 /// Search package attributes and descriptions.
@@ -139,6 +141,38 @@ struct CompletionsOpts {
     /// Shell for which to generate completions.
     #[arg(value_enum)]
     shell: Shell,
+}
+
+/// Options for running the background daemon.
+#[derive(Debug, Parser)]
+#[command(author, about, version)]
+struct DaemonOpts {
+    /// Release URL pattern for nix-index-database.
+    #[arg(
+        long,
+        default_value = "https://github.com/nix-community/nix-index-database/releases/latest/download"
+    )]
+    release_url: String,
+
+    /// Architecture identifier (e.g., x86_64-linux).
+    #[arg(long, default_value = "x86_64-linux")]
+    architecture: String,
+
+    /// Use the -small variant of the prebuilt index.
+    #[arg(long)]
+    small: bool,
+
+    /// Cache directory for prebuilt indexes.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+
+    /// Refresh interval in seconds.
+    #[arg(long, default_value = "3600")]
+    interval: u64,
+
+    /// HTTP server listen address.
+    #[arg(long, default_value = "127.0.0.1:3750")]
+    http_addr: String,
 }
 
 fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
@@ -235,6 +269,43 @@ fn run_completions(opts: CompletionsOpts) {
     generate(opts.shell, &mut cmd, name, &mut std::io::stdout());
 }
 
+async fn run_daemon(opts: DaemonOpts) -> color_eyre::Result<()> {
+    let mut args: Vec<String> = Vec::new();
+    if let Some(cache_dir) = opts.cache_dir {
+        args.push("--cache-dir".into());
+        args.push(cache_dir.to_string_lossy().into_owned());
+    }
+    args.extend([
+        "--release-url".into(),
+        opts.release_url,
+        "--architecture".into(),
+        opts.architecture,
+        "--interval".into(),
+        opts.interval.to_string(),
+        "--http-addr".into(),
+        opts.http_addr,
+    ]);
+    if opts.small {
+        args.push("--small".into());
+    }
+
+    let mut child = tokio::process::Command::new("nixdex-daemon")
+        .args(args)
+        .spawn()
+        .wrap_err("failed to spawn `nixdex-daemon`; is it installed and on PATH?")?;
+
+    let status = child
+        .wait()
+        .await
+        .wrap_err("failed to wait for `nixdex-daemon`")?;
+
+    if let Some(code) = status.code() {
+        std::process::exit(code);
+    }
+
+    Ok(())
+}
+
 fn colored(text: &str, code: &str) -> String {
     format!("\x1b[{code}m{text}\x1b[0m")
 }
@@ -266,5 +337,6 @@ async fn main() -> color_eyre::Result<()> {
         }
         Cmd::Index(index_opts) => index::run(index_opts).await,
         Cmd::Locate(locate_opts) => locate::run(locate_opts),
+        Cmd::Daemon(daemon_opts) => run_daemon(daemon_opts).await,
     }
 }
