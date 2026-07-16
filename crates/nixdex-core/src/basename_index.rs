@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use byteorder::{LittleEndian, WriteBytesExt};
 use fst::Map;
+use mmap_guard;
 use roaring::RoaringBitmap;
 use thiserror::Error;
 
@@ -184,9 +185,12 @@ impl BasenameIndexBuilder {
 /// Opened basename secondary index for exact-basename queries.
 #[derive(Debug)]
 pub struct BasenameIndex {
-    map: Map<Vec<u8>>,
-    postings: Vec<u8>,
-    package_names: Vec<String>,
+    // FileData implements AsRef<[u8]>, so fst::Map can use it directly.
+    map: Map<mmap_guard::FileData>,
+    postings: mmap_guard::FileData,
+    names: mmap_guard::FileData,
+    // Validated byte ranges into `names` for each package ordinal.
+    name_ranges: Vec<(usize, usize)>,
 }
 
 impl BasenameIndex {
@@ -220,35 +224,41 @@ impl BasenameIndex {
             });
         }
 
-        let fst_bytes = std::fs::read(&fst_path)?;
-        if fst_bytes.len() > MAX_FST_BYTES {
+        let fst_data = mmap_guard::map_file(&fst_path).map_err(Error::Io)?;
+        if fst_data.len() > MAX_FST_BYTES {
             return Err(Error::Corrupt("fst file too large".into()));
         }
-        let map = Map::new(fst_bytes).map_err(|err| Error::Fst(err.to_string()))?;
+        let map = Map::new(fst_data).map_err(|err| Error::Fst(err.to_string()))?;
 
-        let postings = std::fs::read(&postings_path)?;
+        let postings = mmap_guard::map_file(&postings_path).map_err(Error::Io)?;
         if postings.len() > MAX_POSTINGS_BYTES {
             return Err(Error::Corrupt("postings file too large".into()));
         }
         validate_postings_header(&postings)?;
 
-        let package_names = read_package_names(&names_path)?;
+        let names = mmap_guard::map_file(&names_path).map_err(Error::Io)?;
+        if names.len() > MAX_NAMES_BYTES {
+            return Err(Error::Corrupt("package names file too large".into()));
+        }
+        let name_ranges = parse_name_ranges(&names)?;
 
         Ok(Self {
             map,
             postings,
-            package_names,
+            names,
+            name_ranges,
         })
     }
 
     /// Look up package labels that contain an exact basename (final path component).
     ///
+    /// Returns borrowed string slices into the mmapped names data.
     /// Returns an empty list when the basename is absent.
     ///
     /// # Errors
     ///
     /// Returns an error when postings for a present FST key are corrupt.
-    pub fn lookup_basename(&self, basename: &[u8]) -> Result<Vec<String>> {
+    pub fn lookup_basename(&self, basename: &[u8]) -> Result<Vec<&str>> {
         let Some(cookie) = self.map.get(basename) else {
             return Ok(Vec::new());
         };
@@ -257,21 +267,40 @@ impl BasenameIndex {
         for ord in ordinals {
             let index = usize::try_from(ord)
                 .map_err(|_| Error::Corrupt(format!("package ordinal {ord} does not fit usize")))?;
-            let Some(name) = self.package_names.get(index) else {
+            let Some((start, end)) = self.name_ranges.get(index) else {
                 return Err(Error::Corrupt(format!(
                     "package ordinal {ord} out of range (names={})",
-                    self.package_names.len()
+                    self.name_ranges.len()
                 )));
             };
-            labels.push(name.clone());
+            let bytes = self.names.get(*start..*end).ok_or_else(|| {
+                Error::Corrupt(format!("package ordinal {ord} name range out of bounds"))
+            })?;
+            let s = std::str::from_utf8(bytes)
+                .map_err(|e| Error::Corrupt(format!("package ordinal {ord} invalid UTF-8: {e}")))?;
+            labels.push(s);
         }
         Ok(labels)
+    }
+
+    /// Look up raw package ordinals that contain an exact basename.
+    ///
+    /// Returns an empty list when the basename is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when postings for a present FST key are corrupt.
+    pub fn lookup_basename_ordinals(&self, basename: &[u8]) -> Result<Vec<u32>> {
+        let Some(cookie) = self.map.get(basename) else {
+            return Ok(Vec::new());
+        };
+        read_ordinals_at(&self.postings, cookie)
     }
 
     /// Number of packages recorded in the name table.
     #[must_use]
     pub fn package_count(&self) -> usize {
-        self.package_names.len()
+        self.name_ranges.len()
     }
 }
 
@@ -371,12 +400,8 @@ fn write_package_names(path: &Path, names: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn read_package_names(path: &Path) -> Result<Vec<String>> {
-    let bytes = std::fs::read(path)?;
-    if bytes.len() > MAX_NAMES_BYTES {
-        return Err(Error::Corrupt("package names file too large".into()));
-    }
-
+/// Parse the names sidecar into byte ranges without cloning strings.
+fn parse_name_ranges(bytes: &[u8]) -> Result<Vec<(usize, usize)>> {
     let magic = bytes
         .get(..NAMES_MAGIC.len())
         .ok_or(Error::Corrupt("names too short for magic".into()))?;
@@ -387,14 +412,14 @@ fn read_package_names(path: &Path) -> Result<Vec<String>> {
         )));
     }
 
-    let ver = read_u32_le(&bytes, NAMES_MAGIC.len())?;
+    let ver = read_u32_le(bytes, NAMES_MAGIC.len())?;
     if ver != SIDE_VERSION {
         return Err(Error::Corrupt(format!(
             "names version {ver}, expected {SIDE_VERSION}"
         )));
     }
 
-    let count = usize::try_from(read_u32_le(&bytes, NAMES_MAGIC.len() + 4)?)
+    let count = usize::try_from(read_u32_le(bytes, NAMES_MAGIC.len() + 4)?)
         .map_err(|_| Error::Corrupt("package name count too large".into()))?;
     if count > MAX_NAME_COUNT {
         return Err(Error::Corrupt(format!(
@@ -409,10 +434,10 @@ fn read_package_names(path: &Path) -> Result<Vec<String>> {
         return Err(Error::Corrupt("package name count too large".into()));
     }
 
-    let mut names = Vec::with_capacity(count);
+    let mut ranges = Vec::with_capacity(count);
     let mut pos = header_size;
     for _ in 0..count {
-        let len = usize::try_from(read_u32_le(&bytes, pos)?)
+        let len = usize::try_from(read_u32_le(bytes, pos)?)
             .map_err(|_| Error::Corrupt("package name length too large".into()))?;
         if len == 0 {
             return Err(Error::Corrupt("empty package name".into()));
@@ -427,17 +452,10 @@ fn read_package_names(path: &Path) -> Result<Vec<String>> {
         if body_end > bytes.len() {
             return Err(Error::Corrupt("package name truncated".into()));
         }
-        let s = String::from_utf8(
-            bytes
-                .get(body_start..body_end)
-                .ok_or(Error::Corrupt("package name slice missing".into()))?
-                .to_vec(),
-        )
-        .map_err(|err| Error::Corrupt(err.to_string()))?;
-        names.push(s);
+        ranges.push((body_start, body_end));
         pos = body_end;
     }
-    Ok(names)
+    Ok(ranges)
 }
 
 #[cfg(test)]
@@ -486,6 +504,11 @@ mod tests {
 
         let missing = index.lookup_basename(b"nope").expect("nope");
         assert!(missing.is_empty());
+
+        // Test lookup_basename_ordinals
+        let mut ls_ordinals = index.lookup_basename_ordinals(b"ls").expect("ls ordinals");
+        ls_ordinals.sort();
+        assert_eq!(ls_ordinals, vec![0, 2]); // coreutils (0), busybox (2)
     }
 
     #[test]
@@ -496,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn read_package_names_rejects_empty_name() {
+    fn parse_name_ranges_rejects_empty_name() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(NAMES_FILE);
         {
@@ -508,25 +531,27 @@ mod tests {
             w.flush().expect("flush");
         }
 
-        let err = read_package_names(&path).expect_err("empty name should fail");
+        let bytes = std::fs::read(&path).expect("read");
+        let err = parse_name_ranges(&bytes).expect_err("empty name should fail");
         assert!(matches!(err, Error::Corrupt(_)));
         assert!(err.to_string().contains("empty package name"));
     }
 
     #[test]
-    fn read_package_names_rejects_excessive_count() {
+    fn parse_name_ranges_rejects_excessive_count() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(NAMES_FILE);
         {
             let mut w = BufWriter::new(File::create(&path).expect("create"));
             w.write_all(NAMES_MAGIC).expect("magic");
             w.write_u32::<LittleEndian>(SIDE_VERSION).expect("ver");
-            w.write_u32::<LittleEndian>((MAX_NAME_COUNT + 1) as u32)
-                .expect("count");
+            let count = u32::try_from(MAX_NAME_COUNT + 1).expect("count fits");
+            w.write_u32::<LittleEndian>(count).expect("count");
             w.flush().expect("flush");
         }
 
-        let err = read_package_names(&path).expect_err("excessive count should fail");
+        let bytes = std::fs::read(&path).expect("read");
+        let err = parse_name_ranges(&bytes).expect_err("excessive count should fail");
         assert!(matches!(err, Error::Corrupt(_)));
         assert!(err.to_string().contains("package name count too large"));
     }
@@ -537,7 +562,7 @@ mod tests {
         postings.extend_from_slice(POSTINGS_MAGIC);
         postings.extend_from_slice(&SIDE_VERSION.to_le_bytes());
         // Cookie 8 (right after header) points at a count that exceeds the cap.
-        let count = (MAX_ORDINALS_PER_BASENAME + 1) as u32;
+        let count = u32::try_from(MAX_ORDINALS_PER_BASENAME + 1).expect("count fits");
         postings.extend_from_slice(&count.to_le_bytes());
 
         let err = read_ordinals_at(&postings, 8).expect_err("excessive ordinal count should fail");
