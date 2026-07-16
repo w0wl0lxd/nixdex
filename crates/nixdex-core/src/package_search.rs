@@ -6,6 +6,8 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::str::FromStr;
 
+use fuzzy_matcher::FuzzyMatcher;
+use fuzzy_matcher::skim::SkimMatcherV2;
 use regex::RegexBuilder;
 
 use crate::errors::{Error, Result};
@@ -134,6 +136,41 @@ impl SearchDb {
 
         Ok(matches)
     }
+
+    /// Fuzzy-search package records using the skim v2 scoring algorithm.
+    ///
+    /// Records are ranked by the highest fuzzy match score across the selected
+    /// field(s). Results are returned in descending score order, optionally
+    /// truncated to `limit`.
+    pub fn search_fuzzy(
+        &self,
+        pattern: &str,
+        field: SearchField,
+        case_sensitive: bool,
+        limit: Option<usize>,
+    ) -> Result<Vec<&PackageMeta>> {
+        let matcher = if case_sensitive {
+            SkimMatcherV2::default().respect_case()
+        } else {
+            SkimMatcherV2::default().smart_case()
+        };
+
+        let mut scored: Vec<(i64, &PackageMeta)> = self
+            .records
+            .iter()
+            .filter_map(|record| {
+                fuzzy_score(record, pattern, field, &matcher).map(|score| (score, record))
+            })
+            .collect();
+
+        scored.sort_by_key(|&(score, _)| std::cmp::Reverse(score));
+
+        if let Some(limit) = limit {
+            scored.truncate(limit);
+        }
+
+        Ok(scored.into_iter().map(|(_, record)| record).collect())
+    }
 }
 
 fn value_contains(value: &str, needle: &str, case_sensitive: bool) -> bool {
@@ -233,6 +270,41 @@ fn record_matches_exact(
                     .main_program
                     .as_ref()
                     .is_some_and(|main| value_equals(main, pattern, case_sensitive))
+        }
+    }
+}
+
+fn fuzzy_score(
+    record: &PackageMeta,
+    pattern: &str,
+    field: SearchField,
+    matcher: &SkimMatcherV2,
+) -> Option<i64> {
+    match field {
+        SearchField::Attr => matcher.fuzzy_match(&record.attr, pattern),
+        SearchField::Description => record
+            .description
+            .as_ref()
+            .and_then(|desc| matcher.fuzzy_match(desc, pattern)),
+        SearchField::MainProgram => record
+            .main_program
+            .as_ref()
+            .and_then(|main| matcher.fuzzy_match(main, pattern)),
+        SearchField::Both => {
+            let mut best: Option<i64> = None;
+            for value in [
+                Some(record.attr.as_str()),
+                record.description.as_deref(),
+                record.main_program.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let Some(score) = matcher.fuzzy_match(value, pattern) {
+                    best = Some(best.map_or(score, |current| current.max(score)));
+                }
+            }
+            best
         }
     }
 }
@@ -412,5 +484,38 @@ mod tests {
             )
             .expect("search");
         assert_eq!(full.len(), 1);
+    }
+
+    #[test]
+    fn fuzzy_search_ranks_by_relevance() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("packages.json");
+        write_fixture(
+            &path,
+            &[
+                test_record("neovim-unwrapped", "Vim-fork focused on extensibility"),
+                test_record("neovim-remote", "Remote control for NeoVim"),
+                test_record("vim", "The ubiquitous text editor"),
+            ],
+        );
+
+        let db = SearchDb::open(&path).expect("open");
+        let hits = db
+            .search_fuzzy("nvim", SearchField::Both, false, None)
+            .expect("search");
+
+        assert!(hits.len() >= 2, "expected at least neovim matches");
+        let attrs: Vec<_> = hits.iter().map(|r| r.attr.as_str()).collect();
+        assert!(
+            attrs
+                .iter()
+                .any(|&a| a == "neovim-unwrapped" || a == "neovim-remote"),
+            "expected neovim results, got {attrs:?}"
+        );
+
+        let limited = db
+            .search_fuzzy("nvim", SearchField::Both, false, Some(2))
+            .expect("search");
+        assert_eq!(limited.len(), 2);
     }
 }
