@@ -1047,6 +1047,7 @@ pub struct SearchOptions<'a> {
 ///
 /// Errors are logged and treated as a full-scan fallback; `None` is returned
 /// when there are no sidecar candidates.
+#[allow(clippy::cognitive_complexity)]
 fn resolve_package_ordinals(
     index_file: &Path,
     exact_basename: Option<&str>,
