@@ -15,6 +15,7 @@ use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 
 use byteorder::{LittleEndian, WriteBytesExt};
+use memchr;
 use mmap_guard;
 use rayon::prelude::*;
 use regex::bytes::Regex;
@@ -1244,6 +1245,120 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
                 &store_path,
                 &entry,
             );
+        }
+    }
+
+    Ok(())
+}
+
+/// Generate nixdex sidecars for an existing NIXI database.
+///
+/// Reads the `files` database at `db_path`, extracts all package basenames,
+/// and writes the sidecar files (`files.basename.fst`, `files.basename.postings`,
+/// `files.packages.names`, `files.frame_map`) to the same directory.
+///
+/// This enables fast basename lookups via `BasenameIndex` for prebuilt indexes
+/// downloaded from upstream nix-index-database releases.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be read, sidecars cannot be written,
+/// or the database is corrupt.
+pub fn generate_sidecars(db_path: &Path) -> Result<()> {
+    let reader = Reader::open(db_path)?;
+    let db_dir = db_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or(Error::Corrupt("database path has no parent directory"))?;
+
+    // Scan all frames to extract package paths and build the basename index.
+    let mut builder = BasenameIndexBuilder::new();
+    let mut all_package_labels: Vec<String> = Vec::new();
+
+    for (offset, len) in &reader.frames {
+        let start = *offset;
+        let end = start + len;
+        let compressed = reader
+            .data
+            .get(start..end)
+            .ok_or(Error::Corrupt("frame slice out of range"))?;
+
+        let raw = if compressed.is_empty() {
+            Vec::new()
+        } else {
+            crate::bounded_zstd_decode(compressed, crate::MAX_ZSTD_FRAME_BYTES)
+                .map_err(Error::Io)?
+        };
+
+        scan_frame_for_packages(&raw, &mut builder, &mut all_package_labels)?;
+    }
+
+    // Write basename sidecars.
+    builder
+        .write_sidecars(db_dir)
+        .map_err(Error::SecondaryIndex)?;
+
+    // Write frame_map sidecar if we have v2 frame data.
+    if let (Some(frame_map), Some(_frame_starts)) = (&reader.frame_map, &reader.frame_starts) {
+        write_frame_map(db_dir, frame_map, reader.frames.len())?;
+    }
+
+    tracing::info!(
+        db_path = %db_path.display(),
+        packages = all_package_labels.len(),
+        "generated nixdex sidecars"
+    );
+
+    Ok(())
+}
+
+/// Scan a single frame's frcode data to extract package paths.
+fn scan_frame_for_packages(
+    raw: &[u8],
+    builder: &mut BasenameIndexBuilder,
+    all_package_labels: &mut Vec<String>,
+) -> Result<()> {
+    let mut decoder = frcode::Decoder::new(std::io::Cursor::new(raw));
+    let mut current_paths: Vec<Vec<u8>> = Vec::new();
+
+    loop {
+        let block = decoder.decode()?;
+        if block.is_empty() {
+            break;
+        }
+
+        for line in block.split(|c| *c == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+
+            if line.starts_with(b"p\0") {
+                // Package footer: record accumulated paths and reset.
+                if !current_paths.is_empty() {
+                    let json = line.get(2..).ok_or_else(|| Error::StorePathParse {
+                        path: line.to_vec(),
+                    })?;
+                    let pkg: StorePath = sonic_rs::from_slice(json).map_err(|_| {
+                        Error::StorePathParse {
+                            path: json.to_vec(),
+                        }
+                    })?;
+                    let label = format!("{}.{}", pkg.origin().attr, pkg.origin().output);
+                    all_package_labels.push(label.clone());
+                    builder
+                        .record_package(label, current_paths.clone())
+                        .map_err(Error::SecondaryIndex)?;
+                    current_paths.clear();
+                }
+            } else {
+                // File entry: extract path.
+                let sep = memchr::memchr(b'\0', line).ok_or_else(|| Error::EntryParse {
+                    entry: line.to_vec(),
+                })?;
+                if let Some(path) = line.get(sep + 1..) {
+                    current_paths.push(path.to_vec());
+                }
+            }
         }
     }
 
