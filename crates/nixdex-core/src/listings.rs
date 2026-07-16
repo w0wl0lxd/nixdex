@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use scc::HashSet as SccHashSet;
@@ -154,7 +154,7 @@ impl ListingSource for CachedSource {
     }
 }
 
-/// Fetch `.ls` listings recursively over the runtime closure of `starting_set`.
+/// Fetch `.ls` listings recursively over the package stream from `input`.
 ///
 /// The returned receiver yields every store path whose `.ls` listing could be
 /// fetched and parsed. Missing `.ls` files or missing narinfos are skipped
@@ -172,7 +172,7 @@ impl ListingSource for CachedSource {
 pub async fn fetch_listings(
     fetcher: &Fetcher,
     jobs: usize,
-    starting_set: Vec<PackageEntry>,
+    input: mpsc::Receiver<PackageEntry>,
     path_cache: Option<Arc<PathCache>>,
 ) -> Result<mpsc::Receiver<Result<ListingItem>>> {
     if let Some(cache) = path_cache {
@@ -180,16 +180,16 @@ pub async fn fetch_listings(
             inner: fetcher.clone(),
             cache,
         };
-        fetch_listings_with_source(&source, jobs, starting_set).await
+        fetch_listings_with_source(&source, jobs, input).await
     } else {
-        fetch_listings_with_source(fetcher, jobs, starting_set).await
+        fetch_listings_with_source(fetcher, jobs, input).await
     }
 }
 
 async fn fetch_listings_with_source<S: ListingSource>(
     source: &S,
     jobs: usize,
-    starting_set: Vec<PackageEntry>,
+    mut input: mpsc::Receiver<PackageEntry>,
 ) -> Result<mpsc::Receiver<Result<ListingItem>>> {
     let jobs = jobs.max(1);
     let (out_tx, out_rx) = mpsc::channel::<Result<ListingItem>>(jobs * 2);
@@ -198,22 +198,32 @@ async fn fetch_listings_with_source<S: ListingSource>(
         Arc::new(SccHashSet::with_hasher(ahash::RandomState::new()));
     let in_flight = Arc::new(AtomicUsize::new(0));
     let notify = Arc::new(Notify::new());
+    let input_done = Arc::new(AtomicBool::new(false));
     let semaphore = Arc::new(Semaphore::new(jobs));
 
-    {
-        let mut q = queue.lock().await;
-        for entry in starting_set {
-            // `scc::HashSet::insert_sync` returns `Ok(())` for a newly inserted
-            // key and `Err(key)` if it already exists, so `is_ok()` is correct.
-            if seen.insert_sync(entry.path.hash().to_string()).is_ok() {
-                in_flight.fetch_add(1, Ordering::SeqCst);
-                q.push_back(entry);
+    // Feed incoming root entries into the shared queue. Workers also push
+    // newly discovered references into the same queue.
+    let notify_for_feeder = Arc::clone(&notify);
+    let queue_for_feeder = Arc::clone(&queue);
+    let seen_for_feeder = Arc::clone(&seen);
+    let in_flight_for_feeder = Arc::clone(&in_flight);
+    let input_done_for_feeder = Arc::clone(&input_done);
+    tokio::spawn(async move {
+        while let Some(entry) = input.recv().await {
+            if seen_for_feeder
+                .insert_sync(entry.path.hash().to_string())
+                .is_ok()
+            {
+                in_flight_for_feeder.fetch_add(1, Ordering::SeqCst);
+                queue_for_feeder.lock().await.push_back(entry);
+                notify_for_feeder.notify_one();
             }
         }
-    }
+        input_done_for_feeder.store(true, Ordering::SeqCst);
+        notify_for_feeder.notify_one();
+    });
 
     let source = source.clone();
-    let out_tx_for_dispatcher = out_tx.clone();
     tokio::spawn(async move {
         let source = source;
         loop {
@@ -234,7 +244,7 @@ async fn fetch_listings_with_source<S: ListingSource>(
                 let seen = Arc::clone(&seen);
                 let in_flight = Arc::clone(&in_flight);
                 let notify = Arc::clone(&notify);
-                let out_tx = out_tx_for_dispatcher.clone();
+                let out_tx = out_tx.clone();
 
                 tokio::spawn(async move {
                     let _permit = permit;
@@ -245,7 +255,8 @@ async fn fetch_listings_with_source<S: ListingSource>(
                     }
                 });
             } else {
-                let done = in_flight.load(Ordering::SeqCst) == 0;
+                let done =
+                    input_done.load(Ordering::SeqCst) && in_flight.load(Ordering::SeqCst) == 0;
                 if done {
                     break;
                 }
@@ -387,6 +398,14 @@ mod tests {
         FileTree::directory(Vec::new())
     }
 
+    fn input_channel(entries: Vec<PackageEntry>) -> mpsc::Receiver<PackageEntry> {
+        let (tx, rx) = mpsc::channel(entries.len());
+        for entry in entries {
+            tx.try_send(entry).expect("enqueue test entry");
+        }
+        rx
+    }
+
     fn leaf(name: &[u8]) -> FileTree {
         FileTree::directory(vec![(Bytes::copy_from_slice(name), empty_tree())])
     }
@@ -412,9 +431,13 @@ mod tests {
             trees,
             ..Default::default()
         };
-        let mut rx = fetch_listings_with_source(&source, 2, vec![PackageEntry::new(a.clone())])
-            .await
-            .expect("start");
+        let mut rx = fetch_listings_with_source(
+            &source,
+            2,
+            input_channel(vec![PackageEntry::new(a.clone())]),
+        )
+        .await
+        .expect("start");
 
         let mut collected = Vec::new();
         while let Some(result) = rx.recv().await {
@@ -446,9 +469,13 @@ mod tests {
             trees,
             ..Default::default()
         };
-        let mut rx = fetch_listings_with_source(&source, 2, vec![PackageEntry::new(a.clone())])
-            .await
-            .expect("start");
+        let mut rx = fetch_listings_with_source(
+            &source,
+            2,
+            input_channel(vec![PackageEntry::new(a.clone())]),
+        )
+        .await
+        .expect("start");
 
         let mut collected = Vec::new();
         while let Some(result) = rx.recv().await {
@@ -474,9 +501,13 @@ mod tests {
             trees,
             ..Default::default()
         };
-        let mut rx = fetch_listings_with_source(&source, 2, vec![PackageEntry::new(a.clone())])
-            .await
-            .expect("start");
+        let mut rx = fetch_listings_with_source(
+            &source,
+            2,
+            input_channel(vec![PackageEntry::new(a.clone())]),
+        )
+        .await
+        .expect("start");
 
         let mut collected = Vec::new();
         while let Some(result) = rx.recv().await {
@@ -502,10 +533,10 @@ mod tests {
         let mut rx = fetch_listings_with_source(
             &source,
             2,
-            vec![PackageEntry {
+            input_channel(vec![PackageEntry {
                 path: a.clone(),
                 main_program: Some("foo".to_string()),
-            }],
+            }]),
         )
         .await
         .expect("start");
@@ -539,10 +570,10 @@ mod tests {
         let mut rx = fetch_listings_with_source(
             &source,
             2,
-            vec![PackageEntry {
+            input_channel(vec![PackageEntry {
                 path: a.clone(),
                 main_program: Some("foo".to_string()),
-            }],
+            }]),
         )
         .await
         .expect("start");
@@ -574,10 +605,10 @@ mod tests {
         let mut rx = fetch_listings_with_source(
             &source,
             2,
-            vec![PackageEntry {
+            input_channel(vec![PackageEntry {
                 path: a.clone(),
                 main_program: Some("foo".to_string()),
-            }],
+            }]),
         )
         .await
         .expect("start");
@@ -602,10 +633,10 @@ mod tests {
         let mut rx = fetch_listings_with_source(
             &source,
             2,
-            vec![PackageEntry {
+            input_channel(vec![PackageEntry {
                 path: a.clone(),
                 main_program: Some("foo/bar".to_string()),
-            }],
+            }]),
         )
         .await
         .expect("start");

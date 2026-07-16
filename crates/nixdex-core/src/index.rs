@@ -3,9 +3,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use indicatif::{MultiProgress, ProgressBar};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::CACHE_URL;
@@ -13,7 +14,7 @@ use crate::database::Writer;
 use crate::errors::{Error, Result};
 use crate::hydra::Fetcher;
 use crate::listings;
-use crate::nixpkgs::{self, PackageList};
+use crate::nixpkgs;
 use crate::path_cache::PathCache;
 
 /// Options controlling an index build.
@@ -97,6 +98,42 @@ impl IndexBuilder {
         &self.options
     }
 
+    /// Spawn an async task that evaluates nixpkgs and streams
+    /// [`PackageEntry`] values into a channel.
+    ///
+    /// Returns the task handle and the receiver to be passed to the listing
+    /// fetcher.
+    fn spawn_package_eval_stream(
+        &self,
+    ) -> (
+        tokio::task::JoinHandle<nixpkgs::Result<(usize, Duration)>>,
+        mpsc::Receiver<listings::PackageEntry>,
+    ) {
+        let opts = &self.options;
+        let (pkg_tx, pkg_rx) = mpsc::channel(1024);
+        let nixpkgs_expr = opts.nixpkgs.clone();
+        let system = opts.system.clone();
+        let extra_scopes = opts.extra_scopes.clone();
+        let show_trace = opts.show_trace;
+        let main_program = opts.main_program;
+
+        let handle = tokio::spawn(async move {
+            let start = Instant::now();
+            let count = nixpkgs::stream_package_entries(
+                &nixpkgs_expr,
+                system.as_deref(),
+                &extra_scopes,
+                show_trace,
+                main_program,
+                pkg_tx,
+            )
+            .await?;
+            Ok((count, start.elapsed()))
+        });
+
+        (handle, pkg_rx)
+    }
+
     /// Run the index build: evaluate packages, fetch `.ls` trees, write NIXI DB.
     ///
     /// # Errors
@@ -111,8 +148,6 @@ impl IndexBuilder {
             path: opts.database.clone(),
             source,
         })?;
-
-        let clock = quanta::Clock::new();
 
         let cache_path = opts
             .path_cache_file
@@ -142,24 +177,8 @@ impl IndexBuilder {
 
         let eval_pb = progress.add(ProgressBar::new_spinner());
         eval_pb.set_message("Evaluating nixpkgs...");
-        let eval_start = clock.now();
-        let packages = nixpkgs::list_packages_with_scopes(
-            &opts.nixpkgs,
-            opts.system.as_deref(),
-            &opts.extra_scopes,
-            opts.show_trace,
-            opts.main_program,
-        )
-        .await
-        .map_err(|source| Error::QueryPackages {
-            source: Box::new(source),
-        })?;
-        let eval_elapsed = eval_start.elapsed();
-        eval_pb.finish_with_message(format!(
-            "Evaluated {} package(s) in {:?}",
-            packages.packages.len(),
-            eval_elapsed
-        ));
+
+        let (eval_handle, pkg_rx) = self.spawn_package_eval_stream();
 
         let fetcher = Fetcher::new(CACHE_URL).map_err(|err| {
             Error::Io(std::io::Error::other(format!(
@@ -167,19 +186,28 @@ impl IndexBuilder {
             )))
         })?;
 
-        let starting_set = build_starting_set(packages);
         let filter_prefix = opts.filter_prefix.as_bytes().to_vec();
         let (indexed, failed, fetch_elapsed) = write_listings(
             &mut writer,
             &fetcher,
             opts.jobs.max(1),
-            starting_set,
+            pkg_rx,
             path_cache.clone(),
             filter_prefix,
             &db_file,
             &progress,
         )
         .await?;
+
+        let (eval_count, eval_elapsed) = eval_handle
+            .await
+            .map_err(|err| Error::Io(std::io::Error::other(format!("eval task panicked: {err}"))))?
+            .map_err(|source| Error::QueryPackages {
+                source: Box::new(source),
+            })?;
+        eval_pb.finish_with_message(format!(
+            "Evaluated {eval_count} package(s) in {eval_elapsed:?}"
+        ));
 
         let cached = path_cache
             .as_ref()
@@ -248,33 +276,12 @@ fn load_path_cache(
     }
 }
 
-fn build_starting_set(packages: PackageList) -> Vec<listings::PackageEntry> {
-    packages
-        .packages
-        .into_iter()
-        .flat_map(|pkg| {
-            let main_program = pkg.main_program.clone();
-            pkg.store_paths.into_iter().map(move |path| {
-                let mp = if path.origin().output == "out" {
-                    main_program.clone()
-                } else {
-                    None
-                };
-                listings::PackageEntry {
-                    path,
-                    main_program: mp,
-                }
-            })
-        })
-        .collect()
-}
-
 #[allow(clippy::cognitive_complexity)]
 async fn write_listings(
     writer: &mut Writer,
     fetcher: &Fetcher,
     jobs: usize,
-    starting_set: Vec<listings::PackageEntry>,
+    package_input: mpsc::Receiver<listings::PackageEntry>,
     path_cache: Option<Arc<PathCache>>,
     filter_prefix: Vec<u8>,
     db_file: &Path,
@@ -287,7 +294,7 @@ async fn write_listings(
     fetch_pb.set_message("Fetching listings...");
     let fetch_start = quanta::Instant::now();
 
-    let mut listings = listings::fetch_listings(fetcher, jobs, starting_set, path_cache)
+    let mut listings = listings::fetch_listings(fetcher, jobs, package_input, path_cache)
         .await
         .map_err(|source| {
             Error::Io(std::io::Error::other(format!(
