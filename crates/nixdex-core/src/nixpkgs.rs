@@ -39,13 +39,26 @@ pub enum Error {
 /// Convenience alias for this module.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// A list of package attribute paths discovered during evaluation.
+/// A single package discovered during evaluation, together with the store
+/// paths produced by its outputs and optional `meta.mainProgram` value.
+#[derive(Debug, Clone)]
+pub struct Package {
+    /// Fully-qualified attribute path (for example `hello`).
+    pub attr: String,
+    /// Store paths discovered from successful evaluation lines.
+    pub store_paths: Vec<StorePath>,
+    /// Value of `meta.mainProgram`, used to synthesize `/bin/<mainProgram>`
+    /// listings for packages not available from the binary cache.
+    pub main_program: Option<String>,
+}
+
+/// A list of packages discovered during evaluation.
 #[derive(Debug, Clone, Default)]
 pub struct PackageList {
     /// Fully-qualified attribute paths (for example `hello`).
     pub attrs: Vec<String>,
-    /// Store paths discovered from successful evaluation lines.
-    pub store_paths: Vec<StorePath>,
+    /// Packages discovered from successful evaluation lines.
+    pub packages: Vec<Package>,
 }
 
 /// Options controlling a `nix-eval-jobs` invocation.
@@ -64,6 +77,18 @@ pub struct EvalJobsOptions<'a> {
     /// Optional attribute path suffix for extra scopes (e.g. `haskellPackages`).
     /// When set, the evaluated expression becomes `(root).<scope>`.
     pub scope: Option<&'a str>,
+}
+
+/// A subset of the `meta` attrset emitted by `nix-eval-jobs --meta`.
+///
+/// Only the fields nixdex cares about are captured; all other meta fields
+/// are ignored during deserialization.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Meta {
+    /// The value of `meta.mainProgram`, if present and a string.
+    #[serde(default)]
+    pub main_program: Option<String>,
 }
 
 /// One successfully decoded derivation job from `nix-eval-jobs` NDJSON.
@@ -99,6 +124,9 @@ pub struct EvalJob {
     /// Fatal evaluation failure flag.
     #[serde(default)]
     pub fatal: Option<bool>,
+    /// Derivation `meta` attrset, present when `--meta` is passed to `nix-eval-jobs`.
+    #[serde(default)]
+    pub meta: Option<Meta>,
 }
 
 fn default_store_dir() -> String {
@@ -161,6 +189,12 @@ impl EvalJob {
             }
         }
         out
+    }
+
+    /// Return the value of `meta.mainProgram`, if any.
+    #[must_use]
+    pub fn main_program(&self) -> Option<&str> {
+        self.meta.as_ref()?.main_program.as_deref()
     }
 }
 
@@ -322,6 +356,8 @@ pub async fn run_eval_jobs(options: &EvalJobsOptions<'_>) -> Result<Vec<EvalJobL
     if options.show_trace {
         cmd.arg("--show-trace");
     }
+    // `meta.mainProgram` is needed to synthesize `/bin/<mainProgram>` listings.
+    cmd.arg("--meta");
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = cmd
@@ -380,8 +416,13 @@ pub async fn list_packages_async(options: &EvalJobsOptions<'_>) -> Result<Packag
         } else {
             job.attr_path.join(".")
         };
-        list.attrs.push(attr);
-        list.store_paths.extend(job.store_paths());
+        let main_program = job.main_program().map(String::from);
+        list.attrs.push(attr.clone());
+        list.packages.push(Package {
+            attr,
+            store_paths: job.store_paths(),
+            main_program,
+        });
     }
     Ok(list)
 }
@@ -426,7 +467,7 @@ pub async fn list_packages_with_scopes(
         match list_packages_async(&scope_opts).await {
             Ok(more) => {
                 merged.attrs.extend(more.attrs);
-                merged.store_paths.extend(more.store_paths);
+                merged.packages.extend(more.packages);
             }
             Err(_) => {
                 // Soft-skip missing scopes (custom nixpkgs without haskellPackages).
@@ -491,6 +532,22 @@ mod tests {
             paths.first().map(StorePath::hash),
             Some("pg2zfrrbm58ynbjshhzkgg4q466spinf")
         );
+    }
+
+    #[test]
+    fn parse_main_program_from_meta() {
+        let raw = r#"{"attr":"nh","attrPath":["nh"],"cacheStatus":"local","drvPath":"/nix/store/x.drv","isCached":true,"name":"nh-4.3.2","meta":{"mainProgram":"nh","description":"Nix helper"},"outputs":{"out":"/nix/store/k9c04vx63x91fa3k147g5hi7k0ppns80-nh-4.3.2"},"storeDir":"/nix/store","system":"x86_64-linux"}"#;
+        let line = parse_eval_line(raw).expect("parse");
+        let job = line.job.expect("job");
+        assert_eq!(job.main_program(), Some("nh"));
+    }
+
+    #[test]
+    fn main_program_missing_when_meta_absent() {
+        let raw = r#"{"attr":"hello","attrPath":["hello"],"cacheStatus":"local","drvPath":"/nix/store/x.drv","isCached":true,"name":"hello-2.12.3","outputs":{"out":"/nix/store/pg2zfrrbm58ynbjshhzkgg4q466spinf-hello-2.12.3"},"storeDir":"/nix/store","system":"x86_64-linux"}"#;
+        let line = parse_eval_line(raw).expect("parse");
+        let job = line.job.expect("job");
+        assert!(job.main_program().is_none());
     }
 
     #[test]
