@@ -65,7 +65,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build and run index benchmark
         run: |
-          nix-shell -p nix-eval-jobs hyperfine zlib --run \
+          nix-shell -p nix-eval-jobs hyperfine --run \
             "./scripts/benchmark-index.sh '${{ github.event.inputs.nixpkgs || '<nixpkgs>' }}' '${{ github.event.inputs.mode || 'eval' }}' '${{ github.event.inputs.runs || '1' }}'"
       - name: Upload benchmark report
         uses: actions/upload-artifact@v4
