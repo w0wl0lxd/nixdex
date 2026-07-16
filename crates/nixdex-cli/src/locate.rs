@@ -85,6 +85,19 @@ pub struct Opts {
     /// Only print attribute names of found files or directories.
     #[arg(long)]
     pub minimal: bool,
+
+    /// Output results as one JSON object per line instead of the default
+    /// human-readable format.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Maximum number of results to print.
+    #[arg(short, long)]
+    pub limit: Option<usize>,
+
+    /// Print the number of matches instead of the matches themselves.
+    #[arg(long)]
+    pub count: bool,
 }
 
 /// Processed form of the CLI options ready for the core search API.
@@ -98,6 +111,9 @@ struct ProcessedArgs {
     path_prefix: Option<String>,
     file_type: Vec<FileType>,
     mode: SearchMode,
+    json: bool,
+    limit: Option<usize>,
+    count: bool,
 }
 
 fn process_args(matches: Opts) -> ProcessedArgs {
@@ -191,6 +207,9 @@ fn process_args(matches: Opts) -> ProcessedArgs {
         path_prefix,
         file_type,
         mode,
+        json: matches.json,
+        limit: matches.limit,
+        count: matches.count,
     }
 }
 
@@ -213,6 +232,9 @@ pub fn run(matches: Opts) -> color_eyre::Result<()> {
         path_prefix: args.path_prefix,
         file_type: &args.file_type,
         mode: args.mode,
+        json: args.json,
+        limit: args.limit,
+        count: args.count,
     };
 
     nixdex_core::search_database(&options).wrap_err("nix-locate failed")?;
