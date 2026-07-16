@@ -212,6 +212,10 @@ fn load_and_store_index(cache_dir: &std::path::Path, index_state: &IndexState) {
         cache_dir.join("current")
     };
 
+    if !ensure_sidecars(&index_dir) {
+        return;
+    }
+
     let Ok(index) = crate::basename_index::BasenameIndex::open(&index_dir) else {
         return;
     };
@@ -222,6 +226,24 @@ fn load_and_store_index(cache_dir: &std::path::Path, index_state: &IndexState) {
     load_reader(&index_dir, index_state);
     load_package_db(&index_dir, index_state);
     tracing::info!(index_dir = %index_dir.display(), "index loaded");
+}
+
+#[cfg(feature = "daemon")]
+fn ensure_sidecars(index_dir: &std::path::Path) -> bool {
+    let files_path = index_dir.join("files");
+    let packages_json = index_dir.join("packages.json");
+    if files_path.is_file()
+        && !packages_json.is_file()
+        && let Err(err) = crate::database::generate_sidecars(&files_path)
+    {
+        tracing::warn!(
+            error = %err,
+            path = %files_path.display(),
+            "failed to generate sidecars for prebuilt index"
+        );
+        return false;
+    }
+    true
 }
 
 #[cfg(feature = "daemon")]
