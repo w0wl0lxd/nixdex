@@ -408,7 +408,7 @@ impl<W: Write> Encoder<W> {
         let mut shared: isize = 0;
         let max_shared = i16::MAX as isize;
         for (a, b) in self.last.iter().zip(path.iter()) {
-            if a != b || shared > max_shared {
+            if a != b || shared >= max_shared {
                 break;
             }
             shared += 1;
@@ -537,5 +537,28 @@ mod tests {
         assert!(decoded.contains(&b'a'));
         assert!(decoded.contains(&b'b'));
         assert!(decoded.contains(&b'c'));
+    }
+
+    #[test]
+    fn roundtrip_very_long_shared_prefix() {
+        // Shared prefixes longer than i16::MAX must not wrap around when encoded.
+        let long = vec![b'a'; 32_768];
+        let mut second = long.clone();
+        second.push(b'b');
+
+        let encoded = encode_paths(&[&long, &second]);
+        let decoded = decode_all(&encoded);
+
+        let lines: Vec<&[u8]> = decoded
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(lines.len(), 3);
+
+        for (i, path) in [&long[..], &second[..]].iter().enumerate() {
+            let line = *lines.get(i).expect("line");
+            let sep = memchr::memchr(b'\0', line).expect("nul");
+            assert_eq!(line.get(sep + 1..), Some(*path));
+        }
     }
 }
