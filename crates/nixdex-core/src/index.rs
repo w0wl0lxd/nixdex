@@ -33,6 +33,12 @@ pub struct UpdateOptions {
     pub nixpkgs: String,
     /// Optional system triple for evaluation.
     pub system: Option<String>,
+    /// Optional `--select` expression passed to `nix-eval-jobs`.
+    pub select: Option<String>,
+    /// Whether to pass `--no-instantiate` to `nix-eval-jobs`.
+    pub no_instantiate: bool,
+    /// Whether to pass `--check-cache-status` to `nix-eval-jobs`.
+    pub check_cache_status: bool,
     /// Zstandard compression level for the on-disk database.
     pub compression_level: i32,
     /// On-disk database format version (1 or 2).
@@ -41,6 +47,8 @@ pub struct UpdateOptions {
     pub show_trace: bool,
     /// Only index paths starting with this prefix.
     pub filter_prefix: String,
+    /// Build a small, `/bin/`-filtered database (alias for `--filter-prefix /bin/`).
+    pub small: bool,
     /// Persist intermediate fetch results into `paths.cache`.
     pub path_cache: bool,
     /// Ignore the existing `paths.cache` and re-fetch all store paths.
@@ -66,10 +74,14 @@ impl Default for UpdateOptions {
             database: PathBuf::from("/tmp/nix-index"),
             nixpkgs: String::from("<nixpkgs>"),
             system: None,
+            select: None,
+            no_instantiate: false,
+            check_cache_status: true,
             compression_level: 19,
             format_version: 2,
             show_trace: false,
             filter_prefix: String::new(),
+            small: false,
             path_cache: false,
             force: false,
             cache_key: None,
@@ -164,23 +176,30 @@ impl IndexBuilder {
         let nixpkgs_expr = opts.nixpkgs.clone();
         let system = opts.system.clone();
         let extra_scopes = opts.extra_scopes.clone();
+        let select = opts.select.clone();
         let show_trace = opts.show_trace;
         let main_program = opts.main_program;
+        let no_instantiate = opts.no_instantiate;
+        let check_cache_status = opts.check_cache_status;
 
         let meta_handle = self.spawn_meta_writer(meta_rx);
         let handle = tokio::spawn(async move {
             let start = Instant::now();
-            let count = nixpkgs::stream_package_entries(
-                &nixpkgs_expr,
-                system.as_deref(),
-                &extra_scopes,
+            let base = nixpkgs::EvalJobsOptions {
+                nixpkgs: &nixpkgs_expr,
+                system: system.as_deref(),
+                select: select.as_deref(),
+                no_instantiate,
+                check_cache_status,
                 show_trace,
-                main_program,
-                true,
-                pkg_tx,
-                meta_tx,
-            )
-            .await?;
+                // Meta is always fetched so the `packages.json` sidecar has
+                // descriptions and `mainProgram` values.
+                meta: true,
+                scope: None,
+            };
+            let count =
+                nixpkgs::stream_package_entries(base, &extra_scopes, main_program, pkg_tx, meta_tx)
+                    .await?;
             Ok((count, start.elapsed()))
         });
 
@@ -324,7 +343,11 @@ impl IndexBuilder {
 
         let stream = self.spawn_package_eval_stream();
         let fetcher = Self::new_fetcher()?;
-        let filter_prefix = opts.filter_prefix.as_bytes().to_vec();
+        let filter_prefix = if opts.small && opts.filter_prefix.is_empty() {
+            b"/bin/".to_vec()
+        } else {
+            opts.filter_prefix.as_bytes().to_vec()
+        };
         let (indexed, failed, fetch_elapsed) = match write_listings(
             &mut writer,
             &fetcher,
@@ -557,10 +580,14 @@ mod tests {
             database: dir.path().to_path_buf(),
             nixpkgs: nixpkgs_file.to_string_lossy().into_owned(),
             system: None,
+            select: None,
+            no_instantiate: false,
+            check_cache_status: true,
             compression_level: 3,
             format_version: 1,
             show_trace: false,
             filter_prefix: "/bin/".into(),
+            small: false,
             path_cache: false,
             force: false,
             cache_key: None,
