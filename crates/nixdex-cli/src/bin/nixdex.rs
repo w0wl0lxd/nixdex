@@ -61,6 +61,10 @@ enum Cmd {
     Which(WhichOpts),
     /// Download the latest prebuilt index.
     Update(UpdateOpts),
+    /// Generate sidecar indexes for an existing `files` database.
+    GenerateSidecars(GenerateSidecarsOpts),
+    /// Print a command-not-found hint for a missing command.
+    CommandNotFound(CommandNotFoundOpts),
     /// Run the background daemon (alias for `nixdex-daemon`).
     Daemon(DaemonOpts),
 }
@@ -182,6 +186,32 @@ struct UpdateOpts {
     /// Download the `-small` prebuilt variant.
     #[arg(long)]
     small: bool,
+}
+
+/// Options for `nixdex generate-sidecars`.
+#[derive(Debug, Parser)]
+#[command(author, about, version)]
+struct GenerateSidecarsOpts {
+    /// Directory where the index is stored.
+    #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
+    database: PathBuf,
+}
+
+/// Options for `nixdex command-not-found`.
+#[derive(Debug, Parser)]
+#[command(author, about, version)]
+struct CommandNotFoundOpts {
+    /// Missing command to look up.
+    #[arg(value_name = "COMMAND")]
+    cmd: String,
+
+    /// Directory where the index is stored.
+    #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
+    database: PathBuf,
+
+    /// Output the suggestion as JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Options for running the background daemon.
@@ -368,6 +398,77 @@ async fn run_update(opts: UpdateOpts) -> color_eyre::Result<()> {
     Ok(())
 }
 
+fn run_generate_sidecars(opts: GenerateSidecarsOpts) -> color_eyre::Result<()> {
+    let files = opts.database.join("files");
+    nixdex_core::generate_sidecars(&files)
+        .wrap_err_with(|| format!("failed to generate sidecars for {}", files.display()))?;
+    println!("generated sidecars for {}", opts.database.display());
+    Ok(())
+}
+
+fn find_command_providers(
+    cmd: &str,
+    reader: &nixdex_core::database::Reader,
+) -> color_eyre::Result<Vec<String>> {
+    let full_path = if cmd.starts_with('/') {
+        cmd.to_string()
+    } else {
+        format!("/bin/{cmd}")
+    };
+    let pattern = format!("^{}$", regex::escape(&full_path));
+    let re = regex::bytes::Regex::new(&pattern).wrap_err("invalid path pattern")?;
+
+    let results = reader
+        .search_entries(&re, None, None, None, None)
+        .map_err(|err| color_eyre::eyre::eyre!("search failed: {err}"))?;
+
+    let mut providers: Vec<String> = results
+        .into_iter()
+        .filter(|(_, entry)| entry.node.is_executable())
+        .map(|(store_path, _)| format_which_attr(&store_path))
+        .collect();
+
+    providers.sort();
+    providers.dedup();
+    Ok(providers)
+}
+
+fn run_command_not_found(opts: CommandNotFoundOpts) -> color_eyre::Result<()> {
+    let files = opts.database.join("files");
+    let reader = nixdex_core::database::Reader::open(&files)
+        .wrap_err_with(|| format!("failed to open index at {}", files.display()))?;
+
+    let providers = find_command_providers(&opts.cmd, &reader)?;
+
+    match providers.as_slice() {
+        [] => {
+            color_eyre::eyre::bail!("{}: command not found", opts.cmd);
+        }
+        [single] if !opts.json => {
+            eprintln!(
+                "The program '{}' is currently not installed. It is provided by the package '{}'.",
+                opts.cmd, single
+            );
+            Ok(())
+        }
+        _ if !opts.json => {
+            eprintln!(
+                "The program '{}' is currently not installed. It is provided by the following packages:",
+                opts.cmd
+            );
+            for provider in &providers {
+                eprintln!("  {provider}");
+            }
+            Ok(())
+        }
+        _ => {
+            let line = sonic_rs::to_string(&providers).wrap_err("failed to serialize providers")?;
+            println!("{line}");
+            Ok(())
+        }
+    }
+}
+
 fn run_completions(opts: CompletionsOpts) {
     let mut cmd = Opts::command();
     let name = cmd.get_name().to_string();
@@ -448,6 +549,8 @@ async fn main() -> color_eyre::Result<()> {
         Cmd::Locate(locate_opts) => locate::run(locate_opts),
         Cmd::Which(which_opts) => run_which(which_opts),
         Cmd::Update(update_opts) => run_update(update_opts).await,
+        Cmd::GenerateSidecars(opts) => run_generate_sidecars(opts),
+        Cmd::CommandNotFound(opts) => run_command_not_found(opts),
         Cmd::Daemon(daemon_opts) => run_daemon(daemon_opts).await,
     }
 }
