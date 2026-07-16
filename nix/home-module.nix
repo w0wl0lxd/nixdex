@@ -38,7 +38,7 @@ in
 
     programs.fish.interactiveShellInit = lib.mkIf cfg.enableFishIntegration ''
       function __fish_command_not_found_handler --on-event fish_command_not_found
-        bash -c 'source ${cfg.package}/etc/profile.d/command-not-found.sh; command_not_found_handle "$@"' -- $argv
+        ${pkgs.bash}/bin/bash -c 'source ${cfg.package}/etc/profile.d/command-not-found.sh; command_not_found_handle "$@"' -- $argv
       end
     '';
 

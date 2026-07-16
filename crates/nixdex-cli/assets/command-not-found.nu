@@ -1,9 +1,9 @@
 { |cmd_name|
   let install = { |pkgs|
-    $pkgs | each {|pkg| $"  nix shell nixpkgs#($pkg)" }
+    $pkgs | each {|pkg| $"  nix profile install nixpkgs#($pkg)" }
   }
   let run_once = { |pkgs|
-    $pkgs | each {|pkg| $"  nix shell nixpkgs#($pkg) --command '($cmd_name) ...'" }
+    $pkgs | each {|pkg| $"  nix shell nixpkgs#($pkg) --command ($cmd_name) ..." }
   }
   let single_pkg = { |pkg|
     let lines = [
@@ -29,7 +29,7 @@
     ]
     $lines | str join "\n"
   }
-  let pkgs = (nix-locate --minimal --no-group --type x --type s --whole-name --at-root $"/bin/($cmd_name)" | lines)
+  let pkgs = (@out@/bin/nix-locate --minimal --no-group --type x --type s --whole-name --at-root $"/bin/($cmd_name)" | lines)
   let len = ($pkgs | length)
   let ret = match $len {
     0 => null,

@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 
 # Shell integration for nixdex / nix-locate.
 # Source this file from your shell profile to get command-not-found suggestions.
@@ -6,7 +6,7 @@
 command_not_found_handle () {
     # Do not run when inside Midnight Commander or within a pipe.
     if [ -n "${MC_SID-}" ] || ! [ -t 1 ]; then
-        >&2 echo "$1: command not found"
+        echo "$1: command not found" >&2
         return 127
     fi
 
@@ -15,46 +15,48 @@ command_not_found_handle () {
     local attrs
     attrs=$(@out@/bin/nix-locate --minimal --no-group --type x --type s --whole-name --at-root "/bin/$cmd")
     local len
-    len=$(echo -n "$attrs" | grep -c "^")
+    len=$(printf '%s\n' "$attrs" | grep -c .)
 
     case $len in
         0)
-            >&2 echo "$cmd: command not found"
+            echo "$cmd: command not found" >&2
             ;;
         1)
-            if ! [ -z "${NIX_AUTO_INSTALL-}" ]; then
-                >&2 cat <<EOF
+            if [ -n "${NIX_AUTO_INSTALL-}" ]; then
+                cat >&2 <<EOF
 The program '$cmd' is currently not installed. It is provided by
 the package '$toplevel.$attrs', which I will now install for you.
 EOF
                 if [ -e "$HOME/.nix-profile/manifest.json" ]; then
-                    nix profile install "$toplevel#$attrs"
+                    if nix profile install "$toplevel#$attrs"; then
+                        "$@"
+                        return
+                    fi
                 else
-                    nix-env -iA "$toplevel.$attrs"
+                    if nix-env -iA "$toplevel.$attrs"; then
+                        "$@"
+                        return
+                    fi
                 fi
-                if [ "$?" -eq 0 ]; then
-                    "$@"
-                    return $?
-                else
-                    >&2 cat <<EOF
+                cat >&2 <<EOF
 Failed to install $toplevel.$attrs.
 $cmd: command not found
 EOF
-                fi
-            elif ! [ -z "${NIX_AUTO_RUN-}" ]; then
-                nix-build --no-out-link -A "$attrs" "<$toplevel>"
-                if [ "$?" -eq 0 ]; then
-                    nix-shell -p "$attrs" --run "$(echo "$@")"
-                    return $?
+            elif [ -n "${NIX_AUTO_RUN-}" ]; then
+                if nix-build --no-out-link -A "$attrs" "<$toplevel>"; then
+                    local escaped
+                    printf -v escaped '%q ' "$@"
+                    nix-shell -p "$attrs" --run "${escaped% }"
+                    return
                 else
-                    >&2 cat <<EOF
+                    cat >&2 <<EOF
 Failed to build $toplevel.$attrs.
 $cmd: command not found
 EOF
                 fi
             else
                 if [ -e "$HOME/.nix-profile/manifest.json" ]; then
-                    >&2 cat <<EOF
+                    cat >&2 <<EOF
 The program '$cmd' is currently not installed. You can install it
 by typing:
   nix profile install $toplevel#$attrs
@@ -63,7 +65,7 @@ Or run it once with:
   nix shell $toplevel#$attrs -c $cmd ...
 EOF
                 else
-                    >&2 cat <<EOF
+                    cat >&2 <<EOF
 The program '$cmd' is currently not installed. You can install it
 by typing:
   nix-env -iA $toplevel.$attrs
@@ -75,28 +77,28 @@ EOF
             fi
             ;;
         *)
-            >&2 cat <<EOF
+            cat >&2 <<EOF
 The program '$cmd' is currently not installed. It is provided by
 several packages. You can install it by typing one of the following:
 EOF
             while read -r attr; do
                 if [ -e "$HOME/.nix-profile/manifest.json" ]; then
-                    >&2 echo "  nix profile install $toplevel#$attr"
+                    echo "  nix profile install $toplevel#$attr" >&2
                 else
-                    >&2 echo "  nix-env -iA $toplevel.$attr"
+                    echo "  nix-env -iA $toplevel.$attr" >&2
                 fi
             done <<EOF
 $attrs
 EOF
-            >&2 cat <<EOF
+            cat >&2 <<EOF
 
 Or run it once with:
 EOF
             while read -r attr; do
                 if [ -e "$HOME/.nix-profile/manifest.json" ]; then
-                    >&2 echo "  nix shell $toplevel#$attr -c $cmd ..."
+                    echo "  nix shell $toplevel#$attr -c $cmd ..." >&2
                 else
-                    >&2 echo "  nix-shell -p $attr --run '$cmd ...'"
+                    echo "  nix-shell -p $attr --run '$cmd ...'" >&2
                 fi
             done <<EOF
 $attrs
@@ -109,5 +111,5 @@ EOF
 
 command_not_found_handler () {
     command_not_found_handle "$@"
-    return $?
+    return
 }

@@ -71,8 +71,10 @@
                 $out/etc/profile.d/command-not-found.sh \
                 --replace-fail "@out@" "$out"
               chmod +x $out/etc/profile.d/command-not-found.sh
-              install -Dm444 ${src}/crates/nixdex-cli/assets/command-not-found.nu \
-                $out/etc/profile.d/command-not-found.nu
+              substitute ${src}/crates/nixdex-cli/assets/command-not-found.nu \
+                $out/etc/profile.d/command-not-found.nu \
+                --replace-fail "@out@" "$out"
+              chmod 444 $out/etc/profile.d/command-not-found.nu
             '';
           }
         );
