@@ -56,7 +56,7 @@ struct Args {
     compression_level: i32,
 
     /// On-disk database format version (1 or 2).
-    #[arg(long, default_value = "1", value_parser = clap::value_parser!(u64).range(1..=2))]
+    #[arg(long, default_value = "2", value_parser = clap::value_parser!(u64).range(1..=2))]
     format_version: u64,
 
     /// Show a stack trace in the case of a Nix evaluation error.

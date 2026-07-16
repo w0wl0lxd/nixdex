@@ -45,7 +45,7 @@ impl Default for UpdateOptions {
             nixpkgs: String::from("<nixpkgs>"),
             system: None,
             compression_level: 22,
-            format_version: 1,
+            format_version: 2,
             show_trace: false,
             filter_prefix: String::new(),
             path_cache: false,
@@ -218,7 +218,7 @@ mod tests {
         let opts = UpdateOptions::default();
         assert_eq!(opts.jobs, 100);
         assert_eq!(opts.compression_level, 22);
-        assert_eq!(opts.format_version, 1);
+        assert_eq!(opts.format_version, 2);
         assert_eq!(opts.nixpkgs, "<nixpkgs>");
         assert!(!opts.path_cache);
     }
@@ -230,7 +230,7 @@ mod tests {
     async fn index_hello_from_nixpkgs() {
         let dir = tempfile::tempdir().expect("tempdir");
         // Evaluate a tiny attrset rather than all of nixpkgs.
-        let expr = r#"{ hello = (import <nixpkgs> {}).hello; }"#;
+        let expr = r"{ hello = (import <nixpkgs> {}).hello; }";
         let opts = UpdateOptions {
             jobs: 4,
             database: dir.path().to_path_buf(),
