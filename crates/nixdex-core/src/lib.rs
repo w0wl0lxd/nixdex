@@ -1,5 +1,6 @@
 //! nixdex-core — library for building and searching a Nix package file index.
 
+pub mod basename_index;
 pub mod daemon;
 pub mod database;
 pub mod errors;
