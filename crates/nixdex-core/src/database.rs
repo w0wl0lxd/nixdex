@@ -36,7 +36,7 @@ const SUPPORTED_VERSIONS: &[u64] = &[1, 2];
 const DEFAULT_WRITE_VERSION: u64 = 2;
 
 /// Magic bytes identifying a nix-index / nixdex database file.
-const FILE_MAGIC: &[u8] = b"NIXI";
+pub const FILE_MAGIC: &[u8] = b"NIXI";
 
 /// Magic of the trailing zstd skippable frame used by version 2 seek tables.
 const SKIPPABLE_MAGIC: u32 = 0x184D_2A50;

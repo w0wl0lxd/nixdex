@@ -103,6 +103,7 @@ impl IndexBuilder {
     ///
     /// Returns an error if the database directory cannot be created, evaluation
     /// fails hard, or the writer cannot be finalized.
+    #[allow(clippy::cognitive_complexity)]
     pub async fn build(&self) -> Result<()> {
         let opts = &self.options;
 
@@ -216,6 +217,7 @@ impl IndexBuilder {
     }
 }
 
+#[allow(clippy::cognitive_complexity)]
 fn load_path_cache(
     cache_path: &Path,
     cache_key: &str,
