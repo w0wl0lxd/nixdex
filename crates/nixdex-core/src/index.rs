@@ -277,8 +277,8 @@ async fn write_listings(
     db_file: &Path,
     progress: &MultiProgress,
 ) -> Result<(usize, usize, Duration)> {
-    const MAX_IN_FLIGHT: usize = 1000;
-    const MAX_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+    // Flush raw packages to a v2 frame once the in-memory chunk reaches 256 MiB.
+    const CHUNK_BYTES: u64 = 256 * 1024 * 1024;
 
     let fetch_pb = progress.add(ProgressBar::new_spinner());
     fetch_pb.set_message("Fetching listings...");
@@ -295,7 +295,6 @@ async fn write_listings(
     let mut indexed = 0usize;
     let mut failed = 0usize;
     let mut bytes_written = 0u64;
-    let mut in_flight = 0usize;
 
     while let Some(result) = listings.recv().await {
         match result {
@@ -310,16 +309,18 @@ async fn write_listings(
                 let after_len = writer.estimated_size();
                 bytes_written += after_len.saturating_sub(before_len);
                 indexed += 1;
-                in_flight += 1;
 
-                if in_flight >= MAX_IN_FLIGHT || writer.estimated_size() > MAX_MEMORY_BYTES {
+                if writer.estimated_size() > CHUNK_BYTES {
                     tracing::debug!(
-                        in_flight,
                         estimated_bytes = writer.estimated_size(),
-                        "memory bound reached, pausing fetch"
+                        "chunk size reached, flushing v2 frame"
                     );
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    in_flight = 0;
+                    writer
+                        .flush_chunk()
+                        .map_err(|source| Error::WriteDatabase {
+                            path: db_file.to_path_buf(),
+                            source: Box::new(source),
+                        })?;
                 }
             }
             Err(err) => {
