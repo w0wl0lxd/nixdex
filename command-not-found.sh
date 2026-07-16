@@ -9,9 +9,22 @@ command_not_found_handle () {
         return 127
     fi
 
+    # Allow command-not-found to use a small, `/bin/`-filtered database
+    # (set via NIXDEX_DATABASE) while leaving the full `NIX_INDEX_DATABASE`
+    # database for general `nix-locate` queries.
+    database="${NIXDEX_DATABASE:-${NIX_INDEX_DATABASE:-}}"
+
+    nix_locate() {
+        if [ -n "$database" ]; then
+            @out@/bin/nix-locate --db "$database" "$@"
+        else
+            @out@/bin/nix-locate "$@"
+        fi
+    }
+
     toplevel=nixpkgs
     cmd=$1
-    attrs=$(@out@/bin/nix-locate --minimal --no-group --type x --type s --whole-name --at-root "/bin/$cmd")
+    attrs=$(nix_locate --minimal --no-group --type x --type s --whole-name --at-root "/bin/$cmd")
     len=$(echo -n "$attrs" | grep -c "^")
 
     case $len in
