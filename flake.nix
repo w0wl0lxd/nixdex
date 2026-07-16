@@ -31,7 +31,7 @@
             craneLib.filterCargoSources path type
             || (
               inCratesCliAssets
-              && (base == "assets" || base == "command-not-found.sh" || base == "command-not-found.nu")
+              && (base == "assets" || base == "command-not-found.sh" || base == "command-not-found.nu" || base == "command-not-found.fish")
             );
         };
 
@@ -75,6 +75,10 @@
                 $out/etc/profile.d/command-not-found.nu \
                 --replace-fail "@out@" "$out"
               chmod 444 $out/etc/profile.d/command-not-found.nu
+              substitute ${src}/crates/nixdex-cli/assets/command-not-found.fish \
+                $out/etc/profile.d/command-not-found.fish \
+                --replace-fail "@out@" "$out"
+              chmod 444 $out/etc/profile.d/command-not-found.fish
             '';
           }
         );
