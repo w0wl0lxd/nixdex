@@ -65,6 +65,14 @@ struct Payload {
     entries: Vec<CachedEntry>,
 }
 
+/// Borrowed view of a [`Payload`] used for serialization without cloning entries.
+#[derive(Serialize)]
+struct SerializePayload<'a> {
+    cache_key: &'a str,
+    ttl_secs: u64,
+    entries: Vec<&'a CachedEntry>,
+}
+
 /// In-memory path cache keyed by store-path hash.
 ///
 /// `PathCache` is `Sync` and is intended to be shared via `Arc` across the
@@ -186,13 +194,16 @@ impl PathCache {
         let cache = Self::new_with_ttl(expected_key, payload.ttl_secs);
         let total_entries = payload.entries.len();
         let mut expired_count = 0usize;
-        for entry in payload.entries {
-            if entry.is_expired(cache.ttl_secs) {
-                expired_count += 1;
-                continue;
+        {
+            let map = cache.map.pin();
+            for entry in payload.entries {
+                if entry.is_expired(cache.ttl_secs) {
+                    expired_count += 1;
+                    continue;
+                }
+                let key = entry.store_path.hash().to_string();
+                let _ = map.insert(key, entry);
             }
-            let key = entry.store_path.hash().to_string();
-            let _ = cache.map.pin().insert(key, entry);
         }
         if expired_count > 0 {
             tracing::info!(
@@ -216,14 +227,10 @@ impl PathCache {
             let mut writer = BufWriter::new(file);
             writer.write_all(MAGIC)?;
             writer.write_all(&VERSION.to_le_bytes())?;
-            let entries: Vec<CachedEntry> = self
-                .map
-                .pin()
-                .iter()
-                .map(|(_, entry)| entry.clone())
-                .collect();
-            let payload = Payload {
-                cache_key: self.cache_key.clone(),
+            let map = self.map.pin();
+            let entries: Vec<&CachedEntry> = map.iter().map(|(_, entry)| entry).collect();
+            let payload = SerializePayload {
+                cache_key: &self.cache_key,
                 ttl_secs: self.ttl_secs,
                 entries,
             };
@@ -239,31 +246,34 @@ impl PathCache {
     /// Look up an entry by store-path hash, returning a cloned copy if found and not expired.
     #[must_use]
     pub fn get(&self, hash: &str) -> Option<CachedEntry> {
-        let entry = self.map.pin().get(hash)?.clone();
+        let map = self.map.pin();
+        let entry = map.get(hash)?;
         if entry.is_expired(self.ttl_secs) {
             return None;
         }
-        Some(entry)
+        Some(entry.clone())
     }
 
     /// Look up the cached narinfo references for a store-path hash.
     #[must_use]
     pub fn get_refs(&self, hash: &str) -> Option<Vec<StorePath>> {
-        let entry = self.map.pin().get(hash)?.clone();
+        let map = self.map.pin();
+        let entry = map.get(hash)?;
         if entry.is_expired(self.ttl_secs) {
             return None;
         }
-        entry.refs
+        entry.refs.clone()
     }
 
     /// Look up the cached `.ls` tree for a store-path hash.
     #[must_use]
     pub fn get_tree(&self, hash: &str) -> Option<FileTree> {
-        let entry = self.map.pin().get(hash)?.clone();
+        let map = self.map.pin();
+        let entry = map.get(hash)?;
         if entry.is_expired(self.ttl_secs) {
             return None;
         }
-        entry.tree
+        entry.tree.clone()
     }
 
     /// Insert or replace an entry keyed by its store-path hash.
