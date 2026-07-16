@@ -6,6 +6,8 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use indicatif::{MultiProgress, ProgressBar};
+use tokio::fs::File;
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -16,6 +18,9 @@ use crate::hydra::Fetcher;
 use crate::listings;
 use crate::nixpkgs;
 use crate::path_cache::PathCache;
+
+/// Name of the package metadata sidecar written alongside `files`.
+const PACKAGES_JSON: &str = "packages.json";
 
 /// Options controlling an index build.
 #[derive(Debug, Clone)]
@@ -85,6 +90,14 @@ pub struct IndexBuilder {
     options: UpdateOptions,
 }
 
+/// Handles for the concurrently-running evaluation and metadata writer tasks,
+/// plus the package receiver consumed by the listing fetcher.
+struct EvalStream {
+    eval: tokio::task::JoinHandle<nixpkgs::Result<(usize, Duration)>>,
+    meta: tokio::task::JoinHandle<Result<()>>,
+    packages: mpsc::Receiver<listings::PackageEntry>,
+}
+
 impl IndexBuilder {
     /// Create a builder with the supplied options.
     #[must_use]
@@ -98,25 +111,60 @@ impl IndexBuilder {
         &self.options
     }
 
+    /// Spawn the package metadata writer that serializes [`nixpkgs::PackageMeta`]
+    /// records into `<database>/packages.json`.
+    fn spawn_meta_writer(
+        &self,
+        rx: mpsc::Receiver<nixpkgs::PackageMeta>,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        let path = self.options.database.join(PACKAGES_JSON);
+        tokio::spawn(async move {
+            let file = File::create(&path)
+                .await
+                .map_err(|source| Error::CreateFile {
+                    path: path.clone(),
+                    source: Box::new(source),
+                })?;
+            let mut writer = BufWriter::new(file);
+            let mut rx = rx;
+            while let Some(meta) = rx.recv().await {
+                let line = sonic_rs::to_string(&meta)?;
+                writer
+                    .write_all(line.as_bytes())
+                    .await
+                    .map_err(|source| Error::WriteFile {
+                        path: path.clone(),
+                        source: Box::new(source),
+                    })?;
+                writer
+                    .write_all(b"\n")
+                    .await
+                    .map_err(|source| Error::WriteFile {
+                        path: path.clone(),
+                        source: Box::new(source),
+                    })?;
+            }
+            writer.flush().await.map_err(|source| Error::WriteFile {
+                path: path.clone(),
+                source: Box::new(source),
+            })?;
+            Ok(())
+        })
+    }
+
     /// Spawn an async task that evaluates nixpkgs and streams
     /// [`PackageEntry`] values into a channel.
-    ///
-    /// Returns the task handle and the receiver to be passed to the listing
-    /// fetcher.
-    fn spawn_package_eval_stream(
-        &self,
-    ) -> (
-        tokio::task::JoinHandle<nixpkgs::Result<(usize, Duration)>>,
-        mpsc::Receiver<listings::PackageEntry>,
-    ) {
+    fn spawn_package_eval_stream(&self) -> EvalStream {
         let opts = &self.options;
         let (pkg_tx, pkg_rx) = mpsc::channel(1024);
+        let (meta_tx, meta_rx) = mpsc::channel(1024);
         let nixpkgs_expr = opts.nixpkgs.clone();
         let system = opts.system.clone();
         let extra_scopes = opts.extra_scopes.clone();
         let show_trace = opts.show_trace;
         let main_program = opts.main_program;
 
+        let meta_handle = self.spawn_meta_writer(meta_rx);
         let handle = tokio::spawn(async move {
             let start = Instant::now();
             let count = nixpkgs::stream_package_entries(
@@ -125,13 +173,19 @@ impl IndexBuilder {
                 &extra_scopes,
                 show_trace,
                 main_program,
+                true,
                 pkg_tx,
+                meta_tx,
             )
             .await?;
             Ok((count, start.elapsed()))
         });
 
-        (handle, pkg_rx)
+        EvalStream {
+            eval: handle,
+            meta: meta_handle,
+            packages: pkg_rx,
+        }
     }
 
     /// Prepare the output database directory, `paths.cache`, and `Writer`.
@@ -194,6 +248,16 @@ impl IndexBuilder {
         }
     }
 
+    /// Await the package metadata writer task and log any failure.
+    #[allow(clippy::cognitive_complexity)]
+    async fn await_meta(handle: tokio::task::JoinHandle<Result<()>>) {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => warn!(error = %err, "failed to write package metadata sidecar"),
+            Err(err) => warn!(error = %err, "meta writer task panicked"),
+        }
+    }
+
     /// Persist the `paths.cache` sidecar if the user enabled it.
     #[allow(clippy::cognitive_complexity)]
     fn maybe_save_path_cache(
@@ -228,14 +292,14 @@ impl IndexBuilder {
         let eval_pb = progress.add(ProgressBar::new_spinner());
         eval_pb.set_message("Evaluating nixpkgs...");
 
-        let (eval_handle, pkg_rx) = self.spawn_package_eval_stream();
+        let stream = self.spawn_package_eval_stream();
         let fetcher = Self::new_fetcher()?;
         let filter_prefix = opts.filter_prefix.as_bytes().to_vec();
         let (indexed, failed, fetch_elapsed) = match write_listings(
             &mut writer,
             &fetcher,
             opts.jobs.max(1),
-            pkg_rx,
+            stream.packages,
             path_cache.clone(),
             filter_prefix,
             &db_file,
@@ -250,7 +314,8 @@ impl IndexBuilder {
             }
         };
 
-        let (eval_count, eval_elapsed) = Self::await_eval(eval_handle).await?;
+        let (eval_count, eval_elapsed) = Self::await_eval(stream.eval).await?;
+        Self::await_meta(stream.meta).await;
         eval_pb.finish_with_message(format!(
             "Evaluated {eval_count} package(s) in {eval_elapsed:?}"
         ));

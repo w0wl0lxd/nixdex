@@ -25,5 +25,9 @@ path = "src/bin/nix-index.rs"
 name = "nix-locate"
 path = "src/bin/nix-locate.rs"
 
+[[bin]]
+name = "nixdex"
+path = "src/bin/nixdex.rs"
+
 [lints]
 workspace = true
