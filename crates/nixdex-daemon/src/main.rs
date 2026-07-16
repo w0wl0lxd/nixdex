@@ -12,7 +12,12 @@ use tracing_subscriber::EnvFilter;
 #[command(author, about, version)]
 struct Args {
     /// Directory where the index is stored.
-    #[arg(short, long = "db", env = "NIX_INDEX_DATABASE", default_value = "/tmp/nix-index")]
+    #[arg(
+        short,
+        long = "db",
+        env = "NIX_INDEX_DATABASE",
+        default_value = "/tmp/nix-index"
+    )]
     database: PathBuf,
 
     /// Refresh interval in seconds.
