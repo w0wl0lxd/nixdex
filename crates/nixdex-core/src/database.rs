@@ -15,6 +15,7 @@ use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 
 use byteorder::{LittleEndian, WriteBytesExt};
+use mmap_guard;
 use rayon::prelude::*;
 use regex::bytes::Regex;
 use thiserror::Error;
@@ -42,6 +43,15 @@ const SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
 
 /// Byte offset right after the file magic and version header.
 const DATA_START: usize = 12;
+
+/// Frame map sidecar filename for selective decompression.
+const FRAME_MAP_FILE: &str = "files.frame_map";
+
+/// Magic for the frame map sidecar.
+const FRAME_MAP_MAGIC: &[u8] = b"NFRM";
+
+/// Frame map sidecar version.
+const FRAME_MAP_VERSION: u32 = 1;
 
 /// Defensive cap on the number of v2 frames (seek table entries).
 const MAX_FRAME_COUNT: usize = 1024 * 1024;
@@ -287,6 +297,13 @@ impl Writer {
                     file.write_all(&len_u32.to_le_bytes())?;
                 }
                 file.write_all(&payload_len_u32.to_le_bytes())?;
+
+                // Write frame_map sidecar for selective decompression.
+                if let Some(dir) = self.path.parent()
+                    && !dir.as_os_str().is_empty()
+                {
+                    write_frame_map(dir, &self.boundaries, &frames)?;
+                }
             }
             _ => unreachable!(),
         }
@@ -354,11 +371,15 @@ fn frame_ranges(
 pub struct Reader {
     path: PathBuf,
     version: u64,
-    /// Raw file bytes, including the header.
-    data: Vec<u8>,
+    /// Raw file bytes, including the header (mmapped).
+    data: mmap_guard::FileData,
     /// Each frame is a `(offset, length)` slice into `data` that holds one
     /// compressed zstd frame. Frames are decompressed lazily during search.
     frames: Vec<(usize, usize)>,
+    /// Optional frame map: package ordinal → frame index.
+    frame_map: Option<Vec<u32>>,
+    /// For each frame, the first package ordinal in that frame.
+    frame_starts: Option<Vec<u32>>,
 }
 
 impl Reader {
@@ -375,7 +396,7 @@ impl Reader {
             return Err(Error::Corrupt("database file exceeds maximum size"));
         }
 
-        let data = fs::read(&path_buf)?;
+        let data = mmap_guard::map_file(&path_buf).map_err(Error::Io)?;
 
         if data.len() < DATA_START {
             return Err(Error::Corrupt("database file too short for header"));
@@ -413,11 +434,37 @@ impl Reader {
             _ => unreachable!(),
         };
 
+        // Try to read frame_map sidecar for selective decompression.
+        let (frame_map, frame_starts) = if let Some(dir) = path_buf.parent()
+            && !dir.as_os_str().is_empty()
+        {
+            match read_frame_map(dir) {
+                Ok(fm) => {
+                    let fs = compute_frame_starts(&fm, frames.len());
+                    (Some(fm), Some(fs))
+                }
+                Err(err) => {
+                    let is_missing = matches!(
+                        &err,
+                        Error::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound
+                    );
+                    if !is_missing {
+                        tracing::warn!(%err, "frame_map sidecar unreadable; falling back to full scan");
+                    }
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             path: path_buf,
             version,
             data,
             frames,
+            frame_map,
+            frame_starts,
         })
     }
 
@@ -447,11 +494,57 @@ impl Reader {
         package_pattern: Option<&Regex>,
         hash: Option<&str>,
         package_labels: Option<&IndexSet<String>>,
+        package_ordinals: Option<&IndexSet<u32>>,
     ) -> Result<Vec<(StorePath, FileTreeEntry)>> {
-        let per_frame: Vec<Vec<(StorePath, FileTreeEntry)>> = self
-            .frames
+        // Selective frame decompression: if we have a frame_map and candidate ordinals,
+        // only decompress frames that contain at least one candidate ordinal.
+        // Ordinals are only meaningful when we also know the ordinal at the start
+        // of each frame, so disable the filter if the frame map is missing.
+        let filter_ordinals: Option<&IndexSet<u32>> = if self.frame_starts.is_some() {
+            package_ordinals
+        } else {
+            None
+        };
+
+        let frames_to_scan: Vec<(usize, usize, Option<u32>)> =
+            if let (Some(frame_map), Some(ordinals), Some(frame_starts)) =
+                (&self.frame_map, filter_ordinals, &self.frame_starts)
+            {
+                // Collect the set of frame indices that contain any candidate ordinal.
+                let mut needed_frames = IndexSet::new();
+                for &ord in ordinals {
+                    let idx = usize::try_from(ord)
+                        .map_err(|_| Error::Corrupt("package ordinal overflow"))?;
+                    if let Some(&frame_idx) = frame_map.get(idx) {
+                        needed_frames.insert(frame_idx);
+                    }
+                }
+
+                // Map frame indices to (offset, len, frame_start_ordinal).
+                self.frames
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, (offset, len))| {
+                        let i_u32 = u32::try_from(i).ok()?;
+                        if needed_frames.contains(&i_u32) {
+                            let start_ord = frame_starts.get(i).copied();
+                            Some((*offset, *len, start_ord))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                // No frame_map or no ordinals: scan all frames.
+                self.frames
+                    .iter()
+                    .map(|(offset, len)| (*offset, *len, None))
+                    .collect()
+            };
+
+        let per_frame: Vec<Vec<(StorePath, FileTreeEntry)>> = frames_to_scan
             .par_iter()
-            .map(|(offset, len)| {
+            .map(|(offset, len, frame_start_ordinal)| {
                 let start = *offset;
                 let end = start + *len;
                 let compressed = self
@@ -464,6 +557,8 @@ impl Reader {
                     package_pattern,
                     hash,
                     package_labels,
+                    *frame_start_ordinal,
+                    filter_ordinals,
                 )
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -496,7 +591,12 @@ impl Reader {
                 })
             })?;
         let index = BasenameIndex::open(dir)?;
-        Ok(index.lookup_basename(pattern.as_bytes())?)
+        // Convert borrowed strings to owned for the public API.
+        Ok(index
+            .lookup_basename(pattern.as_bytes())?
+            .into_iter()
+            .map(std::string::ToString::to_string)
+            .collect())
     }
 }
 
@@ -596,6 +696,133 @@ fn parse_seek_table(data: &[u8], data_start: usize) -> Result<Vec<(usize, usize)
     Ok(frames)
 }
 
+/// Write the frame_map sidecar for selective decompression.
+fn write_frame_map(db_dir: &Path, boundaries: &[usize], frames: &[(usize, usize)]) -> Result<()> {
+    let path = db_dir.join(FRAME_MAP_FILE);
+    let mut file = File::create(&path)?;
+
+    // Build ordinal_to_frame: for each package ordinal, which frame contains it?
+    let package_count = boundaries.len();
+    let frame_count = frames.len();
+    let mut ordinal_to_frame = Vec::with_capacity(package_count);
+
+    let mut boundary_idx = 0usize;
+    for (frame_idx, (_frame_start, frame_end)) in frames.iter().enumerate() {
+        // Assign all packages whose boundaries fall within this frame.
+        while boundary_idx < boundaries.len() {
+            let boundary = *boundaries
+                .get(boundary_idx)
+                .ok_or(Error::Corrupt("package boundary index out of range"))?;
+            if boundary <= *frame_end {
+                ordinal_to_frame.push(
+                    u32::try_from(frame_idx).map_err(|_| Error::Corrupt("frame index overflow"))?,
+                );
+                boundary_idx += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Validate every package boundary lies inside its assigned frame.
+    for (ord, &frame_idx) in ordinal_to_frame.iter().enumerate() {
+        let frame_idx_usize =
+            usize::try_from(frame_idx).map_err(|_| Error::Corrupt("frame index overflow"))?;
+        let Some((frame_start, frame_end)) = frames.get(frame_idx_usize) else {
+            return Err(Error::Corrupt("frame index out of range"));
+        };
+        let boundary = *boundaries
+            .get(ord)
+            .ok_or(Error::Corrupt("package boundary index out of range"))?;
+        if boundary < *frame_start || boundary > *frame_end {
+            return Err(Error::Corrupt("package boundary outside assigned frame"));
+        }
+    }
+
+    // Write the sidecar.
+    file.write_all(FRAME_MAP_MAGIC)?;
+    file.write_u32::<LittleEndian>(FRAME_MAP_VERSION)?;
+    let package_count_u32 =
+        u32::try_from(package_count).map_err(|_| Error::Corrupt("package count overflow"))?;
+    let frame_count_u32 =
+        u32::try_from(frame_count).map_err(|_| Error::Corrupt("frame count overflow"))?;
+    file.write_u32::<LittleEndian>(package_count_u32)?;
+    file.write_u32::<LittleEndian>(frame_count_u32)?;
+    for &frame_idx in &ordinal_to_frame {
+        file.write_u32::<LittleEndian>(frame_idx)?;
+    }
+
+    file.flush()?;
+    Ok(())
+}
+
+/// Read the frame_map sidecar for selective decompression.
+fn read_frame_map(db_dir: &Path) -> Result<Vec<u32>> {
+    let path = db_dir.join(FRAME_MAP_FILE);
+    let bytes = std::fs::read(&path)?;
+
+    if bytes.len() < FRAME_MAP_MAGIC.len() + 12 {
+        return Err(Error::Corrupt("frame_map too short"));
+    }
+
+    let magic = bytes
+        .get(..FRAME_MAP_MAGIC.len())
+        .ok_or(Error::Corrupt("frame_map magic missing"))?;
+    if magic != FRAME_MAP_MAGIC {
+        return Err(Error::Corrupt("frame_map magic mismatch"));
+    }
+
+    let version = read_u32_le(&bytes, FRAME_MAP_MAGIC.len())?;
+    if version != FRAME_MAP_VERSION {
+        return Err(Error::Corrupt("frame_map version mismatch"));
+    }
+
+    let package_count = usize::try_from(read_u32_le(&bytes, FRAME_MAP_MAGIC.len() + 4)?)
+        .map_err(|_| Error::Corrupt("package count overflow"))?;
+    let frame_count = usize::try_from(read_u32_le(&bytes, FRAME_MAP_MAGIC.len() + 8)?)
+        .map_err(|_| Error::Corrupt("frame count overflow"))?;
+
+    let expected_len = FRAME_MAP_MAGIC.len() + 12 + package_count * 4;
+    if bytes.len() != expected_len {
+        return Err(Error::Corrupt("frame_map length mismatch"));
+    }
+
+    let mut ordinal_to_frame = Vec::with_capacity(package_count);
+    for i in 0..package_count {
+        let offset = FRAME_MAP_MAGIC.len() + 12 + i * 4;
+        let frame_idx = read_u32_le(&bytes, offset)?;
+        if usize::try_from(frame_idx).map_err(|_| Error::Corrupt("frame index overflow"))?
+            >= frame_count
+        {
+            return Err(Error::Corrupt("frame index out of range"));
+        }
+        ordinal_to_frame.push(frame_idx);
+    }
+
+    Ok(ordinal_to_frame)
+}
+
+/// Compute frame_starts: for each frame, the first package ordinal in that frame.
+fn compute_frame_starts(frame_map: &[u32], frame_count: usize) -> Vec<u32> {
+    let mut frame_starts = vec![u32::MAX; frame_count];
+    for (ord, &frame_idx) in frame_map.iter().enumerate() {
+        let Ok(frame_idx_usize) = usize::try_from(frame_idx) else {
+            continue;
+        };
+        if frame_idx_usize < frame_count {
+            let Ok(ord_u32) = u32::try_from(ord) else {
+                continue;
+            };
+            if let Some(slot) = frame_starts.get_mut(frame_idx_usize)
+                && (*slot == u32::MAX || ord_u32 < *slot)
+            {
+                *slot = ord_u32;
+            }
+        }
+    }
+    frame_starts
+}
+
 fn read_u32_le(bytes: &[u8], at: usize) -> Result<u32> {
     let end = at
         .checked_add(4)
@@ -621,6 +848,8 @@ fn search_frame(
     package_pattern: Option<&Regex>,
     hash: Option<&str>,
     package_labels: Option<&IndexSet<String>>,
+    frame_start_ordinal: Option<u32>,
+    package_ordinals: Option<&IndexSet<u32>>,
 ) -> Result<Vec<(StorePath, FileTreeEntry)>> {
     let raw = if compressed.is_empty() {
         Vec::new()
@@ -631,6 +860,10 @@ fn search_frame(
     let mut matches = Vec::new();
     let mut pending: Vec<FileTreeEntry> = Vec::new();
     let mut decoder = frcode::Decoder::new(std::io::Cursor::new(&raw));
+    let mut current_ordinal = match frame_start_ordinal {
+        Some(ord) => ord,
+        None => 0,
+    };
 
     loop {
         let block = decoder.decode()?;
@@ -656,7 +889,8 @@ fn search_frame(
                 let accept_pkg = package_pattern
                     .is_none_or(|re| re.is_match(pkg.name().as_bytes()))
                     && hash.is_none_or(|h| h == pkg.hash())
-                    && package_labels.is_none_or(|labels| labels.contains(&label));
+                    && package_labels.is_none_or(|labels| labels.contains(&label))
+                    && package_ordinals.is_none_or(|ordinals| ordinals.contains(&current_ordinal));
 
                 if accept_pkg {
                     for entry in std::mem::take(&mut pending) {
@@ -665,6 +899,11 @@ fn search_frame(
                 } else {
                     pending.clear();
                 }
+
+                // Increment ordinal for the next package in this frame.
+                current_ordinal = current_ordinal
+                    .checked_add(1)
+                    .ok_or(Error::Corrupt("package ordinal overflow"))?;
                 continue;
             }
 
@@ -734,22 +973,22 @@ pub struct SearchOptions<'a> {
     pub mode: SearchMode,
 }
 
-/// Resolve the set of candidate package labels from the basename secondary index.
+/// Resolve the set of candidate package ordinals from the basename secondary index.
 ///
 /// Errors are logged and treated as a full-scan fallback; `None` is returned
 /// when there are no sidecar candidates.
-fn resolve_package_labels(
+fn resolve_package_ordinals(
     index_file: &Path,
     exact_basename: Option<&str>,
-) -> Option<IndexSet<String>> {
+) -> Option<IndexSet<u32>> {
     let base = exact_basename?;
     let dir = index_file.parent()?;
     if dir.as_os_str().is_empty() {
         return None;
     }
     match BasenameIndex::open(dir) {
-        Ok(index) => match index.lookup_basename(base.as_bytes()) {
-            Ok(labels) => Some(labels.into_iter().collect()),
+        Ok(index) => match index.lookup_basename_ordinals(base.as_bytes()) {
+            Ok(ordinals) => Some(ordinals.into_iter().collect()),
             Err(err) => {
                 if sidecars_exist(dir) {
                     tracing::warn!(%err, "basename index sidecars unreadable; falling back to full scan");
@@ -895,8 +1134,8 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
         None => None,
     };
 
-    let package_labels = resolve_package_labels(&index_file, options.exact_basename.as_deref());
-    if package_labels.as_ref().is_some_and(IndexSet::is_empty) {
+    let package_ordinals = resolve_package_ordinals(&index_file, options.exact_basename.as_deref());
+    if package_ordinals.as_ref().is_some_and(IndexSet::is_empty) {
         return Ok(());
     }
 
@@ -910,7 +1149,8 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
             &path_pattern,
             package_re.as_ref(),
             options.hash.as_deref(),
-            package_labels.as_ref(),
+            None, // package_labels not used with ordinals
+            package_ordinals.as_ref(),
         )
         .map_err(|source| crate::Error::ReadDatabase {
             path: index_file,
@@ -1007,7 +1247,7 @@ mod tests {
         let reader = Reader::open(&db_path).expect("reader");
         let re = Regex::new(&regex::escape("bin/hello")).expect("regex");
         let hits = reader
-            .search_entries(&re, None, None, None)
+            .search_entries(&re, None, None, None, None)
             .expect("search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits.first().map(|(p, _)| p.name()), Some("hello-2.12"));
@@ -1046,7 +1286,7 @@ mod tests {
         let reader = Reader::open(&db_path).expect("reader");
         let re = Regex::new(".*").expect("regex");
         let hits = reader
-            .search_entries(&re, None, None, None)
+            .search_entries(&re, None, None, None, None)
             .expect("search");
         assert!(hits.is_empty());
     }
@@ -1131,7 +1371,7 @@ mod tests {
 
         let re = Regex::new(&regex::escape("bin/hello")).expect("regex");
         let hits = reader
-            .search_entries(&re, None, None, None)
+            .search_entries(&re, None, None, None, None)
             .expect("search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits.first().map(|(p, _)| p.name()), Some("hello-2.12"));
@@ -1184,7 +1424,7 @@ mod tests {
 
         let re = Regex::new(".*").expect("regex");
         let hits = reader
-            .search_entries(&re, None, None, None)
+            .search_entries(&re, None, None, None, None)
             .expect("search");
         // Each tree also emits a synthetic root entry with an empty path.
         assert_eq!(hits.len(), 7);
@@ -1209,6 +1449,60 @@ mod tests {
             .map_or(1, std::num::NonZeroUsize::get)
             .max(1);
         assert!(frame_count >= 1 && frame_count <= num_cpus.max(2));
+    }
+
+    #[test]
+    fn v2_selective_search_by_ordinals() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+
+        let hello = sample_store_path();
+        let hello_tree = sample_tree();
+        let coreutils = StorePath::new(
+            "/nix/store".into(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            "coreutils-9.11".into(),
+            Origin {
+                attr: "coreutils".into(),
+                output: "out".into(),
+                toplevel: true,
+                system: Some("x86_64-linux".into()),
+            },
+        );
+        let coreutils_tree = FileTree::directory(vec![(
+            Bytes::from_static(b"bin"),
+            FileTree::directory(vec![
+                (Bytes::from_static(b"ls"), FileTree::regular(0, true)),
+                (Bytes::from_static(b"cat"), FileTree::regular(0, true)),
+            ]),
+        )]);
+
+        {
+            let mut writer = Writer::create_with_version(&db_path, 1, 2).expect("create v2");
+            writer.add(&hello, &hello_tree, b"").expect("add hello");
+            writer
+                .add(&coreutils, &coreutils_tree, b"")
+                .expect("add coreutils");
+            writer.finish().expect("finish");
+        }
+
+        let reader = Reader::open(&db_path).expect("reader");
+        assert!(reader.frame_map.is_some());
+        assert!(reader.frame_starts.is_some());
+
+        let re = Regex::new(".*").expect("regex");
+        let mut ordinals = IndexSet::new();
+        ordinals.insert(1u32);
+
+        let hits = reader
+            .search_entries(&re, None, None, None, Some(&ordinals))
+            .expect("search");
+
+        // coreutils yields the synthetic root plus /bin and /bin/{ls,cat}.
+        assert_eq!(hits.len(), 4);
+        assert!(hits.iter().all(|(p, _)| p.name() == "coreutils-9.11"));
+        assert!(hits.iter().any(|(_, e)| e.path == b"/bin/ls"));
+        assert!(hits.iter().any(|(_, e)| e.path == b"/bin/cat"));
     }
 
     #[test]
