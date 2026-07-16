@@ -629,12 +629,27 @@ fn search_frame(
                 continue;
             }
 
-            let entry = FileTreeEntry::decode(line).map_err(|_| Error::EntryParse {
+            // Fast-path: skip decoding if the path does not match the regex.
+            let sep = memchr::memchr(b'\0', line).ok_or_else(|| Error::EntryParse {
                 entry: line.to_vec(),
             })?;
-            if path_pattern.is_match(&entry.path) {
-                pending.push(entry);
+            let path = line.get(sep + 1..).ok_or_else(|| Error::EntryParse {
+                entry: line.to_vec(),
+            })?;
+            if !path_pattern.is_match(path) {
+                continue;
             }
+
+            let node = FileNode::decode_meta(line.get(..sep).ok_or_else(|| Error::EntryParse {
+                entry: line.to_vec(),
+            })?)
+            .ok_or_else(|| Error::EntryParse {
+                entry: line.to_vec(),
+            })?;
+            pending.push(FileTreeEntry {
+                path: path.to_vec(),
+                node,
+            });
         }
     }
 
