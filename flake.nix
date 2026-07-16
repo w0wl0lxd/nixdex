@@ -20,16 +20,38 @@
         pkgs = import nixpkgs { inherit system; };
         craneLib = crane.mkLib pkgs;
 
-        src = craneLib.cleanCargoSource ./.;
+        src = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter =
+            path: type:
+            let
+              base = baseNameOf path;
+              inCratesCliAssets = pkgs.lib.hasInfix "/crates/nixdex-cli/assets" path;
+            in
+            craneLib.filterCargoSources path type
+            || (
+              inCratesCliAssets
+              && (base == "assets" || base == "command-not-found.sh" || base == "command-not-found.nu")
+            );
+        };
 
         commonArgs = {
           inherit src;
           strictDeps = true;
-          buildInputs = [ ];
+          buildInputs = [ pkgs.openssl ];
           nativeBuildInputs = [
+            pkgs.cacert
+            pkgs.clang
+            pkgs.mold
             pkgs.pkg-config
-            pkgs.openssl
           ];
+
+          # The workspace `.cargo/config.toml` enables `sccache`, which is not
+          # available (or useful) inside the Nix sandbox.
+          RUSTC_WRAPPER = "";
+
+          # `rustls-native-certs` has no system cert store in the sandbox.
+          SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
         };
 
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
