@@ -492,12 +492,12 @@ mod tests {
             .collect();
         assert_eq!(lines.len(), paths.len() + 1);
         for (i, path) in paths.iter().enumerate() {
-            let line = lines[i];
+            let line = *lines.get(i).expect("line");
             let sep = memchr::memchr(b'\0', line).expect("nul");
-            assert_eq!(&line[..sep], b"1r");
-            assert_eq!(&line[sep + 1..], *path);
+            assert_eq!(line.get(..sep), Some(b"1r".as_slice()));
+            assert_eq!(line.get(sep + 1..), Some(*path));
         }
-        assert_eq!(lines[paths.len()], b"p\0{}");
+        assert_eq!(lines.get(paths.len()).copied(), Some(b"p\0{}".as_slice()));
     }
 
     #[test]

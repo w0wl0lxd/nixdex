@@ -230,7 +230,10 @@ References: ias8xacs1h3jy7xgwi2awvim61k2ji6c-glibc-2.42-67 pg2zfrrbm58ynbjshhzkg
 ";
         let refs = parse_narinfo_references(text, "/nix/store").expect("refs");
         assert_eq!(refs.len(), 2);
-        assert_eq!(refs[0].hash(), "ias8xacs1h3jy7xgwi2awvim61k2ji6c");
-        assert_eq!(refs[0].name(), "glibc-2.42-67");
+        assert_eq!(
+            refs.first().map(StorePath::hash),
+            Some("ias8xacs1h3jy7xgwi2awvim61k2ji6c")
+        );
+        assert_eq!(refs.first().map(StorePath::name), Some("glibc-2.42-67"));
     }
 }

@@ -9,7 +9,12 @@ no-default-features = false
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-ignore = []
+ignore = [
+  # `atomic-polyfill` is pulled in by `heapless` 0.7 (transitive via `postcard`).
+  # No safe upgrade is available: `postcard` 1.x still depends on `heapless` 0.7,
+  # and `heapless` 0.7 targets platforms without native atomics.
+  { id = "RUSTSEC-2023-0089", reason = "transitive-only; no safe upgrade available" },
+]
 
 [licenses]
 allow = [
@@ -26,6 +31,7 @@ allow = [
   "Zlib",
   "Unlicense",
   "AGPL-3.0-only",
+  "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 private = { ignore = true, registries = [] }
