@@ -21,30 +21,21 @@ rayon = "1.10"
 # Serialization and compression
 sonic-rs = "0.5"
 serde = { version = "1", features = ["derive"] }
-postcard = { version = "1", features = ["alloc"] }
 zstd = "0.13"
 bytes = { version = "1", features = ["serde"] }
 byteorder = "1"
 regex = "1"
 
 # Databases and indexing
-redb = "2.2"
 fst = "0.4"
 roaring = "0.10"
 
 # Concurrency and collections
-scc = "3"
-moka = { version = "0.12", features = ["future"] }
 memchr = "2.7"
-compact_str = { version = "0.7", features = ["serde"] }
-smallvec = { version = "1", features = ["serde"] }
-rustc-hash = "2"
-ahash = { version = "0.8", features = ["serde"] }
 indexmap = { version = "2", features = ["serde"] }
 
 # Error handling
 thiserror = "2"
-anyhow = "1"
 color-eyre = "0.6"
 
 # Observability
@@ -53,7 +44,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
-owo-colors = { version = "4", features = ["supports-colors"] }
 
 # Workspace crates
 nixdex-core = { path = "crates/nixdex-core" }

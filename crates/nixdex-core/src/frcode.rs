@@ -122,39 +122,53 @@ impl<R: BufRead> Decoder<R> {
     }
 
     fn copy_shared(&mut self) -> Result<bool> {
-        let shared_len = self.shared_len as usize;
-        let new_pos = self.pos + shared_len;
-        let new_last_path = self.pos;
-        if !self.buf.resize(new_pos) {
-            return Ok(false);
-        }
-
-        if self.shared_len < 0 || self.last_path + shared_len > self.pos {
+        if self.shared_len < 0 {
             return Err(Error::SharedOutOfRange {
                 previous_len: self.pos - self.last_path,
                 shared_len: self.shared_len,
             });
         }
 
+        let shared_len = self.shared_len as usize;
+        let previous_len = self.pos - self.last_path;
+        if shared_len > previous_len {
+            return Err(Error::SharedOutOfRange {
+                previous_len,
+                shared_len: self.shared_len,
+            });
+        }
+
+        let new_pos = self
+            .pos
+            .checked_add(shared_len)
+            .ok_or(Error::SharedOutOfRange {
+                previous_len,
+                shared_len: self.shared_len,
+            })?;
+        if !self.buf.resize(new_pos) {
+            return Ok(false);
+        }
+
+        let new_last_path = self.pos;
         let (_, last) = self.buf.split_at_mut(self.last_path);
-        let (last, new) = last.split_at_mut(self.pos - self.last_path);
-        if let Some(dst) = new.get_mut(..shared_len) {
-            if let Some(src) = last.get(..shared_len) {
+        let (src, dst) = last.split_at_mut(previous_len);
+        if let Some(dst) = dst.get_mut(..shared_len) {
+            if let Some(src) = src.get(..shared_len) {
                 dst.copy_from_slice(src);
             } else {
                 return Err(Error::SharedOutOfRange {
-                    previous_len: self.pos - self.last_path,
+                    previous_len,
                     shared_len: self.shared_len,
                 });
             }
         } else {
             return Err(Error::SharedOutOfRange {
-                previous_len: self.pos - self.last_path,
+                previous_len,
                 shared_len: self.shared_len,
             });
         }
 
-        self.pos += shared_len;
+        self.pos = new_pos;
         self.last_path = new_last_path;
         Ok(true)
     }
@@ -188,9 +202,7 @@ impl<R: BufRead> Decoder<R> {
 
                 let new_pos = *pos + len;
                 if buf.resize(new_pos) {
-                    if let (Some(dst), Some(src)) =
-                        (buf.get_mut(*pos..new_pos), input.get(..len))
-                    {
+                    if let (Some(dst), Some(src)) = (buf.get_mut(*pos..new_pos), input.get(..len)) {
                         dst.copy_from_slice(src);
                     }
                     *pos = new_pos;
@@ -256,11 +268,8 @@ impl<R: BufRead> Decoder<R> {
 
         self.buf.allow_resize = true;
 
-        let mut found_nul = self.pos > 0
-            && self
-                .buf
-                .get(self.pos - 1)
-                .is_some_and(|b| *b == b'\x00');
+        let mut found_nul =
+            self.pos > 0 && self.buf.get(self.pos - 1).is_some_and(|b| *b == b'\x00');
         if found_nul {
             self.copy_shared()?;
         }
@@ -461,8 +470,7 @@ mod tests {
     fn encode_paths(paths: &[&[u8]]) -> Vec<u8> {
         let mut out = Vec::new();
         {
-            let mut enc =
-                Encoder::new(&mut out, b"p".to_vec(), b"{}".to_vec()).expect("encoder");
+            let mut enc = Encoder::new(&mut out, b"p".to_vec(), b"{}".to_vec()).expect("encoder");
             for path in paths {
                 enc.write_meta(b"1r").expect("meta");
                 enc.write_path(path.to_vec()).expect("path");
@@ -498,12 +506,12 @@ mod tests {
             .collect();
         assert_eq!(lines.len(), paths.len() + 1);
         for (i, path) in paths.iter().enumerate() {
-            let line = lines[i];
+            let line = *lines.get(i).expect("line");
             let sep = memchr::memchr(b'\0', line).expect("nul");
-            assert_eq!(&line[..sep], b"1r");
-            assert_eq!(&line[sep + 1..], *path);
+            assert_eq!(line.get(..sep), Some(b"1r".as_slice()));
+            assert_eq!(line.get(sep + 1..), Some(*path));
         }
-        assert_eq!(lines[paths.len()], b"p\0{}");
+        assert_eq!(lines.get(paths.len()).copied(), Some(b"p\0{}".as_slice()));
     }
 
     #[test]
@@ -516,8 +524,7 @@ mod tests {
 
         let mut out = Vec::new();
         {
-            let mut enc =
-                Encoder::new(&mut out, b"p".to_vec(), b"{}".to_vec()).expect("encoder");
+            let mut enc = Encoder::new(&mut out, b"p".to_vec(), b"{}".to_vec()).expect("encoder");
             enc.write_meta(b"d").unwrap();
             enc.write_path(long_a).unwrap();
             enc.write_meta(b"d").unwrap();
