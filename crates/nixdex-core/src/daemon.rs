@@ -12,11 +12,14 @@ use indexmap::IndexSet;
 use axum::{Router, extract::State, routing::get};
 #[cfg(feature = "daemon")]
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "daemon")]
+use std::str::FromStr;
 
 #[cfg(feature = "daemon")]
 struct IndexState {
     basename: Arc<std::sync::RwLock<Option<Arc<BasenameIndex>>>>,
     reader: Arc<std::sync::RwLock<Option<Arc<Reader>>>>,
+    package_db: Arc<std::sync::RwLock<Option<Arc<crate::package_search::SearchDb>>>>,
 }
 
 /// Configuration for a prebuilt-index daemon.
@@ -57,6 +60,7 @@ pub async fn run(config: &DaemonConfig) -> Result<()> {
     let index_state = Arc::new(IndexState {
         basename: Arc::new(std::sync::RwLock::new(None)),
         reader: Arc::new(std::sync::RwLock::new(None)),
+        package_db: Arc::new(std::sync::RwLock::new(None)),
     });
 
     let http_handle = start_http_server(&config.http_addr, Arc::clone(&index_state));
@@ -179,7 +183,29 @@ fn load_and_store_index(cache_dir: &std::path::Path, index_state: &IndexState) {
     }
 
     load_reader(cache_dir, index_state);
+    load_package_db(cache_dir, index_state);
     tracing::info!("prebuilt index refreshed and loaded");
+}
+
+#[cfg(feature = "daemon")]
+fn load_package_db(cache_dir: &std::path::Path, index_state: &IndexState) {
+    let Some(current) = prebuilt::current_dir(cache_dir).ok().flatten() else {
+        return;
+    };
+    let packages_json = current.join("packages.json");
+    if !packages_json.exists() {
+        return;
+    }
+    match crate::package_search::SearchDb::open(&packages_json) {
+        Ok(db) => {
+            if let Ok(mut state) = index_state.package_db.write() {
+                *state = Some(Arc::new(db));
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, path = %packages_json.display(), "failed to load package metadata sidecar");
+        }
+    }
 }
 
 #[cfg(feature = "daemon")]
@@ -244,8 +270,10 @@ async fn download_and_update(config: &PrebuiltConfig, cache_dir: &std::path::Pat
 #[cfg(feature = "daemon")]
 async fn run_http_server(addr: &str, index_state: Arc<IndexState>) -> Result<()> {
     let app = Router::new()
+        .route("/health", get(health_handler))
         .route("/locate", get(locate_handler))
         .route("/nix-locate", get(nix_locate_handler))
+        .route("/search", get(search_handler))
         .with_state(index_state);
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -501,4 +529,129 @@ enum NixLocateNode {
     Regular { r#type: String, size: u64 },
     Directory { r#type: String, size: u64 },
     Symlink { r#type: String, target: String },
+}
+
+/// Health-check response.
+#[cfg(feature = "daemon")]
+#[derive(Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    index_loaded: bool,
+    package_db_loaded: bool,
+}
+
+/// HTTP handler for `/health`.
+#[cfg(feature = "daemon")]
+async fn health_handler(State(index_state): State<Arc<IndexState>>) -> axum::Json<HealthResponse> {
+    let index_loaded = matches!(index_state.basename.read(), Ok(g) if g.is_some());
+    let package_db_loaded = matches!(index_state.package_db.read(), Ok(g) if g.is_some());
+
+    axum::Json(HealthResponse {
+        status: "ok",
+        index_loaded,
+        package_db_loaded,
+    })
+}
+
+/// Parameters for `/search`.
+#[cfg(feature = "daemon")]
+#[derive(Deserialize)]
+struct SearchParams {
+    pattern: String,
+    #[serde(default)]
+    regex: bool,
+    #[serde(default)]
+    case_sensitive: bool,
+    #[serde(default)]
+    exact: bool,
+    #[serde(default)]
+    fuzzy: bool,
+    #[serde(default)]
+    field: String,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    count: bool,
+}
+
+/// HTTP handler for `/search`.
+#[cfg(feature = "daemon")]
+async fn search_handler(
+    State(index_state): State<Arc<IndexState>>,
+    axum::extract::Query(params): axum::extract::Query<SearchParams>,
+) -> axum::Json<SearchResponse> {
+    let db = {
+        let Ok(guard) = index_state.package_db.read() else {
+            return axum::Json(SearchResponse {
+                count: None,
+                results: Vec::new(),
+            });
+        };
+        guard.as_ref().map(Arc::clone)
+    };
+
+    let Some(db) = db else {
+        return axum::Json(SearchResponse {
+            count: None,
+            results: Vec::new(),
+        });
+    };
+
+    let Ok(field) = crate::package_search::SearchField::from_str(&params.field) else {
+        return axum::Json(SearchResponse {
+            count: None,
+            results: Vec::new(),
+        });
+    };
+
+    let matched = if params.fuzzy {
+        match db.search_fuzzy(&params.pattern, field, params.case_sensitive, params.limit) {
+            Ok(m) => m,
+            Err(_) => {
+                return axum::Json(SearchResponse {
+                    count: None,
+                    results: Vec::new(),
+                });
+            }
+        }
+    } else {
+        match db.search(
+            &params.pattern,
+            params.regex,
+            field,
+            params.case_sensitive,
+            params.exact,
+            params.limit,
+        ) {
+            Ok(m) => m,
+            Err(_) => {
+                return axum::Json(SearchResponse {
+                    count: None,
+                    results: Vec::new(),
+                });
+            }
+        }
+    };
+
+    if params.count {
+        return axum::Json(SearchResponse {
+            count: Some(matched.len()),
+            results: Vec::new(),
+        });
+    }
+
+    let results = matched.into_iter().cloned().collect();
+
+    axum::Json(SearchResponse {
+        count: None,
+        results,
+    })
+}
+
+/// Response for `/search`.
+#[cfg(feature = "daemon")]
+#[derive(Serialize)]
+struct SearchResponse {
+    count: Option<usize>,
+    results: Vec<crate::PackageMeta>,
 }
