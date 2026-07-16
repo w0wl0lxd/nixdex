@@ -409,7 +409,8 @@ pub async fn run_eval_jobs(options: &EvalJobsOptions<'_>) -> Result<EvalJobsStre
                 },
             };
             if tx.send(record).await.is_err() {
-                // The consumer dropped; stop reading so the caller can shut down.
+                // The consumer dropped; kill the child process and stop reading.
+                let _ = child.kill().await;
                 break;
             }
             records += 1;
@@ -481,6 +482,9 @@ async fn stream_options_to_entries(
     tx: &mpsc::Sender<PackageEntry>,
     main_program: bool,
 ) -> Result<usize> {
+    if tx.is_closed() {
+        return Ok(0);
+    }
     let mut stream = run_eval_jobs(options).await?;
     let mut count = 0;
     while let Some(line) = stream.rx.recv().await {

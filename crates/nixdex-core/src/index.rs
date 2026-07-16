@@ -134,14 +134,8 @@ impl IndexBuilder {
         (handle, pkg_rx)
     }
 
-    /// Run the index build: evaluate packages, fetch `.ls` trees, write NIXI DB.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database directory cannot be created, evaluation
-    /// fails hard, or the writer cannot be finalized.
-    #[allow(clippy::cognitive_complexity)]
-    pub async fn build(&self) -> Result<()> {
+    /// Prepare the output database directory, `paths.cache`, and `Writer`.
+    fn prepare_database(&self) -> Result<(PathBuf, Writer, Option<Arc<PathCache>>, PathBuf)> {
         let opts = &self.options;
 
         std::fs::create_dir_all(&opts.database).map_err(|source| Error::CreateDatabaseDir {
@@ -166,28 +160,78 @@ impl IndexBuilder {
         );
 
         let db_file = opts.database.join("files");
-        let mut writer =
+        let writer =
             Writer::create_with_version(&db_file, opts.compression_level, opts.format_version)
                 .map_err(|source| Error::CreateDatabase {
                     path: db_file.clone(),
                     source: Box::new(source),
                 })?;
 
-        let progress = MultiProgress::new();
+        Ok((db_file, writer, path_cache, cache_path))
+    }
 
+    /// Build a fresh binary-cache fetcher.
+    fn new_fetcher() -> Result<Fetcher> {
+        Fetcher::new(CACHE_URL).map_err(|err| {
+            Error::Io(std::io::Error::other(format!(
+                "failed to create binary-cache client: {err}"
+            )))
+        })
+    }
+
+    /// Await the eval stream task and translate errors into the workspace type.
+    async fn await_eval(
+        handle: tokio::task::JoinHandle<nixpkgs::Result<(usize, Duration)>>,
+    ) -> Result<(usize, Duration)> {
+        match handle.await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(source)) => Err(Error::QueryPackages {
+                source: Box::new(source),
+            }),
+            Err(err) => Err(Error::Io(std::io::Error::other(format!(
+                "eval task panicked: {err}"
+            )))),
+        }
+    }
+
+    /// Persist the `paths.cache` sidecar if the user enabled it.
+    #[allow(clippy::cognitive_complexity)]
+    fn maybe_save_path_cache(
+        enabled: bool,
+        path_cache: Option<&Arc<PathCache>>,
+        cache_path: &Path,
+    ) {
+        if !enabled {
+            return;
+        }
+        match path_cache {
+            Some(pc) => {
+                if let Err(err) = pc.save(cache_path) {
+                    warn!(error = %err, "failed to save path cache");
+                }
+            }
+            None => warn!("path cache enabled but not initialized"),
+        }
+    }
+
+    /// Run the index build: evaluate packages, fetch `.ls` trees, write NIXI DB.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database directory cannot be created, evaluation
+    /// fails hard, or the writer cannot be finalized.
+    pub async fn build(&self) -> Result<()> {
+        let opts = &self.options;
+
+        let (db_file, mut writer, path_cache, cache_path) = self.prepare_database()?;
+        let progress = MultiProgress::new();
         let eval_pb = progress.add(ProgressBar::new_spinner());
         eval_pb.set_message("Evaluating nixpkgs...");
 
         let (eval_handle, pkg_rx) = self.spawn_package_eval_stream();
-
-        let fetcher = Fetcher::new(CACHE_URL).map_err(|err| {
-            Error::Io(std::io::Error::other(format!(
-                "failed to create binary-cache client: {err}"
-            )))
-        })?;
-
+        let fetcher = Self::new_fetcher()?;
         let filter_prefix = opts.filter_prefix.as_bytes().to_vec();
-        let (indexed, failed, fetch_elapsed) = write_listings(
+        let (indexed, failed, fetch_elapsed) = match write_listings(
             &mut writer,
             &fetcher,
             opts.jobs.max(1),
@@ -197,37 +241,30 @@ impl IndexBuilder {
             &db_file,
             &progress,
         )
-        .await?;
+        .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                eval_handle.abort();
+                return Err(err);
+            }
+        };
 
-        let (eval_count, eval_elapsed) = eval_handle
-            .await
-            .map_err(|err| Error::Io(std::io::Error::other(format!("eval task panicked: {err}"))))?
-            .map_err(|source| Error::QueryPackages {
-                source: Box::new(source),
-            })?;
+        let (eval_count, eval_elapsed) = Self::await_eval(eval_handle).await?;
         eval_pb.finish_with_message(format!(
             "Evaluated {eval_count} package(s) in {eval_elapsed:?}"
         ));
 
-        let cached = path_cache
-            .as_ref()
-            .map_or(0, |pc| pc.hits.load(Ordering::Relaxed));
-
-        if opts.path_cache {
-            if let Some(pc) = path_cache.as_ref() {
-                if let Err(err) = pc.save(&cache_path) {
-                    warn!(error = %err, "failed to save path cache");
-                }
-            } else {
-                warn!("path cache enabled but not initialized");
-            }
-        }
+        Self::maybe_save_path_cache(opts.path_cache, path_cache.as_ref(), &cache_path);
 
         let size = writer.finish().map_err(|source| Error::WriteDatabase {
             path: db_file.clone(),
             source: Box::new(source),
         })?;
 
+        let cached = path_cache
+            .as_ref()
+            .map_or(0, |pc| pc.hits.load(Ordering::Relaxed));
         let bytes_downloaded = fetcher.bytes_downloaded();
 
         info!(
@@ -276,7 +313,57 @@ fn load_path_cache(
     }
 }
 
-#[allow(clippy::cognitive_complexity)]
+/// Flush the in-memory writer chunk once it exceeds the configured threshold.
+fn maybe_flush_chunk(writer: &mut Writer, db_file: &Path, chunk_bytes: u64) -> Result<()> {
+    if writer.estimated_size() > chunk_bytes {
+        tracing::debug!(
+            estimated_bytes = writer.estimated_size(),
+            "chunk size reached, flushing v2 frame"
+        );
+        writer
+            .flush_chunk()
+            .map_err(|source| Error::WriteDatabase {
+                path: db_file.to_path_buf(),
+                source: Box::new(source),
+            })?;
+    }
+    Ok(())
+}
+
+/// Finalize the listing fetch progress bar and emit the completion log line.
+fn finish_fetch_progress(
+    fetch_pb: ProgressBar,
+    indexed: usize,
+    failed: usize,
+    bytes_written: u64,
+    fetch_elapsed: Duration,
+) {
+    let packages_per_sec = if fetch_elapsed.as_secs_f64() > 0.0 {
+        let elapsed_secs = fetch_elapsed.as_secs_f64();
+        let indexed_u64 = match u64::try_from(indexed) {
+            Ok(idx) => idx,
+            Err(_) => u64::MAX,
+        };
+        #[allow(clippy::cast_precision_loss, clippy::as_conversions)]
+        let rate = indexed_u64 as f64 / elapsed_secs;
+        rate
+    } else {
+        0.0
+    };
+    info!(
+        indexed,
+        failed,
+        bytes_written,
+        packages_per_sec,
+        ?fetch_elapsed,
+        "listing fetch complete"
+    );
+    fetch_pb.finish_with_message(format!(
+        "Fetched {indexed} listings ({failed} failed) in {:?}",
+        fetch_elapsed
+    ));
+}
+
 async fn write_listings(
     writer: &mut Writer,
     fetcher: &Fetcher,
@@ -319,19 +406,7 @@ async fn write_listings(
                 let after_len = writer.estimated_size();
                 bytes_written += after_len.saturating_sub(before_len);
                 indexed += 1;
-
-                if writer.estimated_size() > CHUNK_BYTES {
-                    tracing::debug!(
-                        estimated_bytes = writer.estimated_size(),
-                        "chunk size reached, flushing v2 frame"
-                    );
-                    writer
-                        .flush_chunk()
-                        .map_err(|source| Error::WriteDatabase {
-                            path: db_file.to_path_buf(),
-                            source: Box::new(source),
-                        })?;
-                }
+                maybe_flush_chunk(writer, db_file, CHUNK_BYTES)?;
             }
             Err(err) => {
                 warn!(error = %err, "closure fetch yielded an error; skipping");
@@ -342,30 +417,7 @@ async fn write_listings(
         fetch_pb.inc(1);
     }
     let fetch_elapsed = fetch_start.elapsed();
-    let packages_per_sec = if fetch_elapsed.as_secs_f64() > 0.0 {
-        let elapsed_secs = fetch_elapsed.as_secs_f64();
-        let indexed_u64 = match u64::try_from(indexed) {
-            Ok(idx) => idx,
-            Err(_) => u64::MAX,
-        };
-        #[allow(clippy::cast_precision_loss, clippy::as_conversions)]
-        let rate = indexed_u64 as f64 / elapsed_secs;
-        rate
-    } else {
-        0.0
-    };
-    info!(
-        indexed,
-        failed,
-        bytes_written,
-        packages_per_sec,
-        ?fetch_elapsed,
-        "listing fetch complete"
-    );
-    fetch_pb.finish_with_message(format!(
-        "Fetched {indexed} listings ({failed} failed) in {:?}",
-        fetch_elapsed
-    ));
+    finish_fetch_progress(fetch_pb, indexed, failed, bytes_written, fetch_elapsed);
 
     Ok((indexed, failed, fetch_elapsed))
 }

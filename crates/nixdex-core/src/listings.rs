@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bytes::Bytes;
-use scc::HashSet as SccHashSet;
+use scc::HashMap as SccHashMap;
+use scc::hash_map::Entry as SccMapEntry;
 use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
 use tracing::warn;
 
@@ -194,8 +195,8 @@ async fn fetch_listings_with_source<S: ListingSource>(
     let jobs = jobs.max(1);
     let (out_tx, out_rx) = mpsc::channel::<Result<ListingItem>>(jobs * 2);
     let queue: Arc<Mutex<VecDeque<PackageEntry>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let seen: Arc<SccHashSet<String, ahash::RandomState>> =
-        Arc::new(SccHashSet::with_hasher(ahash::RandomState::new()));
+    let seen: Arc<SccHashMap<String, Option<String>, ahash::RandomState>> =
+        Arc::new(SccHashMap::with_hasher(ahash::RandomState::new()));
     let in_flight = Arc::new(AtomicUsize::new(0));
     let notify = Arc::new(Notify::new());
     let input_done = Arc::new(AtomicBool::new(false));
@@ -210,10 +211,20 @@ async fn fetch_listings_with_source<S: ListingSource>(
     let input_done_for_feeder = Arc::clone(&input_done);
     tokio::spawn(async move {
         while let Some(entry) = input.recv().await {
-            if seen_for_feeder
-                .insert_sync(entry.path.hash().to_string())
-                .is_ok()
-            {
+            let hash = entry.path.hash().to_string();
+            let is_new = match seen_for_feeder.entry_sync(hash) {
+                SccMapEntry::Occupied(mut occupied) => {
+                    if occupied.get().is_none() && entry.main_program.is_some() {
+                        occupied.insert(entry.main_program.clone());
+                    }
+                    false
+                }
+                SccMapEntry::Vacant(vacant) => {
+                    vacant.insert_entry(entry.main_program.clone());
+                    true
+                }
+            };
+            if is_new {
                 in_flight_for_feeder.fetch_add(1, Ordering::SeqCst);
                 queue_for_feeder.lock().await.push_back(entry);
                 notify_for_feeder.notify_one();
@@ -272,7 +283,7 @@ async fn process_path<S: ListingSource>(
     source: &S,
     entry: &PackageEntry,
     queue: &Mutex<VecDeque<PackageEntry>>,
-    seen: &SccHashSet<String, ahash::RandomState>,
+    seen: &SccHashMap<String, Option<String>, ahash::RandomState>,
     in_flight: &AtomicUsize,
     notify: &Notify,
 ) -> Option<ListingItem> {
@@ -291,13 +302,16 @@ async fn process_path_inner<S: ListingSource>(
     source: &S,
     entry: &PackageEntry,
     queue: &Mutex<VecDeque<PackageEntry>>,
-    seen: &SccHashSet<String, ahash::RandomState>,
+    seen: &SccHashMap<String, Option<String>, ahash::RandomState>,
     in_flight: &AtomicUsize,
     notify: &Notify,
 ) -> Option<ListingItem> {
     let path = &entry.path;
-    let main_program = entry
-        .main_program
+    let main_program_string = entry.main_program.clone().or_else(|| {
+        seen.read_sync(&path.hash().to_string(), |_, mp| mp.clone())
+            .flatten()
+    });
+    let main_program = main_program_string
         .as_deref()
         .filter(|mp| is_valid_main_program(mp));
 
@@ -317,9 +331,14 @@ async fn process_path_inner<S: ListingSource>(
 
     for r in refs {
         let hash = r.hash().to_string();
-        // `scc::HashSet::insert_sync` returns `Ok(())` for a newly inserted
-        // key and `Err(key)` if it already exists, so `is_ok()` is correct.
-        if seen.insert_sync(hash).is_ok() {
+        let is_new = match seen.entry_sync(hash) {
+            SccMapEntry::Occupied(_) => false,
+            SccMapEntry::Vacant(vacant) => {
+                vacant.insert_entry(None);
+                true
+            }
+        };
+        if is_new {
             in_flight.fetch_add(1, Ordering::SeqCst);
             queue.lock().await.push_back(PackageEntry::new(r));
             notify.notify_one();
