@@ -1,5 +1,6 @@
 //! Background daemon support for keeping the nixdex index up to date.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::basename_index::BasenameIndex;
@@ -9,17 +10,25 @@ use crate::prebuilt::{self, PrebuiltConfig};
 use indexmap::IndexSet;
 
 #[cfg(feature = "daemon")]
-use axum::{Router, extract::State, routing::get};
+use axum::{
+    Router, extract::State, http::header::CONTENT_TYPE, response::IntoResponse, routing::get,
+};
 #[cfg(feature = "daemon")]
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "daemon")]
 use std::str::FromStr;
+#[cfg(feature = "daemon")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "daemon")]
+use std::time::Instant;
 
 #[cfg(feature = "daemon")]
 struct IndexState {
     basename: Arc<std::sync::RwLock<Option<Arc<BasenameIndex>>>>,
     reader: Arc<std::sync::RwLock<Option<Arc<Reader>>>>,
     package_db: Arc<std::sync::RwLock<Option<Arc<crate::package_search::SearchDb>>>>,
+    start_time: Instant,
+    requests_total: AtomicU64,
 }
 
 /// Configuration for a prebuilt-index daemon.
@@ -29,6 +38,8 @@ pub struct DaemonConfig {
     pub prebuilt: PrebuiltConfig,
     /// HTTP server listen address.
     pub http_addr: String,
+    /// Optional local database directory to serve instead of downloading a prebuilt index.
+    pub local_database: Option<PathBuf>,
 }
 
 impl Default for DaemonConfig {
@@ -36,6 +47,7 @@ impl Default for DaemonConfig {
         Self {
             prebuilt: PrebuiltConfig::default(),
             http_addr: "127.0.0.1:3750".to_string(),
+            local_database: None,
         }
     }
 }
@@ -50,6 +62,24 @@ impl Default for DaemonConfig {
 /// Returns an error when signal setup or HTTP server binding fails.
 #[cfg(feature = "daemon")]
 pub async fn run(config: &DaemonConfig) -> Result<()> {
+    let index_state = Arc::new(IndexState {
+        basename: Arc::new(std::sync::RwLock::new(None)),
+        reader: Arc::new(std::sync::RwLock::new(None)),
+        package_db: Arc::new(std::sync::RwLock::new(None)),
+        start_time: Instant::now(),
+        requests_total: AtomicU64::new(0),
+    });
+
+    let http_handle = start_http_server(&config.http_addr, Arc::clone(&index_state));
+
+    if let Some(local) = &config.local_database {
+        load_and_store_index(local, &index_state);
+        log_daemon_start_local(config, local);
+        let result = wait_signal().await;
+        http_handle.abort();
+        return result;
+    }
+
     if config.prebuilt.refresh_interval.is_zero() {
         return Err(crate::Error::Io(std::io::Error::other(
             "daemon refresh interval must be non-zero",
@@ -57,14 +87,6 @@ pub async fn run(config: &DaemonConfig) -> Result<()> {
     }
 
     let cache_dir = config.prebuilt.cache_dir.clone();
-    let index_state = Arc::new(IndexState {
-        basename: Arc::new(std::sync::RwLock::new(None)),
-        reader: Arc::new(std::sync::RwLock::new(None)),
-        package_db: Arc::new(std::sync::RwLock::new(None)),
-    });
-
-    let http_handle = start_http_server(&config.http_addr, Arc::clone(&index_state));
-
     log_daemon_start(config, &cache_dir);
 
     let mut interval = tokio::time::interval(config.prebuilt.refresh_interval);
@@ -77,6 +99,15 @@ pub async fn run(config: &DaemonConfig) -> Result<()> {
         http_handle,
     )
     .await
+}
+
+#[cfg(feature = "daemon")]
+fn log_daemon_start_local(config: &DaemonConfig, database: &std::path::Path) {
+    tracing::info!(
+        database = %database.display(),
+        http_addr = %config.http_addr,
+        "nixdex daemon started in local mode"
+    );
 }
 
 #[cfg(feature = "daemon")]
@@ -175,24 +206,27 @@ async fn handle_refresh_tick(
 
 #[cfg(feature = "daemon")]
 fn load_and_store_index(cache_dir: &std::path::Path, index_state: &IndexState) {
-    let Ok(index) = prebuilt::open_current_basename_index(cache_dir) else {
+    let index_dir = if cache_dir.join("files").exists() {
+        cache_dir.to_path_buf()
+    } else {
+        cache_dir.join("current")
+    };
+
+    let Ok(index) = crate::basename_index::BasenameIndex::open(&index_dir) else {
         return;
     };
     if let Ok(mut state) = index_state.basename.write() {
         *state = Some(Arc::new(index));
     }
 
-    load_reader(cache_dir, index_state);
-    load_package_db(cache_dir, index_state);
-    tracing::info!("prebuilt index refreshed and loaded");
+    load_reader(&index_dir, index_state);
+    load_package_db(&index_dir, index_state);
+    tracing::info!(index_dir = %index_dir.display(), "index loaded");
 }
 
 #[cfg(feature = "daemon")]
-fn load_package_db(cache_dir: &std::path::Path, index_state: &IndexState) {
-    let Some(current) = prebuilt::current_dir(cache_dir).ok().flatten() else {
-        return;
-    };
-    let packages_json = current.join("packages.json");
+fn load_package_db(index_dir: &std::path::Path, index_state: &IndexState) {
+    let packages_json = index_dir.join("packages.json");
     if !packages_json.exists() {
         return;
     }
@@ -209,11 +243,10 @@ fn load_package_db(cache_dir: &std::path::Path, index_state: &IndexState) {
 }
 
 #[cfg(feature = "daemon")]
-fn load_reader(cache_dir: &std::path::Path, index_state: &IndexState) {
-    let current = cache_dir.join("current");
-    let files_path = current.join("files");
+fn load_reader(index_dir: &std::path::Path, index_state: &IndexState) {
+    let files_path = index_dir.join("files");
     let Ok(reader) = Reader::open(&files_path) else {
-        tracing::warn!("failed to open database reader for prebuilt index");
+        tracing::warn!(path = %files_path.display(), "failed to open database reader");
         return;
     };
     if let Ok(mut state) = index_state.reader.write() {
@@ -271,6 +304,7 @@ async fn download_and_update(config: &PrebuiltConfig, cache_dir: &std::path::Pat
 async fn run_http_server(addr: &str, index_state: Arc<IndexState>) -> Result<()> {
     let app = Router::new()
         .route("/health", get(health_handler))
+        .route("/metrics", get(metrics_handler))
         .route("/locate", get(locate_handler))
         .route("/nix-locate", get(nix_locate_handler))
         .route("/search", get(search_handler))
@@ -295,6 +329,7 @@ async fn locate_handler(
     State(index_state): State<Arc<IndexState>>,
     axum::extract::Query(params): axum::extract::Query<LocateParams>,
 ) -> axum::Json<LocateResponse> {
+    index_state.requests_total.fetch_add(1, Ordering::Relaxed);
     let index = {
         let Ok(guard) = index_state.basename.read() else {
             return axum::Json(LocateResponse {
@@ -337,9 +372,11 @@ async fn nix_locate_handler(
     State(index_state): State<Arc<IndexState>>,
     axum::extract::Query(params): axum::extract::Query<NixLocateParams>,
 ) -> axum::Json<NixLocateResponse> {
+    index_state.requests_total.fetch_add(1, Ordering::Relaxed);
     let reader = {
         let Ok(guard) = index_state.reader.read() else {
             return axum::Json(NixLocateResponse {
+                count: None,
                 matches: Vec::new(),
             });
         };
@@ -349,6 +386,7 @@ async fn nix_locate_handler(
     let basename_index = {
         let Ok(guard) = index_state.basename.read() else {
             return axum::Json(NixLocateResponse {
+                count: None,
                 matches: Vec::new(),
             });
         };
@@ -357,6 +395,7 @@ async fn nix_locate_handler(
 
     let (Some(reader), Some(basename_index)) = (reader, basename_index) else {
         return axum::Json(NixLocateResponse {
+            count: None,
             matches: Vec::new(),
         });
     };
@@ -374,6 +413,7 @@ async fn nix_locate_handler(
     // Compile regex and package regex if provided.
     let Ok(path_re) = regex::bytes::Regex::new(&pattern) else {
         return axum::Json(NixLocateResponse {
+            count: None,
             matches: Vec::new(),
         });
     };
@@ -416,6 +456,7 @@ async fn nix_locate_handler(
     .await
     else {
         return axum::Json(NixLocateResponse {
+            count: None,
             matches: Vec::new(),
         });
     };
@@ -453,7 +494,7 @@ async fn nix_locate_handler(
         .collect();
 
     // Filter to minimal output if requested.
-    let json_matches = if params.minimal {
+    let mut json_matches = if params.minimal {
         // In minimal mode, we only need unique attr.output pairs.
         let mut seen = IndexSet::new();
         json_matches
@@ -481,7 +522,19 @@ async fn nix_locate_handler(
         json_matches
     };
 
+    if params.count {
+        return axum::Json(NixLocateResponse {
+            count: Some(json_matches.len()),
+            matches: Vec::new(),
+        });
+    }
+
+    if let Some(limit) = params.limit {
+        json_matches.truncate(limit);
+    }
+
     axum::Json(NixLocateResponse {
+        count: None,
         matches: json_matches,
     })
 }
@@ -502,11 +555,16 @@ struct NixLocateParams {
     whole_name: bool,
     #[serde(default)]
     minimal: bool,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    count: bool,
 }
 
 #[cfg(feature = "daemon")]
 #[derive(Serialize)]
 struct NixLocateResponse {
+    count: Option<usize>,
     matches: Vec<NixLocateMatch>,
 }
 
@@ -538,11 +596,14 @@ struct HealthResponse {
     status: &'static str,
     index_loaded: bool,
     package_db_loaded: bool,
+    version: &'static str,
+    uptime_seconds: u64,
 }
 
 /// HTTP handler for `/health`.
 #[cfg(feature = "daemon")]
 async fn health_handler(State(index_state): State<Arc<IndexState>>) -> axum::Json<HealthResponse> {
+    index_state.requests_total.fetch_add(1, Ordering::Relaxed);
     let index_loaded = matches!(index_state.basename.read(), Ok(g) if g.is_some());
     let package_db_loaded = matches!(index_state.package_db.read(), Ok(g) if g.is_some());
 
@@ -550,7 +611,40 @@ async fn health_handler(State(index_state): State<Arc<IndexState>>) -> axum::Jso
         status: "ok",
         index_loaded,
         package_db_loaded,
+        version: env!("CARGO_PKG_VERSION"),
+        uptime_seconds: index_state.start_time.elapsed().as_secs(),
     })
+}
+
+/// Prometheus-style `/metrics` handler.
+#[cfg(feature = "daemon")]
+async fn metrics_handler(State(index_state): State<Arc<IndexState>>) -> impl IntoResponse {
+    let total = index_state.requests_total.load(Ordering::Relaxed);
+    let index_loaded = u64::from(matches!(index_state.basename.read(), Ok(g) if g.is_some()));
+    let package_db_loaded =
+        u64::from(matches!(index_state.package_db.read(), Ok(g) if g.is_some()));
+    let uptime = index_state.start_time.elapsed().as_secs();
+    let version = env!("CARGO_PKG_VERSION");
+
+    let body = format!(
+        "# HELP nixdex_requests_total Total number of HTTP requests served by nixdex-daemon.\n\
+         # TYPE nixdex_requests_total counter\n\
+         nixdex_requests_total {total}\n\
+         # HELP nixdex_index_loaded Whether the file index is loaded (1 = yes, 0 = no).\n\
+         # TYPE nixdex_index_loaded gauge\n\
+         nixdex_index_loaded {index_loaded}\n\
+         # HELP nixdex_package_db_loaded Whether the package metadata sidecar is loaded.\n\
+         # TYPE nixdex_package_db_loaded gauge\n\
+         nixdex_package_db_loaded {package_db_loaded}\n\
+         # HELP nixdex_uptime_seconds Daemon uptime in seconds.\n\
+         # TYPE nixdex_uptime_seconds gauge\n\
+         nixdex_uptime_seconds {uptime}\n\
+         # HELP nixdex_version_info Build version.\n\
+         # TYPE nixdex_version_info gauge\n\
+         nixdex_version_info{{version=\"{version}\"}} 1\n"
+    );
+
+    ([(CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
 
 /// Parameters for `/search`.
@@ -572,6 +666,8 @@ struct SearchParams {
     limit: Option<usize>,
     #[serde(default)]
     count: bool,
+    #[serde(default)]
+    name_only: bool,
 }
 
 /// HTTP handler for `/search`.
@@ -580,10 +676,12 @@ async fn search_handler(
     State(index_state): State<Arc<IndexState>>,
     axum::extract::Query(params): axum::extract::Query<SearchParams>,
 ) -> axum::Json<SearchResponse> {
+    index_state.requests_total.fetch_add(1, Ordering::Relaxed);
     let db = {
         let Ok(guard) = index_state.package_db.read() else {
             return axum::Json(SearchResponse {
                 count: None,
+                names: None,
                 results: Vec::new(),
             });
         };
@@ -593,6 +691,7 @@ async fn search_handler(
     let Some(db) = db else {
         return axum::Json(SearchResponse {
             count: None,
+            names: None,
             results: Vec::new(),
         });
     };
@@ -600,6 +699,7 @@ async fn search_handler(
     let Ok(field) = crate::package_search::SearchField::from_str(&params.field) else {
         return axum::Json(SearchResponse {
             count: None,
+            names: None,
             results: Vec::new(),
         });
     };
@@ -610,6 +710,7 @@ async fn search_handler(
             Err(_) => {
                 return axum::Json(SearchResponse {
                     count: None,
+                    names: None,
                     results: Vec::new(),
                 });
             }
@@ -627,6 +728,7 @@ async fn search_handler(
             Err(_) => {
                 return axum::Json(SearchResponse {
                     count: None,
+                    names: None,
                     results: Vec::new(),
                 });
             }
@@ -636,6 +738,19 @@ async fn search_handler(
     if params.count {
         return axum::Json(SearchResponse {
             count: Some(matched.len()),
+            names: None,
+            results: Vec::new(),
+        });
+    }
+
+    if params.name_only {
+        let names = matched
+            .into_iter()
+            .map(|record| record.attr.clone())
+            .collect();
+        return axum::Json(SearchResponse {
+            count: None,
+            names: Some(names),
             results: Vec::new(),
         });
     }
@@ -644,6 +759,7 @@ async fn search_handler(
 
     axum::Json(SearchResponse {
         count: None,
+        names: None,
         results,
     })
 }
@@ -653,5 +769,6 @@ async fn search_handler(
 #[derive(Serialize)]
 struct SearchResponse {
     count: Option<usize>,
+    names: Option<Vec<String>>,
     results: Vec<crate::PackageMeta>,
 }
