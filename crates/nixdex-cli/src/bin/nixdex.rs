@@ -173,6 +173,10 @@ struct DaemonOpts {
     /// HTTP server listen address.
     #[arg(long, default_value = "127.0.0.1:3750")]
     http_addr: String,
+
+    /// Serve an existing local index directory instead of downloading a prebuilt index.
+    #[arg(long)]
+    database: Option<PathBuf>,
 }
 
 fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
@@ -287,6 +291,10 @@ async fn run_daemon(opts: DaemonOpts) -> color_eyre::Result<()> {
     ]);
     if opts.small {
         args.push("--small".into());
+    }
+    if let Some(database) = opts.database {
+        args.push("--database".into());
+        args.push(database.to_string_lossy().into_owned());
     }
 
     let mut child = tokio::process::Command::new("nixdex-daemon")
