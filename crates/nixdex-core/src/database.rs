@@ -43,6 +43,9 @@ const SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
 /// Byte offset right after the file magic and version header.
 const DATA_START: usize = 12;
 
+/// Defensive cap on the number of v2 frames (seek table entries).
+const MAX_FRAME_COUNT: usize = 1024 * 1024;
+
 /// Errors that can occur when reading or writing a database.
 #[derive(Error, Debug)]
 #[non_exhaustive]
@@ -511,6 +514,9 @@ fn parse_seek_table(data: &[u8], data_start: usize) -> Result<Vec<(usize, usize)
         return Err(Error::Corrupt("v2 seek table payload too short"));
     }
     let frame_count = read_u32_le(payload, 0)? as usize;
+    if frame_count > MAX_FRAME_COUNT {
+        return Err(Error::Corrupt("v2 frame count too high"));
+    }
     let expected_payload_len = 4usize
         .checked_add(
             frame_count
