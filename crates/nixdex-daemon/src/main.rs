@@ -48,12 +48,9 @@ async fn main() -> color_eyre::Result<()> {
 
     let args = Args::parse();
 
-    let cache_dir = args.cache_dir.unwrap_or_else(|| {
-        dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from(".cache"))
-            .join("nixdex")
-            .join("prebuilt")
-    });
+    let cache_dir = args
+        .cache_dir
+        .unwrap_or_else(|| nixdex_core::nixdex_dir().join("prebuilt"));
 
     let prebuilt_config = nixdex_core::prebuilt::PrebuiltConfig {
         release_url: args.release_url,
