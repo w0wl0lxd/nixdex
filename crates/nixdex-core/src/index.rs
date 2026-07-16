@@ -354,7 +354,7 @@ impl IndexBuilder {
             opts.jobs.max(1),
             stream.packages,
             path_cache.clone(),
-            filter_prefix,
+            &filter_prefix,
             &db_file,
             &progress,
         )
@@ -488,7 +488,7 @@ async fn write_listings(
     jobs: usize,
     package_input: mpsc::Receiver<listings::PackageEntry>,
     path_cache: Option<Arc<PathCache>>,
-    filter_prefix: Vec<u8>,
+    filter_prefix: &[u8],
     db_file: &Path,
     progress: &MultiProgress,
 ) -> Result<(usize, usize, Duration)> {
@@ -499,13 +499,14 @@ async fn write_listings(
     fetch_pb.set_message("Fetching listings...");
     let fetch_start = quanta::Instant::now();
 
-    let mut listings = listings::fetch_listings(fetcher, jobs, package_input, path_cache)
-        .await
-        .map_err(|source| {
-            Error::Io(std::io::Error::other(format!(
-                "failed to start listing fetcher: {source}"
-            )))
-        })?;
+    let mut listings =
+        listings::fetch_listings(fetcher, jobs, package_input, path_cache, filter_prefix)
+            .await
+            .map_err(|source| {
+                Error::Io(std::io::Error::other(format!(
+                    "failed to start listing fetcher: {source}"
+                )))
+            })?;
 
     let mut indexed = 0usize;
     let mut failed = 0usize;
@@ -516,7 +517,7 @@ async fn write_listings(
             Ok((store_path, tree)) => {
                 let before_len = writer.estimated_size();
                 writer
-                    .add(&store_path, &tree, &filter_prefix)
+                    .add(&store_path, &tree, filter_prefix)
                     .map_err(|source| Error::WriteDatabase {
                         path: db_file.to_path_buf(),
                         source: Box::new(source),

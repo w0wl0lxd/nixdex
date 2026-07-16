@@ -597,6 +597,13 @@ pub async fn stream_package_entries(
     let meta_ref = Some(&meta_tx);
     let mut count = stream_options_to_entries(&base, &tx, meta_ref, main_program).await?;
 
+    // A `--select` expression is applied to the root nixpkgs set; extra scopes
+    // are separate attribute paths and should not be evaluated when the caller
+    // has explicitly narrowed the root set.
+    if base.select.is_some() {
+        return Ok(count);
+    }
+
     for scope in extra_scopes {
         if scope.is_empty() {
             continue;
@@ -638,6 +645,13 @@ pub async fn list_packages_with_scopes(
     extra_scopes: &[String],
 ) -> Result<PackageList> {
     let mut merged = list_packages_async(&base).await?;
+
+    // A `--select` expression is applied to the root nixpkgs set; extra scopes
+    // are separate attribute paths and should not be evaluated when the caller
+    // has explicitly narrowed the root set.
+    if base.select.is_some() {
+        return Ok(merged);
+    }
 
     for scope in extra_scopes {
         if scope.is_empty() {
