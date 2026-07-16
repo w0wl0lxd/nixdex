@@ -41,6 +41,10 @@ pub struct UpdateOptions {
     pub force: bool,
     /// Cache-key used to identify a `paths.cache` file; defaults to `nixpkgs`.
     pub cache_key: Option<String>,
+    /// Path to the `paths.cache` file; defaults to `<database>/paths.cache`.
+    pub path_cache_file: Option<PathBuf>,
+    /// Time-to-live for cache entries in seconds (0 = no expiry); defaults to 7 days.
+    pub path_cache_ttl: Option<u64>,
     /// Synthesize `/bin/<mainProgram>` listings from `meta.mainProgram`.
     pub main_program: bool,
     /// Extra attribute scopes to walk during evaluation.
@@ -54,13 +58,15 @@ impl Default for UpdateOptions {
             database: PathBuf::from("/tmp/nix-index"),
             nixpkgs: String::from("<nixpkgs>"),
             system: None,
-            compression_level: 22,
+            compression_level: 19,
             format_version: 2,
             show_trace: false,
             filter_prefix: String::new(),
             path_cache: false,
             force: false,
             cache_key: None,
+            path_cache_file: None,
+            path_cache_ttl: None,
             main_program: true,
             extra_scopes: vec![
                 String::from("haskellPackages"),
@@ -107,12 +113,21 @@ impl IndexBuilder {
 
         let clock = quanta::Clock::new();
 
-        let cache_path = opts.database.join("paths.cache");
+        let cache_path = opts
+            .path_cache_file
+            .clone()
+            .unwrap_or_else(|| opts.database.join("paths.cache"));
         let cache_key = match opts.cache_key.as_deref() {
             Some(key) => key,
             None => &opts.nixpkgs,
         };
-        let path_cache = load_path_cache(&cache_path, cache_key, opts.path_cache, opts.force);
+        let path_cache = load_path_cache(
+            &cache_path,
+            cache_key,
+            opts.path_cache,
+            opts.force,
+            opts.path_cache_ttl,
+        );
 
         let db_file = opts.database.join("files");
         let mut writer =
@@ -206,22 +221,27 @@ fn load_path_cache(
     cache_key: &str,
     enabled: bool,
     force: bool,
+    ttl_secs: Option<u64>,
 ) -> Option<Arc<PathCache>> {
     if !enabled {
         return None;
     }
+    let ttl = match ttl_secs {
+        Some(t) => t,
+        None => 7 * 24 * 60 * 60, // 7 days default
+    };
     if force {
-        return Some(Arc::new(PathCache::new(cache_key)));
+        return Some(Arc::new(PathCache::new_with_ttl(cache_key, ttl)));
     }
     match PathCache::load(cache_path, cache_key) {
         Ok(Some(cache)) => Some(Arc::new(cache)),
         Ok(None) => {
             info!(cache_key, "path cache not found or stale; starting fresh");
-            Some(Arc::new(PathCache::new(cache_key)))
+            Some(Arc::new(PathCache::new_with_ttl(cache_key, ttl)))
         }
         Err(err) => {
             warn!(error = %err, "failed to load path cache; starting fresh");
-            Some(Arc::new(PathCache::new(cache_key)))
+            Some(Arc::new(PathCache::new_with_ttl(cache_key, ttl)))
         }
     }
 }
@@ -257,6 +277,9 @@ async fn write_listings(
     db_file: &Path,
     progress: &MultiProgress,
 ) -> Result<(usize, usize, Duration)> {
+    // Flush raw packages to a v2 frame once the in-memory chunk reaches 256 MiB.
+    const CHUNK_BYTES: u64 = 256 * 1024 * 1024;
+
     let fetch_pb = progress.add(ProgressBar::new_spinner());
     fetch_pb.set_message("Fetching listings...");
     let fetch_start = quanta::Instant::now();
@@ -271,16 +294,34 @@ async fn write_listings(
 
     let mut indexed = 0usize;
     let mut failed = 0usize;
+    let mut bytes_written = 0u64;
+
     while let Some(result) = listings.recv().await {
         match result {
             Ok((store_path, tree)) => {
+                let before_len = writer.estimated_size();
                 writer
                     .add(&store_path, &tree, &filter_prefix)
                     .map_err(|source| Error::WriteDatabase {
                         path: db_file.to_path_buf(),
                         source: Box::new(source),
                     })?;
+                let after_len = writer.estimated_size();
+                bytes_written += after_len.saturating_sub(before_len);
                 indexed += 1;
+
+                if writer.estimated_size() > CHUNK_BYTES {
+                    tracing::debug!(
+                        estimated_bytes = writer.estimated_size(),
+                        "chunk size reached, flushing v2 frame"
+                    );
+                    writer
+                        .flush_chunk()
+                        .map_err(|source| Error::WriteDatabase {
+                            path: db_file.to_path_buf(),
+                            source: Box::new(source),
+                        })?;
+                }
             }
             Err(err) => {
                 warn!(error = %err, "closure fetch yielded an error; skipping");
@@ -291,6 +332,26 @@ async fn write_listings(
         fetch_pb.inc(1);
     }
     let fetch_elapsed = fetch_start.elapsed();
+    let packages_per_sec = if fetch_elapsed.as_secs_f64() > 0.0 {
+        let elapsed_secs = fetch_elapsed.as_secs_f64();
+        let indexed_u64 = match u64::try_from(indexed) {
+            Ok(idx) => idx,
+            Err(_) => u64::MAX,
+        };
+        #[allow(clippy::cast_precision_loss, clippy::as_conversions)]
+        let rate = indexed_u64 as f64 / elapsed_secs;
+        rate
+    } else {
+        0.0
+    };
+    info!(
+        indexed,
+        failed,
+        bytes_written,
+        packages_per_sec,
+        ?fetch_elapsed,
+        "listing fetch complete"
+    );
     fetch_pb.finish_with_message(format!(
         "Fetched {indexed} listings ({failed} failed) in {:?}",
         fetch_elapsed
@@ -317,7 +378,7 @@ mod tests {
     fn default_options_match_upstream_baseline() {
         let opts = UpdateOptions::default();
         assert_eq!(opts.jobs, 100);
-        assert_eq!(opts.compression_level, 22);
+        assert_eq!(opts.compression_level, 19);
         assert_eq!(opts.format_version, 2);
         assert_eq!(opts.nixpkgs, "<nixpkgs>");
         assert!(!opts.path_cache);
@@ -344,6 +405,8 @@ mod tests {
             path_cache: false,
             force: false,
             cache_key: None,
+            path_cache_file: None,
+            path_cache_ttl: None,
             main_program: true,
             extra_scopes: vec![],
         };
