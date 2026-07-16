@@ -31,7 +31,10 @@
     ]
     $lines | str join "\n"
   }
-  let pkgs = (@out@/bin/nix-locate --minimal --no-group --type x --type s --whole-name --at-root $"/bin/($cmd_name)" | lines)
+  let database = ($env | get -i NIXDEX_DATABASE | default ($env | get -i NIX_INDEX_DATABASE | default ""))
+  let base_args = [--minimal --no-group --type x --type s --whole-name --at-root $"/bin/($cmd_name)"]
+  let args = if ($database | is-empty) { $base_args } else { ($base_args | append [--db $database]) }
+  let pkgs = (@out@/bin/nix-locate ...$args | lines)
   let len = ($pkgs | length)
   let ret = match $len {
     0 => null,
