@@ -1,9 +1,21 @@
 { |cmd_name|
+  let comma_cmd = if (which , | length) > 0 {
+    ","
+  } else if (which comma | length) > 0 {
+    "comma"
+  } else {
+    null
+  }
   let install = { |pkgs|
     $pkgs | each {|pkg| $"  nix profile install nixpkgs#($pkg)" }
   }
   let run_once = { |pkgs|
     $pkgs | each {|pkg| $"  nix shell nixpkgs#($pkg) --command ($cmd_name) ..." }
+  }
+  let comma_lines = if $comma_cmd != null {
+    ["" "Or run it once with:" $"  ($comma_cmd) ($cmd_name)"]
+  } else {
+    []
   }
   let single_pkg = { |pkg|
     let lines = [
@@ -14,7 +26,7 @@
       ""
       "Or run it once with:"
       (do $run_once [$pkg] | get 0)
-    ]
+    ] | append $comma_lines
     $lines | str join "\n"
   }
   let multiple_pkgs = { |pkgs|
@@ -26,7 +38,7 @@
       ""
       "Or run it once with:"
       (do $run_once $pkgs | str join "\n")
-    ]
+    ] | append $comma_lines
     $lines | str join "\n"
   }
   let pkgs = (@out@/bin/nix-locate --minimal --no-group --type x --type s --whole-name --at-root $"/bin/($cmd_name)" | lines)
