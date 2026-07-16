@@ -244,6 +244,9 @@ impl FileTreeEntry {
     }
 }
 
+/// Maximum decompressed size accepted for a `.ls` JSON document (defensive cap).
+pub(crate) const MAX_LS_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
+
 impl FileTree {
     /// Create a regular file tree node.
     #[must_use]
@@ -281,7 +284,6 @@ impl FileTree {
     /// Returns [`crate::Error::Parse`] when the JSON is invalid, oversized, too deep,
     /// or the schema is unexpected.
     pub fn from_ls_json(bytes: &[u8]) -> crate::Result<Self> {
-        const MAX_LS_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
         if bytes.len() > MAX_LS_BYTES {
             return Err(crate::Error::Parse(format!(
                 ".ls payload too large: {} bytes (max {MAX_LS_BYTES})",
