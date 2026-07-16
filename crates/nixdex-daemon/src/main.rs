@@ -37,6 +37,13 @@ struct Args {
     /// HTTP server listen address.
     #[arg(long, default_value = "127.0.0.1:3750")]
     http_addr: String,
+
+    /// Serve an existing local index directory instead of downloading a prebuilt index.
+    ///
+    /// The directory must contain a NIXI `files` database. Sidecar files
+    /// (`files.basename.*`, `packages.json`) are loaded if present.
+    #[arg(long)]
+    database: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -63,6 +70,7 @@ async fn main() -> color_eyre::Result<()> {
     let config = nixdex_core::daemon::DaemonConfig {
         prebuilt: prebuilt_config,
         http_addr: args.http_addr,
+        local_database: args.database,
     };
 
     match nixdex_core::daemon::run(&config).await {
