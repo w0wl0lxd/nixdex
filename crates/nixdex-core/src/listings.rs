@@ -113,19 +113,17 @@ impl ListingSource for CachedSource {
         Output = std::result::Result<(Vec<StorePath>, Option<String>), hydra::Error>,
     > + Send {
         async move {
-            let hash = path.hash().to_string();
-            if let Some(refs) = self.cache.get_refs(&hash) {
-                let _ = self.cache.hits.fetch_add(1, Ordering::Relaxed);
+            let hash = path.hash();
+            if let Some(refs) = self.cache.get_refs(hash) {
+                self.cache.hits.fetch_add(1, Ordering::Relaxed);
                 return Ok((refs, None));
             }
 
             let (refs, nar_url) = self.inner.fetch_narinfo_details(path).await?;
 
             // Preserve any already-cached tree for this path while storing refs.
-            let mut entry = self
-                .cache
-                .get(&hash)
-                .unwrap_or_else(|| crate::path_cache::CachedEntry::new(path.clone()));
+            let mut entry = crate::path_cache::CachedEntry::new(path.clone());
+            entry.tree = self.cache.get_tree(hash);
             entry.refs = Some(refs.clone());
             self.cache.insert(hash, entry);
 
@@ -138,18 +136,16 @@ impl ListingSource for CachedSource {
         path: &'a StorePath,
     ) -> impl std::future::Future<Output = std::result::Result<FileTree, hydra::Error>> + Send {
         async move {
-            let hash = path.hash().to_string();
-            if let Some(tree) = self.cache.get_tree(&hash) {
-                let _ = self.cache.hits.fetch_add(1, Ordering::Relaxed);
+            let hash = path.hash();
+            if let Some(tree) = self.cache.get_tree(hash) {
+                self.cache.hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(tree);
             }
 
             let tree = self.inner.fetch_file_tree(path).await?;
 
-            let mut entry = self
-                .cache
-                .get(&hash)
-                .unwrap_or_else(|| crate::path_cache::CachedEntry::new(path.clone()));
+            let mut entry = crate::path_cache::CachedEntry::new(path.clone());
+            entry.refs = self.cache.get_refs(hash);
             entry.tree = Some(tree.clone());
             self.cache.insert(hash, entry);
 

@@ -56,6 +56,13 @@ struct Payload {
     entries: Vec<CachedEntry>,
 }
 
+/// Borrowed view of a [`Payload`] used for serialization without cloning entries.
+#[derive(Serialize)]
+struct SerializePayload<'a> {
+    cache_key: &'a str,
+    entries: Vec<&'a CachedEntry>,
+}
+
 /// In-memory path cache keyed by store-path hash.
 ///
 /// `PathCache` is `Sync` and is intended to be shared via `Arc` across the
@@ -149,9 +156,12 @@ impl PathCache {
         }
 
         let cache = Self::new(expected_key);
-        for entry in payload.entries {
-            let key = entry.store_path.hash().to_string();
-            let _ = cache.map.pin().insert(key, entry);
+        {
+            let map = cache.map.pin();
+            for entry in payload.entries {
+                let key = entry.store_path.hash().to_string();
+                let _ = map.insert(key, entry);
+            }
         }
         Ok(Some(cache))
     }
@@ -168,14 +178,10 @@ impl PathCache {
             let mut writer = BufWriter::new(file);
             writer.write_all(MAGIC)?;
             writer.write_all(&VERSION.to_le_bytes())?;
-            let entries: Vec<CachedEntry> = self
-                .map
-                .pin()
-                .iter()
-                .map(|(_, entry)| entry.clone())
-                .collect();
-            let payload = Payload {
-                cache_key: self.cache_key.clone(),
+            let map = self.map.pin();
+            let entries: Vec<&CachedEntry> = map.iter().map(|(_, entry)| entry).collect();
+            let payload = SerializePayload {
+                cache_key: &self.cache_key,
                 entries,
             };
             let bytes =

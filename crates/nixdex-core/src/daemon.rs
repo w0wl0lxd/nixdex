@@ -27,16 +27,21 @@ impl Default for DaemonConfig {
 /// Run the daemon loop, refreshing the index at `config.interval` until a
 /// termination signal is received.
 ///
-/// Listens for `SIGTERM` and `SIGINT`. A refresh that fails is logged and the
-/// loop continues.
+/// Listens for `SIGTERM` and `SIGINT` on Unix, and `Ctrl+C` elsewhere. A
+/// refresh that fails is logged and the loop continues.
 ///
 /// # Errors
 ///
-/// Returns an error only when signal setup fails.
+/// Returns an error when the interval is zero or signal setup fails.
 pub async fn run(config: &DaemonConfig) -> Result<()> {
+    if config.interval.is_zero() {
+        return Err(crate::errors::Error::Io(std::io::Error::other(
+            "daemon interval must be non-zero",
+        )));
+    }
+
     let mut interval = tokio::time::interval(config.interval);
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     tracing::info!(
         database = %config.update_options.database.display(),
@@ -53,16 +58,31 @@ pub async fn run(config: &DaemonConfig) -> Result<()> {
                     Err(err) => tracing::error!(error = %err, "refresh failed"),
                 }
             }
-            _ = sigterm.recv() => {
-                tracing::info!("received SIGTERM, shutting down");
-                break;
-            }
-            _ = sigint.recv() => {
-                tracing::info!("received SIGINT, shutting down");
+            _ = wait_signal() => {
                 break;
             }
         }
     }
 
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn wait_signal() -> Result<()> {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+
+    tokio::select! {
+        _ = sigterm.recv() => tracing::info!("received SIGTERM, shutting down"),
+        _ = sigint.recv() => tracing::info!("received SIGINT, shutting down"),
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn wait_signal() -> Result<()> {
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("received Ctrl+C, shutting down");
     Ok(())
 }
