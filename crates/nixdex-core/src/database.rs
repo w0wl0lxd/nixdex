@@ -46,6 +46,9 @@ const DATA_START: usize = 12;
 /// Defensive cap on the number of v2 frames (seek table entries).
 const MAX_FRAME_COUNT: usize = 1024 * 1024;
 
+/// Defensive cap on the on-disk database file size.
+const MAX_DATABASE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Errors that can occur when reading or writing a database.
 #[derive(Error, Debug)]
 #[non_exhaustive]
@@ -357,6 +360,10 @@ impl Reader {
         let path_buf = path.as_ref().to_path_buf();
         let data = fs::read(&path_buf)?;
 
+        if data.len() as u64 > MAX_DATABASE_BYTES {
+            return Err(Error::Corrupt("database file exceeds maximum size"));
+        }
+
         if data.len() < DATA_START {
             return Err(Error::Corrupt("database file too short for header"));
         }
@@ -489,7 +496,10 @@ fn parse_seek_table(data: &[u8], data_start: usize) -> Result<Vec<(usize, usize)
     let skippable_size = 8usize
         .checked_add(payload_len)
         .ok_or(Error::Corrupt("v2 seek table size overflow"))?;
-    if data.len() < skippable_size {
+    let min_file_size = DATA_START
+        .checked_add(skippable_size)
+        .ok_or(Error::Corrupt("v2 seek table size overflow"))?;
+    if data.len() < min_file_size {
         return Err(Error::Corrupt("v2 seek table truncated"));
     }
 
@@ -543,7 +553,10 @@ fn parse_seek_table(data: &[u8], data_start: usize) -> Result<Vec<(usize, usize)
         acc.checked_add(len)
             .ok_or(Error::Corrupt("v2 compressed length overflow"))
     })?;
-    if total_compressed != frames_end - data_start {
+    let frames_len = frames_end
+        .checked_sub(data_start)
+        .ok_or(Error::Corrupt("v2 compressed frames underflow"))?;
+    if total_compressed != frames_len {
         return Err(Error::Corrupt("v2 compressed length mismatch"));
     }
 
@@ -592,7 +605,8 @@ fn search_frame(
     let raw = if compressed.is_empty() {
         Vec::new()
     } else {
-        zstd::decode_all(compressed)?
+        crate::bounded_zstd_decode(compressed, crate::MAX_ZSTD_FRAME_BYTES as usize)
+            .map_err(Error::Io)?
     };
 
     let mut matches = Vec::new();
@@ -1126,7 +1140,7 @@ mod tests {
             .expect("4 bytes");
         let frame_count = u32::from_le_bytes(frame_count_bytes) as usize;
         let num_cpus = std::thread::available_parallelism()
-            .map_or(1, |n| n.get())
+            .map_or(1, std::num::NonZeroUsize::get)
             .max(1);
         assert!(frame_count >= 1 && frame_count <= num_cpus.max(2));
     }
@@ -1154,6 +1168,26 @@ mod tests {
         fs::write(&db_path, &data).expect("rewrite corrupt db");
 
         let err = Reader::open(&db_path).expect_err("corrupt db should fail");
+        assert!(matches!(err, Error::Corrupt(_)));
+    }
+
+    #[test]
+    fn v2_seek_table_smaller_than_header_plus_trailer_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+
+        // 20-byte v2 file: 12-byte header + 4 padding bytes + payload_len=8.
+        // This is too short to contain the header plus a 16-byte skippable
+        // frame, so `parse_seek_table` should reject it instead of underflowing
+        // `frames_end - data_start`.
+        let mut data = Vec::new();
+        data.extend_from_slice(FILE_MAGIC);
+        data.extend_from_slice(&2u64.to_le_bytes());
+        data.extend_from_slice(&[0u8; 4]);
+        data.extend_from_slice(&8u32.to_le_bytes());
+        fs::write(&db_path, &data).expect("write truncated db");
+
+        let err = Reader::open(&db_path).expect_err("truncated db should fail");
         assert!(matches!(err, Error::Corrupt(_)));
     }
 }
