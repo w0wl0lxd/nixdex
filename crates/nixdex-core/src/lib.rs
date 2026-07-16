@@ -10,6 +10,7 @@ pub mod files;
 pub mod frcode;
 pub mod hydra;
 pub mod index;
+pub mod listings;
 pub mod nixpkgs;
 pub mod store_path;
 
