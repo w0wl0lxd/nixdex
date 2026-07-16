@@ -38,6 +38,7 @@ struct WriteListingsContext<'a> {
     jobs: usize,
     path_cache: Option<Arc<PathCache>>,
     filter_prefix: &'a [u8],
+    exclude_prefixes: Vec<Vec<u8>>,
     db_file: &'a Path,
     progress: &'a MultiProgress,
     attrs_map: IndexMap<String, String>,
@@ -88,6 +89,8 @@ pub struct UpdateOptions {
     pub only_eval: bool,
     /// Base URL of the Nix binary cache to fetch listings from.
     pub cache_url: String,
+    /// Only add paths that do not start with any of these prefixes.
+    pub exclude_prefix: Vec<String>,
 }
 
 impl Default for UpdateOptions {
@@ -119,6 +122,7 @@ impl Default for UpdateOptions {
             ],
             only_eval: false,
             cache_url: crate::CACHE_URL.to_string(),
+            exclude_prefix: Vec::new(),
         }
     }
 }
@@ -411,6 +415,11 @@ impl IndexBuilder {
         } else {
             opts.filter_prefix.as_bytes().to_vec()
         };
+        let exclude_prefixes = opts
+            .exclude_prefix
+            .iter()
+            .map(|s| s.as_bytes().to_vec())
+            .collect();
         let (indexed, failed, fetch_elapsed) = match write_listings(
             WriteListingsContext {
                 writer: &mut ctx.writer,
@@ -418,6 +427,7 @@ impl IndexBuilder {
                 jobs: opts.jobs.max(1),
                 path_cache: ctx.path_cache.clone(),
                 filter_prefix: &filter_prefix,
+                exclude_prefixes,
                 db_file: &ctx.db_file,
                 progress: &progress,
                 attrs_map: ctx.attrs_map,
@@ -583,8 +593,13 @@ async fn write_listings(
         match result {
             Ok((store_path, tree)) => {
                 let before_len = ctx.writer.estimated_size();
+                let exclude_slices: Vec<&[u8]> = ctx
+                    .exclude_prefixes
+                    .iter()
+                    .map(std::vec::Vec::as_slice)
+                    .collect();
                 ctx.writer
-                    .add(&store_path, &tree, ctx.filter_prefix)
+                    .add_excluding(&store_path, &tree, ctx.filter_prefix, &exclude_slices)
                     .map_err(|source| Error::WriteDatabase {
                         path: ctx.db_file.to_path_buf(),
                         source: Box::new(source),
@@ -664,6 +679,8 @@ mod tests {
             main_program: true,
             extra_scopes: vec![],
             only_eval: false,
+            cache_url: crate::CACHE_URL.to_string(),
+            exclude_prefix: Vec::new(),
         };
         IndexBuilder::new(opts).build().await.expect("build");
         assert!(dir.path().join("files").exists());
