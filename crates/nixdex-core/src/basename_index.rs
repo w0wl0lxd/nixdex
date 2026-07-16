@@ -27,11 +27,23 @@ const SIDE_VERSION: u32 = 1;
 /// Maximum total size of the package-names sidecar (defensive cap).
 const MAX_NAMES_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Maximum number of package labels in the names sidecar.
+///
+/// This prevents a malicious sidecar full of zero-length names from causing a
+/// huge `Vec<String>` allocation (the file-size cap alone is not enough).
+const MAX_NAME_COUNT: u64 = 2_000_000;
+
 /// Maximum length of a single package label in the names sidecar.
 const MAX_NAME_BYTES: usize = 64 * 1024;
 
 /// Maximum total size of the postings sidecar (defensive cap).
 const MAX_POSTINGS_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Maximum number of package ordinals returned for a single basename.
+///
+/// This bounds the allocation in `read_ordinals_at` to a few megabytes per
+/// lookup instead of the full postings file size.
+const MAX_ORDINALS_PER_BASENAME: usize = 1_000_000;
 
 /// Maximum total size of the FST sidecar (defensive cap).
 const MAX_FST_BYTES: u64 = 128 * 1024 * 1024;
@@ -312,6 +324,11 @@ fn read_ordinals_at(postings: &[u8], cookie: u64) -> Result<Vec<u32>> {
     let start = usize::try_from(cookie)
         .map_err(|_| Error::Corrupt(format!("cookie {cookie} does not fit usize")))?;
     let count = read_u32_le(postings, start)? as usize;
+    if count > MAX_ORDINALS_PER_BASENAME {
+        return Err(Error::Corrupt(format!(
+            "too many ordinals for one basename: {count} (max {MAX_ORDINALS_PER_BASENAME})"
+        )));
+    }
     let body = start
         .checked_add(4)
         .ok_or_else(|| Error::Corrupt("ordinal body offset overflow".into()))?;
@@ -375,6 +392,11 @@ fn read_package_names(path: &Path) -> Result<Vec<String>> {
     }
 
     let count = u64::from(read_u32_le(&bytes, NAMES_MAGIC.len() + 4)?);
+    if count > MAX_NAME_COUNT {
+        return Err(Error::Corrupt(format!(
+            "package name count too large: {count} (max {MAX_NAME_COUNT})"
+        )));
+    }
     let header_size = NAMES_MAGIC.len() + 4 + 4;
     if count
         .checked_mul(4)
@@ -387,6 +409,9 @@ fn read_package_names(path: &Path) -> Result<Vec<String>> {
     let mut pos = header_size;
     for _ in 0..count {
         let len = read_u32_le(&bytes, pos)? as usize;
+        if len == 0 {
+            return Err(Error::Corrupt("empty package name".into()));
+        }
         if len > MAX_NAME_BYTES {
             return Err(Error::Corrupt(format!("package name too long: {len}")));
         }
@@ -463,5 +488,55 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let err = BasenameIndex::open(dir.path()).expect_err("should fail");
         assert!(matches!(err, Error::Missing { .. }));
+    }
+
+    #[test]
+    fn read_package_names_rejects_empty_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(NAMES_FILE);
+        {
+            let mut w = BufWriter::new(File::create(&path).expect("create"));
+            w.write_all(NAMES_MAGIC).expect("magic");
+            w.write_u32::<LittleEndian>(SIDE_VERSION).expect("ver");
+            w.write_u32::<LittleEndian>(1).expect("count");
+            w.write_u32::<LittleEndian>(0).expect("empty len");
+            w.flush().expect("flush");
+        }
+
+        let err = read_package_names(&path).expect_err("empty name should fail");
+        assert!(matches!(err, Error::Corrupt(_)));
+        assert!(err.to_string().contains("empty package name"));
+    }
+
+    #[test]
+    fn read_package_names_rejects_excessive_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(NAMES_FILE);
+        {
+            let mut w = BufWriter::new(File::create(&path).expect("create"));
+            w.write_all(NAMES_MAGIC).expect("magic");
+            w.write_u32::<LittleEndian>(SIDE_VERSION).expect("ver");
+            w.write_u32::<LittleEndian>((MAX_NAME_COUNT + 1) as u32)
+                .expect("count");
+            w.flush().expect("flush");
+        }
+
+        let err = read_package_names(&path).expect_err("excessive count should fail");
+        assert!(matches!(err, Error::Corrupt(_)));
+        assert!(err.to_string().contains("package name count too large"));
+    }
+
+    #[test]
+    fn read_ordinals_at_rejects_excessive_count() {
+        let mut postings = Vec::new();
+        postings.extend_from_slice(POSTINGS_MAGIC);
+        postings.extend_from_slice(&SIDE_VERSION.to_le_bytes());
+        // Cookie 8 (right after header) points at a count that exceeds the cap.
+        let count = (MAX_ORDINALS_PER_BASENAME + 1) as u32;
+        postings.extend_from_slice(&count.to_le_bytes());
+
+        let err = read_ordinals_at(&postings, 8).expect_err("excessive ordinal count should fail");
+        assert!(matches!(err, Error::Corrupt(_)));
+        assert!(err.to_string().contains("too many ordinals"));
     }
 }
