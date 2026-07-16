@@ -316,6 +316,11 @@ pub fn parse_narinfo_references(narinfo: &str, store_dir: &str) -> Result<Vec<St
                     "invalid reference store path: {token}"
                 )));
             };
+            if sp.hash().len() != 32 || sp.name().is_empty() {
+                return Err(Error::Parse(format!(
+                    "invalid reference store path: {token}"
+                )));
+            }
             refs.push(sp);
         }
         break;
@@ -377,5 +382,125 @@ References: ias8xacs1h3jy7xgwi2awvim61k2ji6c-glibc-2.42-67 pg2zfrrbm58ynbjshhzkg
             Some("ias8xacs1h3jy7xgwi2awvim61k2ji6c")
         );
         assert_eq!(refs.first().map(StorePath::name), Some("glibc-2.42-67"));
+    }
+
+    #[test]
+    fn parse_narinfo_url_missing_field() {
+        let text = "StorePath: /nix/store/abc-foo\n";
+        assert!(parse_narinfo_url(text).is_none());
+    }
+
+    #[test]
+    fn parse_narinfo_references_missing_field() {
+        let text = "StorePath: /nix/store/abc-foo\nURL: nar/abc-foo.nar.xz\n";
+        let refs = parse_narinfo_references(text, "/nix/store").expect("refs");
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn parse_narinfo_references_empty() {
+        let text = "StorePath: /nix/store/abc-foo\nReferences: \n";
+        let refs = parse_narinfo_references(text, "/nix/store").expect("refs");
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn parse_narinfo_references_invalid_store_path() {
+        let text = "StorePath: /nix/store/abc-foo\nReferences: invalid-hash-name\n";
+        let result = parse_narinfo_references(text, "/nix/store");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid reference store path")
+        );
+    }
+
+    #[test]
+    fn fetcher_rejects_empty_base_url() {
+        let result = Fetcher::new("");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must not be empty")
+        );
+    }
+
+    #[test]
+    fn fetcher_trims_trailing_slash() {
+        let fetcher = Fetcher::new("https://cache.nixos.org/").expect("fetcher");
+        assert_eq!(fetcher.base_url(), "https://cache.nixos.org");
+    }
+
+    #[test]
+    fn listing_url_construction() {
+        let fetcher = Fetcher::new("https://cache.nixos.org").expect("fetcher");
+        let origin = Origin {
+            attr: "hello".into(),
+            output: "out".into(),
+            toplevel: true,
+            system: None,
+        };
+        let path = StorePath::new(
+            "/nix/store".into(),
+            "abc123hello".into(),
+            "hello-2.12".into(),
+            origin,
+        );
+        let url = fetcher.listing_url(&path);
+        assert_eq!(url, "https://cache.nixos.org/abc123hello.ls");
+    }
+
+    #[test]
+    fn narinfo_url_construction() {
+        let fetcher = Fetcher::new("https://cache.nixos.org").expect("fetcher");
+        let origin = Origin {
+            attr: "hello".into(),
+            output: "out".into(),
+            toplevel: true,
+            system: None,
+        };
+        let path = StorePath::new(
+            "/nix/store".into(),
+            "abc123hello".into(),
+            "hello-2.12".into(),
+            origin,
+        );
+        let url = fetcher.narinfo_url(&path);
+        assert_eq!(url, "https://cache.nixos.org/abc123hello.narinfo");
+    }
+
+    #[test]
+    fn error_is_not_found_detection() {
+        let err = Error::Request("https://cache.nixos.org/abc.narinfo: HTTP 404".to_string());
+        assert!(err.is_not_found());
+
+        let other_err = Error::Request("https://cache.nixos.org/abc.narinfo: HTTP 500".to_string());
+        assert!(!other_err.is_not_found());
+
+        let parse_err = Error::Parse("invalid data".to_string());
+        assert!(!parse_err.is_not_found());
+    }
+
+    #[test]
+    fn decompress_unknown_magic_returns_as_is() {
+        // Data that doesn't match any known magic should be returned as-is
+        let data = b"random data that isn't compressed";
+        let out = decompress_listing(data).expect("decompress");
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn bounded_xz_decode_respects_limit() {
+        // Compress a single byte and ensure the zero-byte limit rejects it.
+        let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 0);
+        std::io::Write::write_all(&mut encoder, b"x").expect("write");
+        let compressed = encoder.finish().expect("finish");
+        let result = bounded_xz_decode(&compressed, 0); // Zero limit
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exceeds limit"));
     }
 }

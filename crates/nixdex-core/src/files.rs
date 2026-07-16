@@ -478,4 +478,182 @@ mod tests {
             let _ = line;
         }
     }
+
+    #[test]
+    fn from_ls_json_malformed_json() {
+        let invalid_json = b"{not valid json";
+        let result = FileTree::from_ls_json(invalid_json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn from_ls_json_oversized_payload() {
+        let mut large_json = vec![b' '; MAX_LS_BYTES + 1];
+        *large_json.first_mut().expect("first byte") = b'{';
+        *large_json.last_mut().expect("last byte") = b'}';
+        let result = FileTree::from_ls_json(&large_json);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too large"));
+    }
+
+    #[test]
+    fn from_ls_json_deep_nesting_exceeds_max() {
+        // Create a deeply nested structure that exceeds MAX_LS_DEPTH
+        let mut json = String::from(r#"{"type":"directory","entries":{""#);
+        for _ in 0..MAX_LS_DEPTH + 1 {
+            json.push_str(r#""a":{"type":"directory","entries":{""#);
+        }
+        json.push_str(r#""b":{"type":"regular","size":1}}}"#);
+        for _ in 0..MAX_LS_DEPTH + 1 {
+            json.push_str("}}");
+        }
+
+        let result = FileTree::from_ls_json(json.as_bytes());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn from_ls_json_invalid_entry_name_with_slash() {
+        let json = br#"{"type":"directory","entries":{"a/b":{"type":"regular","size":1}}}"#;
+        let result = FileTree::from_ls_json(json);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid directory entry name")
+        );
+    }
+
+    #[test]
+    fn from_ls_json_invalid_entry_name_with_backslash() {
+        let json = br#"{"type":"directory","entries":{"a\\b":{"type":"regular","size":1}}}"#;
+        let result = FileTree::from_ls_json(json);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid directory entry name")
+        );
+    }
+
+    #[test]
+    fn from_ls_json_invalid_entry_name_dot() {
+        let json = br#"{"type":"directory","entries":{".":{"type":"regular","size":1}}}"#;
+        let result = FileTree::from_ls_json(json);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid directory entry name")
+        );
+    }
+
+    #[test]
+    fn from_ls_json_unknown_node_type() {
+        let json = br#"{"type":"unknown","size":1}"#;
+        let result = FileTree::from_ls_json(json);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unknown .ls node type")
+        );
+    }
+
+    #[test]
+    fn from_ls_json_symlink_missing_target() {
+        let json = br#"{"type":"symlink"}"#;
+        let result = FileTree::from_ls_json(json);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("missing target"));
+    }
+
+    #[test]
+    fn to_list_prefix_filtering() {
+        let tree = FileTree::directory(vec![
+            (
+                Bytes::from_static(b"bin"),
+                FileTree::directory(vec![
+                    (Bytes::from_static(b"ls"), FileTree::regular(100, true)),
+                    (Bytes::from_static(b"cat"), FileTree::regular(50, false)),
+                ]),
+            ),
+            (
+                Bytes::from_static(b"share"),
+                FileTree::directory(vec![(
+                    Bytes::from_static(b"doc"),
+                    FileTree::directory(vec![(
+                        Bytes::from_static(b"README"),
+                        FileTree::regular(10, false),
+                    )]),
+                )]),
+            ),
+        ]);
+
+        // Filter for /bin paths
+        let bin_entries = tree.to_list(b"/bin");
+        assert!(bin_entries.iter().all(|e| e.path.starts_with(b"/bin")));
+        assert!(bin_entries.iter().any(|e| e.path == b"/bin/ls"));
+        assert!(bin_entries.iter().any(|e| e.path == b"/bin/cat"));
+        assert!(!bin_entries.iter().any(|e| e.path.starts_with(b"/share")));
+
+        // Filter for /share paths
+        let share_entries = tree.to_list(b"/share");
+        assert!(share_entries.iter().all(|e| e.path.starts_with(b"/share")));
+        assert!(share_entries.iter().any(|e| e.path == b"/share/doc/README"));
+
+        // Empty filter returns all
+        let all_entries = tree.to_list(b"");
+        assert_eq!(all_entries.len(), 7); // /, /bin, /share, /bin/ls, /bin/cat, /share/doc, /share/doc/README
+    }
+
+    #[test]
+    fn to_list_empty_prefix_matches_all() {
+        let tree = FileTree::directory(vec![
+            (Bytes::from_static(b"a"), FileTree::regular(1, false)),
+            (Bytes::from_static(b"b"), FileTree::regular(2, false)),
+        ]);
+
+        let entries = tree.to_list(b"");
+        assert_eq!(entries.len(), 3); // /, /a, /b
+    }
+
+    #[test]
+    fn to_list_nonexistent_prefix_returns_empty() {
+        let tree = FileTree::directory(vec![(
+            Bytes::from_static(b"bin"),
+            FileTree::regular(1, false),
+        )]);
+
+        let entries = tree.to_list(b"/nonexistent");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn file_node_decode_meta_invalid_format() {
+        // Missing type suffix
+        assert!(FileNode::decode_meta(b"123").is_none());
+        // Invalid type character
+        assert!(FileNode::decode_meta(b"123z").is_none());
+        // Non-numeric size
+        assert!(FileNode::decode_meta(b"abcx").is_none());
+    }
+
+    #[test]
+    fn file_tree_entry_decode_missing_nul() {
+        let invalid = b"1r/bin/ls"; // No NUL separator
+        let result = FileTreeEntry::decode(invalid);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn file_tree_entry_decode_invalid_metadata() {
+        let invalid = b"invalid\x00/bin/ls";
+        let result = FileTreeEntry::decode(invalid);
+        assert!(result.is_err());
+    }
 }
