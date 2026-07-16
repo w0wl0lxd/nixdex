@@ -269,6 +269,7 @@ fn build_starting_set(packages: PackageList) -> Vec<listings::PackageEntry> {
         .collect()
 }
 
+#[allow(clippy::cognitive_complexity)]
 async fn write_listings(
     writer: &mut Writer,
     fetcher: &Fetcher,
