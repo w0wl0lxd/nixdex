@@ -4,6 +4,9 @@
 //! - magic `NIXI` + `u64` LE version `1`
 //! - zstd stream of frcode blocks
 //! - per package: file entries, then footer entry with metadata `p` and JSON `StorePath`
+//!
+//! Optional secondary index (nixdex): basename FST sidecars next to `files`
+//! (see [`crate::basename_index`]).
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
@@ -15,6 +18,7 @@ use thiserror::Error;
 
 use indexmap::IndexSet;
 
+use crate::basename_index::{BasenameIndex, BasenameIndexBuilder};
 use crate::files::{FileNode, FileTree, FileTreeEntry, FileType};
 use crate::frcode;
 use crate::store_path::StorePath;
@@ -89,20 +93,29 @@ pub enum Error {
     /// Requested functionality is not implemented yet.
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
+
+    /// Basename secondary index is missing or unreadable.
+    #[error("secondary index: {0}")]
+    SecondaryIndex(#[from] crate::basename_index::Error),
 }
 
 /// Convenience alias for this module.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Writer that creates a new NIXI database file.
+#[allow(clippy::struct_field_names)] // encoder field names mirror the stream lifecycle
 pub struct Writer {
     /// Inner encoder; `None` after finish / drop.
-    writer: Option<BufWriter<zstd::Encoder<'static, File>>>,
+    encoder: Option<BufWriter<zstd::Encoder<'static, File>>>,
+    /// Path of the NIXI `files` blob (used to place sidecars beside it).
+    path: PathBuf,
+    /// Optional basename index accumulated during `add`.
+    basename_index: BasenameIndexBuilder,
 }
 
 impl Drop for Writer {
     fn drop(&mut self) {
-        if self.writer.is_some() {
+        if self.encoder.is_some() {
             // Best-effort finish; callers should prefer `finish()` for error reporting.
             let _ = self.finish_encoder();
         }
@@ -116,14 +129,17 @@ impl Writer {
     ///
     /// Returns an I/O error if the file cannot be created or the header written.
     pub fn create<P: AsRef<Path>>(path: P, level: i32) -> Result<Self> {
-        let mut file = File::create(path)?;
+        let path = path.as_ref().to_path_buf();
+        let mut file = File::create(&path)?;
         file.write_all(FILE_MAGIC)?;
         file.write_u64::<LittleEndian>(FORMAT_VERSION)?;
         let encoder = zstd::Encoder::new(file, level)?;
         // Multithreading is optional; ignore failure on platforms that disallow it.
         // (zstd::Encoder::multithread returns Result on some versions.)
         Ok(Self {
-            writer: Some(BufWriter::new(encoder)),
+            encoder: Some(BufWriter::new(encoder)),
+            path,
+            basename_index: BasenameIndexBuilder::new(),
         })
     }
 
@@ -146,37 +162,49 @@ impl Writer {
             return Ok(());
         }
 
-        let writer = self.writer.as_mut().ok_or_else(|| {
+        let label = format!("{}.{}", path.origin().attr, path.origin().output);
+        let paths: Vec<Vec<u8>> = entries.iter().map(|e| e.path.clone()).collect();
+        self.basename_index.record_package(label, paths)?;
+
+        let stream = self.encoder.as_mut().ok_or_else(|| {
             Error::Io(io::Error::other("database writer already finished"))
         })?;
 
         let json = sonic_rs::to_vec(path).map_err(|err| Error::Json(err.to_string()))?;
-        let mut encoder = frcode::Encoder::new(writer, b"p".to_vec(), json)?;
+        let mut fr = frcode::Encoder::new(stream, b"p".to_vec(), json)?;
         for entry in entries {
-            entry.encode(&mut encoder)?;
+            entry.encode(&mut fr)?;
         }
-        encoder.finish()?;
+        fr.finish()?;
         Ok(())
     }
 
     fn finish_encoder(&mut self) -> Result<File> {
-        let writer = self.writer.take().ok_or_else(|| {
+        let buffered = self.encoder.take().ok_or_else(|| {
             Error::Io(io::Error::other("database writer already finished"))
         })?;
-        let encoder = writer
+        let encoder = buffered
             .into_inner()
             .map_err(|err| io::Error::other(err.to_string()))?;
         Ok(encoder.finish()?)
     }
 
-    /// Finish writing and return the compressed size in bytes.
+    /// Finish writing the NIXI stream and basename sidecars; return compressed size.
+    ///
+    /// Sidecars are written next to the `files` path when a parent directory exists.
     ///
     /// # Errors
     ///
-    /// Returns an I/O error if the stream cannot be finalized.
+    /// Returns an I/O or secondary-index error if finalization fails.
     pub fn finish(mut self) -> Result<u64> {
         let mut file = self.finish_encoder()?;
-        Ok(file.stream_position()?)
+        let size = file.stream_position()?;
+        if let Some(dir) = self.path.parent()
+            && !dir.as_os_str().is_empty()
+        {
+            self.basename_index.write_sidecars(dir)?;
+        }
+        Ok(size)
     }
 }
 
@@ -293,16 +321,28 @@ impl Reader {
         Ok(matches)
     }
 
-    /// Scaffold for a future FST-backed query path.
+    /// Exact-basename lookup via the optional FST secondary index.
+    ///
+    /// `pattern` is treated as a **basename** (final path component), not a full
+    /// path or regex. Returns package labels (`attr.output`) that contain a file
+    /// with that basename.
     ///
     /// # Errors
     ///
-    /// Currently always returns [`Error::NotImplemented`].
-    pub fn query_fst(&self, _pattern: &str) -> Result<Vec<String>> {
-        // FST secondary index is planned for a later wave; Wave 3 uses linear scan.
-        Err(Error::NotImplemented(
-            "database::Reader::query_fst is reserved for a future FST index",
-        ))
+    /// Returns [`Error::SecondaryIndex`] when sidecars are missing or corrupt.
+    pub fn query_fst(&self, pattern: &str) -> Result<Vec<String>> {
+        let dir = self
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| {
+                Error::SecondaryIndex(crate::basename_index::Error::Missing {
+                    dir: self.path.clone(),
+                    detail: "database path has no parent directory for sidecars".into(),
+                })
+            })?;
+        let index = BasenameIndex::open(dir)?;
+        Ok(index.lookup_basename(pattern.as_bytes())?)
     }
 }
 
@@ -579,5 +619,56 @@ mod tests {
         assert_eq!(format_grouped(1234), "1,234");
         assert_eq!(format_grouped(16_524), "16,524");
         assert_eq!(format_grouped(1_000_000), "1,000,000");
+    }
+
+    #[test]
+    fn writer_builds_fst_sidecar_queryable_by_basename() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+
+        let hello = sample_store_path();
+        let hello_tree = sample_tree();
+        let coreutils = StorePath::new(
+            "/nix/store".into(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            "coreutils-9.11".into(),
+            Origin {
+                attr: "coreutils".into(),
+                output: "out".into(),
+                toplevel: true,
+                system: Some("x86_64-linux".into()),
+            },
+        );
+        let coreutils_tree = FileTree::directory(vec![(
+            Bytes::from_static(b"bin"),
+            FileTree::directory(vec![
+                (Bytes::from_static(b"ls"), FileTree::regular(0, true)),
+                (Bytes::from_static(b"cat"), FileTree::regular(0, true)),
+            ]),
+        )]);
+
+        {
+            let mut writer = Writer::create(&db_path, 3).expect("create");
+            writer.add(&hello, &hello_tree, b"").expect("add hello");
+            writer
+                .add(&coreutils, &coreutils_tree, b"")
+                .expect("add coreutils");
+            writer.finish().expect("finish");
+        }
+
+        assert!(dir.path().join("files.basename.fst").is_file());
+        assert!(dir.path().join("files.basename.postings").is_file());
+        assert!(dir.path().join("files.packages.names").is_file());
+
+        let reader = Reader::open(&db_path).expect("reader");
+        let mut hits = reader.query_fst("ls").expect("query ls");
+        hits.sort();
+        assert_eq!(hits, vec!["coreutils.out"]);
+
+        let hello_hits = reader.query_fst("hello").expect("query hello");
+        assert_eq!(hello_hits, vec!["hello.out"]);
+
+        let none = reader.query_fst("missing-binary").expect("missing");
+        assert!(none.is_empty());
     }
 }
