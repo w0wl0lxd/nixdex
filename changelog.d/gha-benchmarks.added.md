@@ -1,0 +1,4 @@
+- Add Criterion benchmark harness (`benches/index.rs`, `benches/search.rs`, `benches/locate.rs`) and `criterion.toml`.
+- Add verification workflows for coverage, exhaustive checks, hax, Kani, and Miri.
+- Restructure `ci.yml` into fmt/check/clippy/test/deny/benchmark jobs with stable/beta and Ubuntu/macOS matrices.
+- Add Kani proof for `basename_index::read_u32_le` and set `deny.toml` `all-features = true`.
