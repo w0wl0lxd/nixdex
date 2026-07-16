@@ -443,7 +443,16 @@ impl Reader {
                     let fs = compute_frame_starts(&fm, frames.len());
                     (Some(fm), Some(fs))
                 }
-                Err(_) => (None, None), // Missing or corrupt frame_map is not fatal
+                Err(err) => {
+                    let is_missing = matches!(
+                        &err,
+                        Error::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound
+                    );
+                    if !is_missing {
+                        tracing::warn!(%err, "frame_map sidecar unreadable; falling back to full scan");
+                    }
+                    (None, None)
+                }
             }
         } else {
             (None, None)
@@ -491,43 +500,47 @@ impl Reader {
         // only decompress frames that contain at least one candidate ordinal.
         // Ordinals are only meaningful when we also know the ordinal at the start
         // of each frame, so disable the filter if the frame map is missing.
-        let filter_ordinals: Option<&IndexSet<u32>> =
-            if self.frame_starts.is_some() { package_ordinals } else { None };
-
-        let frames_to_scan: Vec<(usize, usize, Option<u32>)> = if let (Some(frame_map), Some(ordinals), Some(frame_starts)) =
-            (&self.frame_map, filter_ordinals, &self.frame_starts)
-        {
-            // Collect the set of frame indices that contain any candidate ordinal.
-            let mut needed_frames = IndexSet::new();
-            for &ord in ordinals {
-                let idx = usize::try_from(ord)
-                    .map_err(|_| Error::Corrupt("package ordinal overflow"))?;
-                if let Some(&frame_idx) = frame_map.get(idx) {
-                    needed_frames.insert(frame_idx);
-                }
-            }
-
-            // Map frame indices to (offset, len, frame_start_ordinal).
-            self.frames
-                .iter()
-                .enumerate()
-                .filter_map(|(i, (offset, len))| {
-                    let i_u32 = u32::try_from(i).ok()?;
-                    if needed_frames.contains(&i_u32) {
-                        let start_ord = frame_starts.get(i).copied();
-                        Some((*offset, *len, start_ord))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
+        let filter_ordinals: Option<&IndexSet<u32>> = if self.frame_starts.is_some() {
+            package_ordinals
         } else {
-            // No frame_map or no ordinals: scan all frames.
-            self.frames
-                .iter()
-                .map(|(offset, len)| (*offset, *len, None))
-                .collect()
+            None
         };
+
+        let frames_to_scan: Vec<(usize, usize, Option<u32>)> =
+            if let (Some(frame_map), Some(ordinals), Some(frame_starts)) =
+                (&self.frame_map, filter_ordinals, &self.frame_starts)
+            {
+                // Collect the set of frame indices that contain any candidate ordinal.
+                let mut needed_frames = IndexSet::new();
+                for &ord in ordinals {
+                    let idx = usize::try_from(ord)
+                        .map_err(|_| Error::Corrupt("package ordinal overflow"))?;
+                    if let Some(&frame_idx) = frame_map.get(idx) {
+                        needed_frames.insert(frame_idx);
+                    }
+                }
+
+                // Map frame indices to (offset, len, frame_start_ordinal).
+                self.frames
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, (offset, len))| {
+                        let i_u32 = u32::try_from(i).ok()?;
+                        if needed_frames.contains(&i_u32) {
+                            let start_ord = frame_starts.get(i).copied();
+                            Some((*offset, *len, start_ord))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                // No frame_map or no ordinals: scan all frames.
+                self.frames
+                    .iter()
+                    .map(|(offset, len)| (*offset, *len, None))
+                    .collect()
+            };
 
         let per_frame: Vec<Vec<(StorePath, FileTreeEntry)>> = frames_to_scan
             .par_iter()
@@ -684,11 +697,7 @@ fn parse_seek_table(data: &[u8], data_start: usize) -> Result<Vec<(usize, usize)
 }
 
 /// Write the frame_map sidecar for selective decompression.
-fn write_frame_map(
-    db_dir: &Path,
-    boundaries: &[usize],
-    frames: &[(usize, usize)],
-) -> Result<()> {
+fn write_frame_map(db_dir: &Path, boundaries: &[usize], frames: &[(usize, usize)]) -> Result<()> {
     let path = db_dir.join(FRAME_MAP_FILE);
     let mut file = File::create(&path)?;
 
@@ -701,12 +710,13 @@ fn write_frame_map(
     for (frame_idx, (_frame_start, frame_end)) in frames.iter().enumerate() {
         // Assign all packages whose boundaries fall within this frame.
         while boundary_idx < boundaries.len() {
-            let boundary = *boundaries.get(boundary_idx)
+            let boundary = *boundaries
+                .get(boundary_idx)
                 .ok_or(Error::Corrupt("package boundary index out of range"))?;
             if boundary <= *frame_end {
-                ordinal_to_frame.push(u32::try_from(frame_idx).map_err(|_| {
-                    Error::Corrupt("frame index overflow")
-                })?);
+                ordinal_to_frame.push(
+                    u32::try_from(frame_idx).map_err(|_| Error::Corrupt("frame index overflow"))?,
+                );
                 boundary_idx += 1;
             } else {
                 break;
@@ -716,12 +726,13 @@ fn write_frame_map(
 
     // Validate every package boundary lies inside its assigned frame.
     for (ord, &frame_idx) in ordinal_to_frame.iter().enumerate() {
-        let frame_idx_usize = usize::try_from(frame_idx)
-            .map_err(|_| Error::Corrupt("frame index overflow"))?;
+        let frame_idx_usize =
+            usize::try_from(frame_idx).map_err(|_| Error::Corrupt("frame index overflow"))?;
         let Some((frame_start, frame_end)) = frames.get(frame_idx_usize) else {
             return Err(Error::Corrupt("frame index out of range"));
         };
-        let boundary = *boundaries.get(ord)
+        let boundary = *boundaries
+            .get(ord)
             .ok_or(Error::Corrupt("package boundary index out of range"))?;
         if boundary < *frame_start || boundary > *frame_end {
             return Err(Error::Corrupt("package boundary outside assigned frame"));
@@ -731,10 +742,10 @@ fn write_frame_map(
     // Write the sidecar.
     file.write_all(FRAME_MAP_MAGIC)?;
     file.write_u32::<LittleEndian>(FRAME_MAP_VERSION)?;
-    let package_count_u32 = u32::try_from(package_count)
-        .map_err(|_| Error::Corrupt("package count overflow"))?;
-    let frame_count_u32 = u32::try_from(frame_count)
-        .map_err(|_| Error::Corrupt("frame count overflow"))?;
+    let package_count_u32 =
+        u32::try_from(package_count).map_err(|_| Error::Corrupt("package count overflow"))?;
+    let frame_count_u32 =
+        u32::try_from(frame_count).map_err(|_| Error::Corrupt("frame count overflow"))?;
     file.write_u32::<LittleEndian>(package_count_u32)?;
     file.write_u32::<LittleEndian>(frame_count_u32)?;
     for &frame_idx in &ordinal_to_frame {
@@ -780,7 +791,9 @@ fn read_frame_map(db_dir: &Path) -> Result<Vec<u32>> {
     for i in 0..package_count {
         let offset = FRAME_MAP_MAGIC.len() + 12 + i * 4;
         let frame_idx = read_u32_le(&bytes, offset)?;
-        if usize::try_from(frame_idx).map_err(|_| Error::Corrupt("frame index overflow"))? >= frame_count {
+        if usize::try_from(frame_idx).map_err(|_| Error::Corrupt("frame index overflow"))?
+            >= frame_count
+        {
             return Err(Error::Corrupt("frame index out of range"));
         }
         ordinal_to_frame.push(frame_idx);
@@ -1467,7 +1480,9 @@ mod tests {
         {
             let mut writer = Writer::create_with_version(&db_path, 1, 2).expect("create v2");
             writer.add(&hello, &hello_tree, b"").expect("add hello");
-            writer.add(&coreutils, &coreutils_tree, b"").expect("add coreutils");
+            writer
+                .add(&coreutils, &coreutils_tree, b"")
+                .expect("add coreutils");
             writer.finish().expect("finish");
         }
 
