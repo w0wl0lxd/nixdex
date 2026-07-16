@@ -11,8 +11,8 @@ publish = false
 [features]
 default = []
 cli = ["dep:clap"]
-daemon = ["dep:axum", "dep:dirs"]
-prebuilt = ["dep:dirs"]
+daemon = ["dep:axum"]
+prebuilt = []
 
 [dependencies]
 tokio = { workspace = true }
@@ -41,13 +41,11 @@ xz2 = "0.1.7"
 mmap-guard = "0.2.2"
 fastrand = "2"
 axum = { version = "0.8", features = ["json"], optional = true }
-dirs = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true }
 proptest = { workspace = true }
-dirs = { workspace = true }
 
 [lints]
 workspace = true
