@@ -82,6 +82,30 @@ pub enum Error {
         source: Box<crate::database::Error>,
     },
 
+    /// Creating a file failed.
+    #[error("creating file '{path}' failed: {source}")]
+    CreateFile {
+        /// Intended file path.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// Writing a file failed.
+    #[error("writing file '{path}' failed: {source}")]
+    WriteFile {
+        /// File path being written.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// Serializing package metadata failed.
+    #[error("serializing package metadata failed: {0}")]
+    Serialize(#[from] sonic_rs::Error),
+
     /// Local filesystem I/O failed.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
