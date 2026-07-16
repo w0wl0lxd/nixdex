@@ -569,4 +569,130 @@ mod tests {
         assert!(matches!(err, Error::Corrupt(_)));
         assert!(err.to_string().contains("too many ordinals"));
     }
+
+    #[test]
+    fn lookup_basename_empty_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let builder = BasenameIndexBuilder::new();
+        builder.write_sidecars(dir.path()).expect("write");
+
+        let index = BasenameIndex::open(dir.path()).expect("open");
+        assert_eq!(index.package_count(), 0);
+
+        let result = index.lookup_basename(b"anything").expect("lookup");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn lookup_basename_multiple_matches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut builder = BasenameIndexBuilder::new();
+
+        // Multiple packages with the same basename
+        for i in 0..5 {
+            let label = format!("pkg{}.out", i);
+            builder
+                .record_package(label, vec![b"/bin/ls".to_vec()])
+                .expect("record");
+        }
+
+        builder.write_sidecars(dir.path()).expect("write");
+
+        let index = BasenameIndex::open(dir.path()).expect("open");
+        let results = index.lookup_basename(b"ls").expect("lookup");
+        assert_eq!(results.len(), 5);
+    }
+
+    #[test]
+    fn open_missing_fst_sidecar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Create only the postings file, missing FST
+        let path = dir.path().join(POSTINGS_FILE);
+        std::fs::write(&path, b"dummy").expect("write");
+
+        let err = BasenameIndex::open(dir.path()).expect_err("should fail");
+        assert!(matches!(err, Error::Missing { .. }));
+        assert!(err.to_string().contains(FST_FILE));
+    }
+
+    #[test]
+    fn open_missing_postings_sidecar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Create only the FST file, missing postings
+        let path = dir.path().join(FST_FILE);
+        std::fs::write(&path, b"dummy").expect("write");
+
+        let err = BasenameIndex::open(dir.path()).expect_err("should fail");
+        assert!(matches!(err, Error::Missing { .. }));
+        assert!(err.to_string().contains(POSTINGS_FILE));
+    }
+
+    #[test]
+    fn open_missing_names_sidecar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Create FST and postings, missing names
+        std::fs::write(dir.path().join(FST_FILE), b"dummy").expect("write");
+        std::fs::write(dir.path().join(POSTINGS_FILE), b"dummy").expect("write");
+
+        let err = BasenameIndex::open(dir.path()).expect_err("should fail");
+        assert!(matches!(err, Error::Missing { .. }));
+        assert!(err.to_string().contains(NAMES_FILE));
+    }
+
+    #[test]
+    fn oversized_fst_sidecar_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // BasenameIndex::open checks that all sidecars exist before it validates size.
+        std::fs::write(dir.path().join(POSTINGS_FILE), &[]).expect("write");
+        std::fs::write(dir.path().join(NAMES_FILE), &[]).expect("write");
+
+        let path = dir.path().join(FST_FILE);
+        let oversized = vec![0u8; MAX_FST_BYTES + 1];
+        std::fs::write(&path, &oversized).expect("write");
+
+        let err = BasenameIndex::open(dir.path()).expect_err("should fail");
+        assert!(matches!(err, Error::Corrupt(_)));
+        assert!(err.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn oversized_postings_sidecar_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Create a minimal valid FST so the open reaches the postings size check.
+        let fst_bytes = fst::MapBuilder::memory().into_inner().expect("fst");
+        std::fs::write(dir.path().join(FST_FILE), &fst_bytes).expect("write");
+        std::fs::write(dir.path().join(NAMES_FILE), &[]).expect("write");
+
+        let path = dir.path().join(POSTINGS_FILE);
+        let oversized = vec![0u8; MAX_POSTINGS_BYTES + 1];
+        std::fs::write(&path, &oversized).expect("write");
+
+        let err = BasenameIndex::open(dir.path()).expect_err("should fail");
+        assert!(matches!(err, Error::Corrupt(_)));
+        assert!(err.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn basename_of_edge_cases() {
+        assert_eq!(basename_of(b""), b"");
+        assert_eq!(basename_of(b"file"), b"file");
+        assert_eq!(basename_of(b"/"), b"");
+        assert_eq!(basename_of(b"/file"), b"file");
+        assert_eq!(basename_of(b"/path/to/file"), b"file");
+        assert_eq!(basename_of(b"/path/to/"), b"");
+        assert_eq!(basename_of(b"//double"), b"double");
+    }
+
+    #[test]
+    fn record_package_ordinal_overflow() {
+        let mut builder = BasenameIndexBuilder::new();
+        builder.next_ordinal = u32::MAX;
+
+        let result = builder.record_package("test".into(), vec![b"/bin/test".to_vec()]);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::Corrupt(_))));
+        assert!(result.unwrap_err().to_string().contains("overflow"));
+    }
 }

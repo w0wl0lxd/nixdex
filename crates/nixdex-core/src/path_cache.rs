@@ -293,4 +293,87 @@ mod tests {
 
         assert!(PathCache::load(&path, "key").expect("load").is_none());
     }
+
+    #[test]
+    fn wrong_version_returns_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("paths.cache");
+
+        let sp = sample_path();
+        let cache = PathCache::new("key");
+        cache.insert(sp.hash().to_string(), CachedEntry::new(sp));
+        cache.save(&path).expect("save");
+
+        // Corrupt the version field
+        let mut data = std::fs::read(&path).expect("read");
+        let version_slice = data.get_mut(4..8).expect("version slice");
+        version_slice.copy_from_slice(&999u32.to_le_bytes());
+        std::fs::write(&path, &data).expect("write");
+
+        assert!(PathCache::load(&path, "key").expect("load").is_none());
+    }
+
+    #[test]
+    fn cache_key_derivation() {
+        let cache_a = PathCache::new("nixpkgs-21.11");
+        let cache_b = PathCache::new("nixpkgs-22.05");
+
+        assert_eq!(cache_a.cache_key(), "nixpkgs-21.11");
+        assert_eq!(cache_b.cache_key(), "nixpkgs-22.05");
+        assert_ne!(cache_a.cache_key(), cache_b.cache_key());
+    }
+
+    #[test]
+    fn empty_cache_lookups_return_none() {
+        let cache = PathCache::new("test");
+        assert!(cache.get("nonexistent").is_none());
+        assert!(cache.get_refs("nonexistent").is_none());
+        assert!(cache.get_tree("nonexistent").is_none());
+    }
+
+    #[test]
+    fn insert_and_retrieve_entry() {
+        let cache = PathCache::new("test");
+        let sp = sample_path();
+        let hash = sp.hash().to_string();
+
+        let mut entry = CachedEntry::new(sp.clone());
+        entry.tree = Some(FileTree::regular(100, true));
+        entry.refs = Some(vec![]);
+
+        cache.insert(hash.clone(), entry.clone());
+
+        let retrieved = cache.get(&hash).expect("entry");
+        assert_eq!(retrieved.store_path.hash(), sp.hash());
+        assert!(retrieved.tree.is_some());
+        assert!(retrieved.refs.is_some());
+    }
+
+    #[test]
+    fn corrupt_postcard_data_returns_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("paths.cache");
+
+        // Write valid magic and version, then corrupt the payload
+        let mut data = Vec::new();
+        data.extend_from_slice(MAGIC);
+        data.extend_from_slice(&VERSION.to_le_bytes());
+        data.extend_from_slice(b"invalid postcard data");
+
+        std::fs::write(&path, &data).expect("write");
+
+        let result = PathCache::load(&path, "key");
+        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::Postcard(_))));
+    }
+
+    #[test]
+    fn cached_entry_timestamp_is_set() {
+        let sp = sample_path();
+        let entry = CachedEntry::new(sp);
+        // Timestamp should be reasonably recent (within last minute)
+        let now = now_secs();
+        assert!(entry.fetched_at <= now);
+        assert!(entry.fetched_at > now.saturating_sub(60));
+    }
 }

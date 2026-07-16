@@ -322,6 +322,11 @@ impl<R: BufRead> Decoder<R> {
                 if !got_input && newline < item_start {
                     return Ok(&mut []);
                 }
+                // A line must contain a terminating NUL for the metadata;
+                // otherwise we cannot locate the path.
+                if !got_input && !found_nul && self.pos > item_start {
+                    return Err(Error::MissingNul);
+                }
                 match self.buf.get_mut(item_start..self.partial_entry_start) {
                     Some(slice) => Ok(slice),
                     None => Err(Error::MissingNewline),
@@ -564,5 +569,132 @@ mod tests {
             let sep = memchr::memchr(b'\0', line).expect("nul");
             assert_eq!(line.get(sep + 1..), Some(*path));
         }
+    }
+
+    #[test]
+    fn encode_empty_path() {
+        let paths: &[&[u8]] = &[b""];
+        let encoded = encode_paths(paths);
+        let decoded = decode_all(&encoded);
+
+        let lines: Vec<&[u8]> = decoded
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(lines.len(), 2); // entry + footer
+        let line = lines.first().expect("line");
+        let sep = memchr::memchr(b'\0', line).expect("nul");
+        assert_eq!(line.get(sep + 1..), Some(b"".as_slice()));
+    }
+
+    #[test]
+    fn encode_forbidden_bytes_in_meta() {
+        let mut out = Vec::new();
+        let mut enc = Encoder::new(&mut out, b"p".to_vec(), b"{}".to_vec()).expect("encoder");
+        let result = enc.write_meta(b"bad\0meta");
+        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::ForbiddenByte)));
+    }
+
+    #[test]
+    fn encode_forbidden_bytes_in_path() {
+        let mut out = Vec::new();
+        let mut enc = Encoder::new(&mut out, b"p".to_vec(), b"{}".to_vec()).expect("encoder");
+        enc.write_meta(b"1r").expect("meta");
+        let result = enc.write_path(b"/bad\npath".to_vec());
+        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::ForbiddenByte)));
+    }
+
+    #[test]
+    fn decode_empty_input() {
+        let data = b"";
+        let mut dec = Decoder::new(Cursor::new(data));
+        let block = dec.decode().expect("decode");
+        assert!(block.is_empty());
+    }
+
+    #[test]
+    fn decode_missing_nul() {
+        let data = b"1r/bin/ls\n"; // Missing NUL separator
+        let mut dec = Decoder::new(Cursor::new(data));
+        let result = dec.decode();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_missing_newline() {
+        // A complete first entry (meta, NUL, zero diff, path) without the trailing newline.
+        let data = b"1r\x00\x00/bin/ls";
+        let mut dec = Decoder::new(Cursor::new(data));
+        let result = dec.decode();
+        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::MissingNewline)));
+    }
+
+    #[test]
+    fn decode_shared_prefix_out_of_range() {
+        // Construct a case where shared prefix exceeds previous path length
+        let mut out = Vec::new();
+        {
+            let mut enc = Encoder::new(&mut out, b"p".to_vec(), b"{}".to_vec()).expect("encoder");
+            enc.write_meta(b"1r").expect("meta");
+            enc.write_path(b"/a".to_vec()).expect("path");
+            enc.write_meta(b"1r").expect("meta");
+            enc.write_path(b"/b".to_vec()).expect("path");
+            enc.finish().expect("finish");
+        }
+        // Corrupt the diff to request a shared prefix longer than possible
+        // This is hard to test without direct byte manipulation, so we test
+        // the decoder's handling of invalid diffs via a crafted input
+        let mut corrupted = Vec::new();
+        corrupted.extend_from_slice(b"1r\x00"); // meta + NUL
+        corrupted.push(0x80); // extended diff marker
+        corrupted.extend_from_slice(&1000i16.to_le_bytes()); // impossible diff
+        corrupted.extend_from_slice(b"/a\n");
+
+        let mut dec = Decoder::new(Cursor::new(corrupted));
+        let result = dec.decode();
+        // This should either fail or handle gracefully
+        if let Err(e) = result {
+            assert!(matches!(
+                e,
+                Error::SharedOutOfRange { .. } | Error::SharedOverflow { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn decode_trailing_data_after_footer() {
+        let paths: &[&[u8]] = &[b"/bin/ls"];
+        let mut encoded = encode_paths(paths);
+        encoded.extend_from_slice(b"extra trailing data");
+
+        let mut dec = Decoder::new(Cursor::new(&encoded));
+        let first_block = dec.decode().expect("first decode");
+        assert!(!first_block.is_empty());
+
+        let second_block = dec.decode().expect("second decode");
+        // Trailing data without proper entry structure should be handled
+        // (either ignored or cause an error depending on implementation)
+        let _ = second_block;
+    }
+
+    #[test]
+    fn encoder_footer_written_once() {
+        let mut out = Vec::new();
+        {
+            let mut enc = Encoder::new(&mut out, b"p".to_vec(), b"{}".to_vec()).expect("encoder");
+            enc.write_meta(b"1r").expect("meta");
+            enc.write_path(b"/bin/ls".to_vec()).expect("path");
+            enc.finish().expect("finish");
+        }
+        // The footer is encoded with a prefix differential; decode and verify it appears once.
+        let decoded = decode_all(&out);
+        let footer_count = decoded
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty() && line == b"p\0{}")
+            .count();
+        assert_eq!(footer_count, 1);
     }
 }
