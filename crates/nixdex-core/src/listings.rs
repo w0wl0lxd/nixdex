@@ -165,6 +165,11 @@ impl ListingSource for CachedSource {
 /// narinfo causes a synthetic `/bin/<main_program>` listing to be emitted
 /// instead of being skipped.
 ///
+/// When `filter_prefix` starts with `/bin/`, the fetcher does not recurse into
+/// runtime dependencies: each package's own `/bin/` entries live in its own
+/// store path, so dependency traversal is unnecessary for command-not-found
+/// style databases and is the dominant source of network work.
+///
 /// When `path_cache` is `Some`, fetched narinfo references and `.ls` trees are
 /// looked up from the cache before making HTTP requests and written back on
 /// misses.
@@ -175,15 +180,17 @@ pub async fn fetch_listings(
     jobs: usize,
     input: mpsc::Receiver<PackageEntry>,
     path_cache: Option<Arc<PathCache>>,
+    filter_prefix: &[u8],
 ) -> Result<mpsc::Receiver<Result<ListingItem>>> {
+    let prefix = Bytes::copy_from_slice(filter_prefix);
     if let Some(cache) = path_cache {
         let source = CachedSource {
             inner: fetcher.clone(),
             cache,
         };
-        fetch_listings_with_source(&source, jobs, input).await
+        fetch_listings_with_source(&source, jobs, input, prefix).await
     } else {
-        fetch_listings_with_source(fetcher, jobs, input).await
+        fetch_listings_with_source(fetcher, jobs, input, prefix).await
     }
 }
 
@@ -191,6 +198,7 @@ async fn fetch_listings_with_source<S: ListingSource>(
     source: &S,
     jobs: usize,
     mut input: mpsc::Receiver<PackageEntry>,
+    filter_prefix: Bytes,
 ) -> Result<mpsc::Receiver<Result<ListingItem>>> {
     let jobs = jobs.max(1);
     let (out_tx, out_rx) = mpsc::channel::<Result<ListingItem>>(jobs * 2);
@@ -257,10 +265,12 @@ async fn fetch_listings_with_source<S: ListingSource>(
                 let notify = Arc::clone(&notify);
                 let out_tx = out_tx.clone();
 
+                let prefix = filter_prefix.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     if let Some(item) =
-                        process_path(&source, &entry, &queue, &seen, &in_flight, &notify).await
+                        process_path(&source, &entry, &queue, &seen, &in_flight, &notify, prefix)
+                            .await
                     {
                         let _ = out_tx.send(Ok(item)).await;
                     }
@@ -286,8 +296,10 @@ async fn process_path<S: ListingSource>(
     seen: &SccHashMap<String, Option<String>, ahash::RandomState>,
     in_flight: &AtomicUsize,
     notify: &Notify,
+    filter_prefix: Bytes,
 ) -> Option<ListingItem> {
-    let result = process_path_inner(source, entry, queue, seen, in_flight, notify).await;
+    let result =
+        process_path_inner(source, entry, queue, seen, in_flight, notify, filter_prefix).await;
 
     let remaining = in_flight.fetch_sub(1, Ordering::SeqCst);
     if remaining == 1 {
@@ -305,6 +317,7 @@ async fn process_path_inner<S: ListingSource>(
     seen: &SccHashMap<String, Option<String>, ahash::RandomState>,
     in_flight: &AtomicUsize,
     notify: &Notify,
+    filter_prefix: Bytes,
 ) -> Option<ListingItem> {
     let path = &entry.path;
     let main_program_string = entry.main_program.clone().or_else(|| {
@@ -315,33 +328,40 @@ async fn process_path_inner<S: ListingSource>(
         .as_deref()
         .filter(|mp| is_valid_main_program(mp));
 
-    let refs = match source.fetch_narinfo_details(path).await {
-        Ok((refs, _nar_url)) => refs,
-        Err(err) => {
-            if err.is_not_found() {
-                if let Some(mp) = main_program {
-                    return Some((path.clone(), synthesize_main_program(mp)));
-                }
-            } else {
-                warn!(path = %path, error = %err, "failed to fetch narinfo; skipping");
-            }
-            return None;
-        }
-    };
+    // For command-not-found-style `/bin/` indexes, a package's own `/bin/`
+    // entries live in its own store path; recursing into every dependency
+    // (and fetching their `.ls` listings) is the dominant cost and not needed.
+    let shallow = filter_prefix.starts_with(b"/bin/");
 
-    for r in refs {
-        let hash = r.hash().to_string();
-        let is_new = match seen.entry_sync(hash) {
-            SccMapEntry::Occupied(_) => false,
-            SccMapEntry::Vacant(vacant) => {
-                vacant.insert_entry(None);
-                true
+    if !shallow {
+        let refs = match source.fetch_narinfo_details(path).await {
+            Ok((refs, _nar_url)) => refs,
+            Err(err) => {
+                if err.is_not_found() {
+                    if let Some(mp) = main_program {
+                        return Some((path.clone(), synthesize_main_program(mp)));
+                    }
+                } else {
+                    warn!(path = %path, error = %err, "failed to fetch narinfo; skipping");
+                }
+                return None;
             }
         };
-        if is_new {
-            in_flight.fetch_add(1, Ordering::SeqCst);
-            queue.lock().await.push_back(PackageEntry::new(r));
-            notify.notify_one();
+
+        for r in refs {
+            let hash = r.hash().to_string();
+            let is_new = match seen.entry_sync(hash) {
+                SccMapEntry::Occupied(_) => false,
+                SccMapEntry::Vacant(vacant) => {
+                    vacant.insert_entry(None);
+                    true
+                }
+            };
+            if is_new {
+                in_flight.fetch_add(1, Ordering::SeqCst);
+                queue.lock().await.push_back(PackageEntry::new(r));
+                notify.notify_one();
+            }
         }
     }
 
@@ -454,6 +474,7 @@ mod tests {
             &source,
             2,
             input_channel(vec![PackageEntry::new(a.clone())]),
+            Bytes::new(),
         )
         .await
         .expect("start");
@@ -492,6 +513,7 @@ mod tests {
             &source,
             2,
             input_channel(vec![PackageEntry::new(a.clone())]),
+            Bytes::new(),
         )
         .await
         .expect("start");
@@ -524,6 +546,7 @@ mod tests {
             &source,
             2,
             input_channel(vec![PackageEntry::new(a.clone())]),
+            Bytes::new(),
         )
         .await
         .expect("start");
@@ -556,6 +579,7 @@ mod tests {
                 path: a.clone(),
                 main_program: Some("foo".to_string()),
             }]),
+            Bytes::new(),
         )
         .await
         .expect("start");
@@ -593,6 +617,7 @@ mod tests {
                 path: a.clone(),
                 main_program: Some("foo".to_string()),
             }]),
+            Bytes::new(),
         )
         .await
         .expect("start");
@@ -628,6 +653,7 @@ mod tests {
                 path: a.clone(),
                 main_program: Some("foo".to_string()),
             }]),
+            Bytes::new(),
         )
         .await
         .expect("start");
@@ -656,6 +682,7 @@ mod tests {
                 path: a.clone(),
                 main_program: Some("foo/bar".to_string()),
             }]),
+            Bytes::new(),
         )
         .await
         .expect("start");

@@ -83,6 +83,13 @@ struct SearchOpts {
     #[arg(long)]
     exact: bool,
 
+    /// Use fuzzy matching with relevance scoring (skim v2 algorithm).
+    ///
+    /// This ranks results by how well the pattern matches the selected field(s)
+    /// and cannot be combined with `--regex` or `--exact`.
+    #[arg(long, conflicts_with_all = ["regex", "exact"])]
+    fuzzy: bool,
+
     /// Which fields to search: `attr`, `description`, `main-program`, or `both`.
     #[arg(short, long, default_value = "both")]
     field: SearchField,
@@ -144,8 +151,10 @@ fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
     }
 
     let db = SearchDb::open(&sidecar).wrap_err("failed to load package metadata sidecar")?;
-    let matches = db
-        .search(
+    let matches = if opts.fuzzy {
+        db.search_fuzzy(&opts.pattern, opts.field, opts.case_sensitive, opts.limit)
+    } else {
+        db.search(
             &opts.pattern,
             opts.regex,
             opts.field,
@@ -153,7 +162,8 @@ fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
             opts.exact,
             opts.limit,
         )
-        .wrap_err("search failed")?;
+    }
+    .wrap_err("search failed")?;
 
     if opts.count {
         println!("{}", matches.len());

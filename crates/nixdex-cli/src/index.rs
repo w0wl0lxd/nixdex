@@ -41,6 +41,23 @@ pub struct Args {
     #[arg(short = 's', long, value_name = "platform")]
     pub system: Option<String>,
 
+    /// Pass a Nix function to `nix-eval-jobs --select` to filter or transform the
+    /// evaluation root before attribute traversal.
+    #[arg(long, value_name = "EXPR")]
+    pub select: Option<String>,
+
+    /// Pass `--no-instantiate` to `nix-eval-jobs` for faster read-only evaluation.
+    ///
+    /// This is most useful with `--only-eval`, since it may leave output paths
+    /// uninstantiated.
+    #[arg(long)]
+    pub no_instantiate: bool,
+
+    /// Disable `nix-eval-jobs --check-cache-status` to avoid blocking eval
+    /// workers on narinfo lookups.
+    #[arg(long)]
+    pub no_check_cache_status: bool,
+
     /// Zstandard compression level (1–22).
     #[arg(short, long = "compression", default_value = "19", value_parser = clap::value_parser!(i32).range(1..=22))]
     pub compression_level: i32,
@@ -56,6 +73,13 @@ pub struct Args {
     /// Only add paths starting with PREFIX (for example `/bin/`).
     #[arg(long, default_value = "")]
     pub filter_prefix: String,
+
+    /// Build a small database containing only files under `/bin/`.
+    ///
+    /// This is equivalent to `--filter-prefix /bin/` and is much faster to build
+    /// and query for command-not-found use cases.
+    #[arg(long)]
+    pub small: bool,
 
     /// Store and load results of the fetch phase in `paths.cache`.
     #[arg(long)]
@@ -141,15 +165,31 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
         return Ok(());
     }
 
+    let filter_prefix = if args.small {
+        if !args.filter_prefix.is_empty() && args.filter_prefix != "/bin/" {
+            color_eyre::eyre::bail!(
+                "--small is incompatible with --filter-prefix '{}'",
+                args.filter_prefix
+            );
+        }
+        String::from("/bin/")
+    } else {
+        args.filter_prefix
+    };
+
     let options = nixdex_core::index::UpdateOptions {
         jobs: args.jobs,
         database: args.database,
         nixpkgs: args.nixpkgs,
         system: args.system,
+        select: args.select,
+        no_instantiate: args.no_instantiate,
+        check_cache_status: !args.no_check_cache_status,
         compression_level: args.compression_level,
         format_version: args.format_version,
         show_trace: args.show_trace,
-        filter_prefix: args.filter_prefix,
+        filter_prefix,
+        small: args.small,
         path_cache: args.path_cache,
         force: args.force,
         cache_key: args.cache_key,
