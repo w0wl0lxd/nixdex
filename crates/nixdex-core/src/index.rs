@@ -339,7 +339,7 @@ impl IndexBuilder {
         {
             Ok(result) => result,
             Err(err) => {
-                eval_handle.abort();
+                stream.eval.abort();
                 return Err(err);
             }
         };
