@@ -41,3 +41,10 @@ secrets:
     fi
 
 validate: secrets fmt check clippy test
+
+benchmark:
+    cargo bench --bench search
+    @echo "Run 'just benchmark-index <nixpkgs> [eval|full] [runs]' for a full index build benchmark."
+
+benchmark-index NIXPKGS='<nixpkgs>' MODE='eval' RUNS='1':
+    ./scripts/benchmark-index.sh '{{NIXPKGS}}' '{{MODE}}' '{{RUNS}}'

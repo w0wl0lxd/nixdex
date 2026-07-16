@@ -1,0 +1,89 @@
+name: benchmark
+
+on:
+  # Run fast SearchDb benchmark on PRs so regressions are caught, but keep
+  # heavy full index benchmarks for off-peak scheduled runs.
+  pull_request:
+  # Run benchmarks off-peak on a dedicated runner schedule to reduce
+  # resource contention and get stable wall-clock numbers.
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      nixpkgs:
+        description: 'nixpkgs expression or path to benchmark'
+        required: true
+        default: '<nixpkgs>'
+      mode:
+        description: 'benchmark mode: eval (only nixpkgs eval) or full (eval + fetch + write)'
+        required: true
+        default: 'eval'
+      runs:
+        description: 'number of hyperfine runs'
+        required: true
+        default: '1'
+
+permissions:
+  contents: read
+
+# Only one benchmark workflow at a time so runner resources are not
+# competing with another instance of this same benchmark.
+concurrency:
+  group: benchmark
+  cancel-in-progress: false
+
+jobs:
+  searchdb-benchmark:
+    name: SearchDb criterion benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SCCACHE_DIR: /home/runner/.cache/sccache
+      SCCACHE_CACHE_SIZE: 2G
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sccache clang mold
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run SearchDb criterion benchmark
+        run: cargo bench --bench search
+      - name: Upload Criterion report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: criterion-report
+          path: target/criterion/
+
+  index-benchmark:
+    name: nixdex index benchmark
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    timeout-minutes: 360
+    needs: searchdb-benchmark
+    env:
+      SCCACHE_DIR: /home/runner/.cache/sccache
+      SCCACHE_CACHE_SIZE: 2G
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sccache clang mold
+      - uses: cachix/install-nix-action@v27
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and run index benchmark
+        run: |
+          nix-shell -p nix-eval-jobs hyperfine --run \
+            "./scripts/benchmark-index.sh '${{ github.event.inputs.nixpkgs || '<nixpkgs>' }}' '${{ github.event.inputs.mode || 'eval' }}' '${{ github.event.inputs.runs || '1' }}'"
+      - name: Upload benchmark report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: index-benchmark-report
+          path: /tmp/nixdex-bench-*.md
