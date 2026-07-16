@@ -31,7 +31,12 @@
             craneLib.filterCargoSources path type
             || (
               inCratesCliAssets
-              && (base == "assets" || base == "command-not-found.sh" || base == "command-not-found.nu" || base == "command-not-found.fish")
+              && (
+                base == "assets"
+                || base == "command-not-found.sh"
+                || base == "command-not-found.nu"
+                || base == "command-not-found.fish"
+              )
             );
         };
 
