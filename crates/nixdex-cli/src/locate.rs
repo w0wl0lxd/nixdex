@@ -2,13 +2,14 @@
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::OnceLock;
 
 use clap::Parser;
 use color_eyre::eyre::WrapErr;
 use tracing_subscriber::EnvFilter;
 
-use nixdex_core::database::{SearchMode, SearchOptions};
+use nixdex_core::database::{SearchMode, SearchOptions, SearchSort};
 use nixdex_core::{ALL_FILE_TYPES, FileType};
 
 /// Resolve the default nix-index database directory.
@@ -98,6 +99,18 @@ pub struct Opts {
     /// Print the number of matches instead of the matches themselves.
     #[arg(long)]
     pub count: bool,
+
+    /// Sort results: `size`, `size-asc`, `size-desc`, or `attr`/`attr-asc`.
+    #[arg(long)]
+    pub sort: Option<String>,
+
+    /// Only print files with size >= MIN_SIZE bytes.
+    #[arg(long)]
+    pub min_size: Option<u64>,
+
+    /// Only print files with size <= MAX_SIZE bytes.
+    #[arg(long)]
+    pub max_size: Option<u64>,
 }
 
 /// Processed form of the CLI options ready for the core search API.
@@ -114,9 +127,12 @@ struct ProcessedArgs {
     json: bool,
     limit: Option<usize>,
     count: bool,
+    sort: nixdex_core::database::SearchSort,
+    min_size: Option<u64>,
+    max_size: Option<u64>,
 }
 
-fn process_args(matches: Opts) -> ProcessedArgs {
+fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
     let start_anchor = if matches.at_root { "^" } else { "" };
     let end_anchor = if matches.whole_name { "$" } else { "" };
     let as_regex = matches.regex;
@@ -197,7 +213,13 @@ fn process_args(matches: Opts) -> ProcessedArgs {
         }
     };
 
-    ProcessedArgs {
+    let sort = match matches.sort {
+        Some(s) => SearchSort::from_str(&s)
+            .map_err(|err| color_eyre::eyre::eyre!("invalid --sort value '{s}': {err}"))?,
+        None => SearchSort::None,
+    };
+
+    Ok(ProcessedArgs {
         database: matches.database,
         pattern,
         hash: matches.hash,
@@ -210,7 +232,10 @@ fn process_args(matches: Opts) -> ProcessedArgs {
         json: matches.json,
         limit: matches.limit,
         count: matches.count,
-    }
+        sort,
+        min_size: matches.min_size,
+        max_size: matches.max_size,
+    })
 }
 
 /// Run a file lookup against the nixdex database.
@@ -220,7 +245,7 @@ pub fn run(matches: Opts) -> color_eyre::Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .try_init();
 
-    let args = process_args(matches);
+    let args = process_args(matches)?;
 
     let options = SearchOptions {
         database: args.database,
@@ -235,6 +260,9 @@ pub fn run(matches: Opts) -> color_eyre::Result<()> {
         json: args.json,
         limit: args.limit,
         count: args.count,
+        sort: args.sort,
+        min_size: args.min_size,
+        max_size: args.max_size,
     };
 
     nixdex_core::search_database(&options).wrap_err("nix-locate failed")?;

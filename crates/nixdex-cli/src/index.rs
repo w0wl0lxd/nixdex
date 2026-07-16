@@ -121,6 +121,10 @@ pub struct Args {
     )]
     pub extra_scopes: Vec<String>,
 
+    /// Base URL of the Nix binary cache to fetch listings from.
+    #[arg(long, default_value_t = String::from(nixdex_core::CACHE_URL))]
+    pub cache_url: String,
+
     /// Download a prebuilt `files` database instead of evaluating nixpkgs.
     #[arg(long)]
     pub download_prebuilt: bool,
@@ -198,6 +202,7 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
         main_program: !args.no_main_program,
         extra_scopes: args.extra_scopes,
         only_eval: args.only_eval,
+        cache_url: args.cache_url,
     };
 
     nixdex_core::update_index(&options)

@@ -57,6 +57,10 @@ enum Cmd {
     Index(index::Args),
     /// Find files in nixpkgs packages (alias for `nix-locate`).
     Locate(locate::Opts),
+    /// Find the package that provides a command (similar to `which`).
+    Which(WhichOpts),
+    /// Download the latest prebuilt index.
+    Update(UpdateOpts),
     /// Run the background daemon (alias for `nixdex-daemon`).
     Daemon(DaemonOpts),
 }
@@ -141,6 +145,43 @@ struct CompletionsOpts {
     /// Shell for which to generate completions.
     #[arg(value_enum)]
     shell: Shell,
+}
+
+/// Options for `nixdex which`.
+#[derive(Debug, Parser)]
+#[command(author, about, version)]
+struct WhichOpts {
+    /// Command to locate (e.g. `hello` or `/bin/hello`).
+    #[arg(value_name = "COMMAND")]
+    cmd: String,
+
+    /// Directory where the index is stored.
+    #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
+    database: PathBuf,
+}
+
+/// Options for `nixdex update`.
+#[derive(Debug, Parser)]
+#[command(author, about, version)]
+struct UpdateOpts {
+    /// Directory where the index is stored.
+    #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
+    database: PathBuf,
+
+    /// Release URL pattern for nix-index-database.
+    #[arg(
+        long,
+        default_value = "https://github.com/nix-community/nix-index-database/releases/latest/download"
+    )]
+    release_url: String,
+
+    /// Architecture identifier (e.g., x86_64-linux).
+    #[arg(long, default_value = "x86_64-linux")]
+    architecture: String,
+
+    /// Download the `-small` prebuilt variant.
+    #[arg(long)]
+    small: bool,
 }
 
 /// Options for running the background daemon.
@@ -267,6 +308,66 @@ fn run_info(opts: InfoOpts) -> color_eyre::Result<()> {
     Ok(())
 }
 
+fn run_which(opts: WhichOpts) -> color_eyre::Result<()> {
+    let cmd = opts.cmd;
+    let files = opts.database.join("files");
+    let reader = nixdex_core::database::Reader::open(&files)
+        .wrap_err_with(|| format!("failed to open index at {}", files.display()))?;
+
+    let full_path = if cmd.starts_with('/') {
+        cmd.clone()
+    } else {
+        format!("/bin/{cmd}")
+    };
+    let pattern = format!("^{}$", regex::escape(&full_path));
+    let re = regex::bytes::Regex::new(&pattern).wrap_err("invalid path pattern")?;
+
+    let results = reader
+        .search_entries(&re, None, None, None, None)
+        .map_err(|err| color_eyre::eyre::eyre!("search failed: {err}"))?;
+
+    for (store_path, entry) in results {
+        if entry.node.is_executable() {
+            println!("{}", format_which_attr(&store_path));
+            return Ok(());
+        }
+    }
+
+    color_eyre::eyre::bail!("no package found for command '{}'", cmd)
+}
+
+fn format_which_attr(store_path: &nixdex_core::StorePath) -> String {
+    let mut attr = format!(
+        "{}.{}",
+        store_path.origin().attr,
+        store_path.origin().output
+    );
+    if !store_path.origin().toplevel {
+        attr = format!("({attr})");
+    }
+    attr
+}
+
+async fn run_update(opts: UpdateOpts) -> color_eyre::Result<()> {
+    let config = nixdex_core::prebuilt::PrebuiltConfig {
+        release_url: opts.release_url,
+        architecture: opts.architecture,
+        small: opts.small,
+        cache_dir: opts.database.clone(),
+        refresh_interval: std::time::Duration::ZERO,
+    };
+    let dest = opts.database.join("files");
+
+    nixdex_core::prebuilt::download_to(&config, &dest)
+        .await
+        .wrap_err("failed to download prebuilt index")?;
+
+    nixdex_core::generate_sidecars(&dest).wrap_err("failed to generate sidecars")?;
+
+    println!("updated index at {}", opts.database.display());
+    Ok(())
+}
+
 fn run_completions(opts: CompletionsOpts) {
     let mut cmd = Opts::command();
     let name = cmd.get_name().to_string();
@@ -345,6 +446,8 @@ async fn main() -> color_eyre::Result<()> {
         }
         Cmd::Index(index_opts) => index::run(index_opts).await,
         Cmd::Locate(locate_opts) => locate::run(locate_opts),
+        Cmd::Which(which_opts) => run_which(which_opts),
+        Cmd::Update(update_opts) => run_update(update_opts).await,
         Cmd::Daemon(daemon_opts) => run_daemon(daemon_opts).await,
     }
 }
