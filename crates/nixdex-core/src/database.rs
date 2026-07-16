@@ -241,7 +241,11 @@ impl Writer {
                 file.write_all(&compressed)?;
             }
             2 => {
-                let frames = frame_ranges(&raw, &self.boundaries, parallelism);
+                let frames = frame_ranges(&raw, &self.boundaries, parallelism)?;
+
+                if frames.len() > MAX_FRAME_COUNT {
+                    return Err(Error::Corrupt("frame count exceeds maximum"));
+                }
 
                 let slices: Vec<&[u8]> = frames
                     .iter()
@@ -313,9 +317,13 @@ impl Writer {
 
 /// Split `raw` frcode data into contiguous frame ranges, grouped at package
 /// boundaries and targeting one frame per available CPU.
-fn frame_ranges(raw: &[u8], boundaries: &[usize], parallelism: usize) -> Vec<(usize, usize)> {
+fn frame_ranges(
+    raw: &[u8],
+    boundaries: &[usize],
+    parallelism: usize,
+) -> Result<Vec<(usize, usize)>> {
     if raw.is_empty() || boundaries.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let target = (raw.len() / parallelism).max(1);
@@ -325,7 +333,10 @@ fn frame_ranges(raw: &[u8], boundaries: &[usize], parallelism: usize) -> Vec<(us
     for &end in boundaries {
         // Each range must end at a package boundary. Once we reach the target
         // size, cut the frame and start the next one.
-        if end - start >= target {
+        let len = end
+            .checked_sub(start)
+            .ok_or(Error::Corrupt("package boundary out of order"))?;
+        if len >= target {
             ranges.push((start, end));
             start = end;
         }
@@ -335,7 +346,7 @@ fn frame_ranges(raw: &[u8], boundaries: &[usize], parallelism: usize) -> Vec<(us
         ranges.push((start, raw.len()));
     }
 
-    ranges
+    Ok(ranges)
 }
 
 /// Reader that opens an existing NIXI database file.
@@ -358,11 +369,13 @@ impl Reader {
     /// Returns an error if the path does not exist or is not a valid database.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path_buf = path.as_ref().to_path_buf();
-        let data = fs::read(&path_buf)?;
 
-        if data.len() as u64 > MAX_DATABASE_BYTES {
+        let metadata = fs::metadata(&path_buf)?;
+        if metadata.len() > MAX_DATABASE_BYTES {
             return Err(Error::Corrupt("database file exceeds maximum size"));
         }
+
+        let data = fs::read(&path_buf)?;
 
         if data.len() < DATA_START {
             return Err(Error::Corrupt("database file too short for header"));
