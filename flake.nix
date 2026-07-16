@@ -42,6 +42,16 @@
             cargoExtraArgs = "-p nixdex-cli";
             doCheck = true;
             cargoTestExtraArgs = "-p nixdex-core";
+
+            postInstall = ''
+              mkdir -p $out/etc/profile.d
+              substitute ${src}/crates/nixdex-cli/assets/command-not-found.sh \
+                $out/etc/profile.d/command-not-found.sh \
+                --replace-fail "@out@" "$out"
+              chmod +x $out/etc/profile.d/command-not-found.sh
+              install -Dm444 ${src}/crates/nixdex-cli/assets/command-not-found.nu \
+                $out/etc/profile.d/command-not-found.nu
+            '';
           }
         );
       in
@@ -88,5 +98,28 @@
           '';
         };
       }
-    );
+    )
+    // {
+      nixosModules.default =
+        {
+          config,
+          lib,
+          pkgs,
+          ...
+        }:
+        import ./nix/nixos-module.nix { package = self.packages.${pkgs.system}.nixdex or pkgs.nixdex; } {
+          inherit config lib pkgs;
+        };
+
+      homeModules.default =
+        {
+          config,
+          lib,
+          pkgs,
+          ...
+        }:
+        import ./nix/home-module.nix { package = self.packages.${pkgs.system}.nixdex or pkgs.nixdex; } {
+          inherit config lib pkgs;
+        };
+    };
 }
