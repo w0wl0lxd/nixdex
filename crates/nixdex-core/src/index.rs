@@ -6,11 +6,11 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
+use crate::CACHE_URL;
 use crate::database::Writer;
 use crate::errors::{Error, Result};
 use crate::hydra::Fetcher;
 use crate::nixpkgs;
-use crate::CACHE_URL;
 
 /// Options controlling an index build.
 #[derive(Debug, Clone)]

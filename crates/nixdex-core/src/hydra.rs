@@ -4,9 +4,9 @@ use std::io::Read;
 
 use thiserror::Error;
 
+use crate::CACHE_URL;
 use crate::files::FileTree;
 use crate::store_path::{Origin, StorePath};
-use crate::CACHE_URL;
 
 /// Errors that can occur when talking to a binary cache.
 #[derive(Error, Debug)]
@@ -98,10 +98,7 @@ impl Fetcher {
             .await
             .map_err(|err| Error::Request(format!("{url}: {err}")))?;
         if !response.status().is_success() {
-            return Err(Error::Request(format!(
-                "{url}: HTTP {}",
-                response.status()
-            )));
+            return Err(Error::Request(format!("{url}: HTTP {}", response.status())));
         }
         let bytes = response
             .bytes()
@@ -138,10 +135,7 @@ impl Fetcher {
             .await
             .map_err(|err| Error::Request(format!("{url}: {err}")))?;
         if !response.status().is_success() {
-            return Err(Error::Request(format!(
-                "{url}: HTTP {}",
-                response.status()
-            )));
+            return Err(Error::Request(format!("{url}: HTTP {}", response.status())));
         }
         response
             .text()

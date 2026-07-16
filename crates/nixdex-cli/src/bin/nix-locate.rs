@@ -9,7 +9,7 @@ use color_eyre::eyre::WrapErr;
 use tracing_subscriber::EnvFilter;
 
 use nixdex_core::database::{SearchMode, SearchOptions};
-use nixdex_core::{FileType, ALL_FILE_TYPES};
+use nixdex_core::{ALL_FILE_TYPES, FileType};
 
 /// Resolve the default cache directory for the nixdex database.
 fn cache_dir() -> &'static str {

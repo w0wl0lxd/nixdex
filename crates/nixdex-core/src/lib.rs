@@ -12,7 +12,7 @@ pub mod nixpkgs;
 pub mod store_path;
 
 pub use errors::{Error, Result};
-pub use files::{FileEntries, FileNode, FileTree, FileTreeEntry, FileType, ALL_FILE_TYPES};
+pub use files::{ALL_FILE_TYPES, FileEntries, FileNode, FileTree, FileTreeEntry, FileType};
 pub use hydra::Fetcher;
 pub use nixpkgs::{
     EvalJob, EvalJobLine, EvalJobsOptions, PackageList, eval_expr_for_nixpkgs,

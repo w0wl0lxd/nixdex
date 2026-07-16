@@ -26,6 +26,7 @@ zstd = "0.13"
 bytes = { version = "1", features = ["serde"] }
 byteorder = "1"
 regex = "1"
+regex-syntax = "0.8"
 
 # Databases and indexing
 redb = "2.2"
