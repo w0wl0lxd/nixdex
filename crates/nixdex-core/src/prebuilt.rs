@@ -9,7 +9,7 @@ use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 
 use crate::basename_index::BasenameIndex;
-use crate::database::FILE_MAGIC;
+use crate::database::{FILE_MAGIC, generate_sidecars};
 
 /// Errors that can occur during prebuilt index management.
 #[derive(Error, Debug)]
@@ -193,12 +193,16 @@ pub async fn download_to(config: &PrebuiltConfig, dest: &Path) -> Result<()> {
     validate_nixi(&temp_path)?;
     tokio::fs::rename(&temp_path, dest).await?;
 
-    // The prebuilt asset does not include basename sidecars. Remove any
-    // stale sidecars left behind by a previous nixdex-generated database so
-    // `nix-locate` falls back to a full scan instead of using old ordinals.
-    for suffix in ["basename.fst", "basename.postings"] {
-        let _ = tokio::fs::remove_file(dest.with_extension(suffix)).await;
-    }
+    // Generate nixdex sidecars for fast basename lookups.
+    // This is CPU-bound, so we use spawn_blocking to avoid blocking the async runtime.
+    let dest_clone = dest.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        if let Err(err) = generate_sidecars(&dest_clone) {
+            tracing::warn!(error = %err, "failed to generate sidecars for prebuilt index");
+        }
+    })
+    .await
+    .map_err(|err| Error::Io(std::io::Error::other(err.to_string())))?;
 
     Ok(())
 }
