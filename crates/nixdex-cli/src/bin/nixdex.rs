@@ -476,42 +476,24 @@ fn run_completions(opts: CompletionsOpts) {
 }
 
 async fn run_daemon(opts: DaemonOpts) -> color_eyre::Result<()> {
-    let mut args: Vec<String> = Vec::new();
-    if let Some(cache_dir) = opts.cache_dir {
-        args.push("--cache-dir".into());
-        args.push(cache_dir.to_string_lossy().into_owned());
-    }
-    args.extend([
-        "--release-url".into(),
-        opts.release_url,
-        "--architecture".into(),
-        opts.architecture,
-        "--interval".into(),
-        opts.interval.to_string(),
-        "--http-addr".into(),
-        opts.http_addr,
-    ]);
-    if opts.small {
-        args.push("--small".into());
-    }
-    if let Some(database) = opts.database {
-        args.push("--database".into());
-        args.push(database.to_string_lossy().into_owned());
-    }
+    let cache_dir = opts
+        .cache_dir
+        .unwrap_or_else(|| nixdex_core::nixdex_dir().join("prebuilt"));
+    let config = nixdex_core::daemon::DaemonConfig {
+        prebuilt: nixdex_core::prebuilt::PrebuiltConfig {
+            release_url: opts.release_url,
+            architecture: opts.architecture,
+            small: opts.small,
+            cache_dir,
+            refresh_interval: std::time::Duration::from_secs(opts.interval),
+        },
+        http_addr: opts.http_addr,
+        local_database: opts.database,
+    };
 
-    let mut child = tokio::process::Command::new("nixdex-daemon")
-        .args(args)
-        .spawn()
-        .wrap_err("failed to spawn `nixdex-daemon`; is it installed and on PATH?")?;
-
-    let status = child
-        .wait()
+    nixdex_core::daemon::run(&config)
         .await
-        .wrap_err("failed to wait for `nixdex-daemon`")?;
-
-    if let Some(code) = status.code() {
-        std::process::exit(code);
-    }
+        .wrap_err("nixdex-daemon failed")?;
 
     Ok(())
 }

@@ -31,6 +31,7 @@ use crate::basename_index::{
 };
 use crate::files::{FileNode, FileTree, FileTreeEntry, FileType};
 use crate::frcode;
+use crate::nixpkgs::PackageMeta;
 use crate::path_index::{PathIndex, PathIndexBuilder};
 use crate::store_path::StorePath;
 
@@ -1492,6 +1493,8 @@ struct MinimalMatchJson {
 /// Print a single search result according to `SearchMode` and color settings.
 ///
 /// Mutates `printed_attrs` for `--minimal` de-duplication.
+///
+/// Returns `true` if a line was actually emitted.
 #[allow(clippy::print_stdout)] // search is a CLI-facing printer for now
 fn print_match(
     options: &SearchOptions<'_>,
@@ -1499,11 +1502,11 @@ fn print_match(
     printed_attrs: &mut IndexSet<String>,
     store_path: &StorePath,
     entry: &FileTreeEntry,
-) {
+) -> bool {
     let attr = format_attr(store_path);
 
     if options.json {
-        print_match_json(options, printed_attrs, store_path, entry, &attr);
+        print_match_json(options, printed_attrs, store_path, entry, &attr)
     } else {
         print_match_text(
             options,
@@ -1512,7 +1515,7 @@ fn print_match(
             store_path,
             entry,
             &attr,
-        );
+        )
     }
 }
 
@@ -1523,7 +1526,7 @@ fn print_match_json(
     store_path: &StorePath,
     entry: &FileTreeEntry,
     attr: &str,
-) {
+) -> bool {
     match options.mode {
         SearchMode::Minimal => {
             if printed_attrs.insert(attr.into()) {
@@ -1532,8 +1535,10 @@ fn print_match_json(
                 };
                 if let Ok(line) = sonic_rs::to_string(&record) {
                     println!("{line}");
+                    return true;
                 }
             }
+            false
         }
         SearchMode::Full { .. } => {
             let (kind, size) = match &entry.node {
@@ -1552,6 +1557,9 @@ fn print_match_json(
             };
             if let Ok(line) = sonic_rs::to_string(&record) {
                 println!("{line}");
+                true
+            } else {
+                false
             }
         }
     }
@@ -1565,12 +1573,14 @@ fn print_match_text(
     store_path: &StorePath,
     entry: &FileTreeEntry,
     attr: &str,
-) {
+) -> bool {
     match options.mode {
         SearchMode::Minimal => {
             if printed_attrs.insert(attr.into()) {
                 println!("{attr}");
+                return true;
             }
+            false
         }
         SearchMode::Full { color, .. } => {
             let (typ, size) = match &entry.node {
@@ -1609,6 +1619,7 @@ fn print_match_text(
             } else {
                 println!("{path_str}");
             }
+            true
         }
     }
 }
@@ -1712,14 +1723,15 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
             break;
         }
 
-        print_match(
+        if print_match(
             options,
             &path_pattern,
             &mut printed_attrs,
             &store_path,
             &entry,
-        );
-        printed += 1;
+        ) {
+            printed += 1;
+        }
     }
 
     if options.count {
@@ -1731,12 +1743,14 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
 
 /// Generate nixdex sidecars for an existing NIXI database.
 ///
-/// Reads the `files` database at `db_path`, extracts all package basenames,
-/// and writes the sidecar files (`files.basename.fst`, `files.basename.postings`,
-/// `files.packages.names`, `files.frame_map`) to the same directory.
+/// Reads the `files` database at `db_path`, extracts all package basenames and
+/// metadata, and writes the sidecar files (`files.basename.fst`,
+/// `files.basename.postings`, `files.basename.names`, `files.frame_map`,
+/// `packages.json`) to the same directory.
 ///
-/// This enables fast basename lookups via `BasenameIndex` for prebuilt indexes
-/// downloaded from upstream nix-index-database releases.
+/// This enables fast basename lookups via `BasenameIndex` and package search
+/// via `SearchDb` for prebuilt indexes downloaded from upstream
+/// nix-index-database releases.
 ///
 /// # Errors
 ///
@@ -1752,6 +1766,7 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
     // Scan all frames to extract package paths and build the basename index.
     let mut builder = BasenameIndexBuilder::new();
     let mut all_package_labels: Vec<String> = Vec::new();
+    let mut all_package_meta: Vec<PackageMeta> = Vec::new();
 
     for (offset, len) in &reader.frames {
         let start = *offset;
@@ -1768,7 +1783,12 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
                 .map_err(Error::Io)?
         };
 
-        scan_frame_for_packages(&raw, &mut builder, &mut all_package_labels)?;
+        scan_frame_for_packages(
+            &raw,
+            &mut builder,
+            &mut all_package_labels,
+            &mut all_package_meta,
+        )?;
     }
 
     // Write basename sidecars.
@@ -1781,6 +1801,10 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
         write_frame_map(db_dir, frame_map, reader.frames.len())?;
     }
 
+    // Synthesize a packages.json sidecar from package footers so that
+    // package metadata search works for prebuilt file-only indexes.
+    write_packages_json(db_dir, &all_package_meta)?;
+
     tracing::info!(
         db_path = %db_path.display(),
         packages = all_package_labels.len(),
@@ -1790,11 +1814,27 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Write a `packages.json` NDJSON sidecar from extracted package metadata.
+fn write_packages_json(db_dir: &Path, packages: &[PackageMeta]) -> Result<()> {
+    let path = db_dir.join("packages.json");
+    let file = std::fs::File::create(&path).map_err(Error::Io)?;
+    let mut writer = std::io::BufWriter::new(file);
+
+    for package in packages {
+        let line = sonic_rs::to_string(package).map_err(|err| Error::Json(err.to_string()))?;
+        writeln!(writer, "{line}").map_err(Error::Io)?;
+    }
+
+    writer.flush().map_err(Error::Io)?;
+    Ok(())
+}
+
 /// Scan a single frame's frcode data to extract package paths.
 fn scan_frame_for_packages(
     raw: &[u8],
     builder: &mut BasenameIndexBuilder,
     all_package_labels: &mut Vec<String>,
+    all_package_meta: &mut Vec<PackageMeta>,
 ) -> Result<()> {
     let mut decoder = frcode::Decoder::new(std::io::Cursor::new(raw));
     let mut current_paths: Vec<Vec<u8>> = Vec::new();
@@ -1822,6 +1862,12 @@ fn scan_frame_for_packages(
                         })?;
                     let label = format!("{}.{}", pkg.origin().attr, pkg.origin().output);
                     all_package_labels.push(label.clone());
+                    all_package_meta.push(PackageMeta {
+                        attr: pkg.origin().attr.clone(),
+                        name: pkg.name().to_string(),
+                        description: None,
+                        main_program: None,
+                    });
                     builder
                         .record_package(label, current_paths.clone())
                         .map_err(Error::SecondaryIndex)?;
