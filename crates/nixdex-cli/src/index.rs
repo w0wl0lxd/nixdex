@@ -115,10 +115,10 @@ pub struct Args {
 
 /// Run the index build.
 pub async fn run(args: Args) -> color_eyre::Result<()> {
-    color_eyre::install()?;
-    tracing_subscriber::fmt()
+    let _ = color_eyre::install().ok();
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
-        .init();
+        .try_init();
 
     if args.download_prebuilt {
         let config = nixdex_core::prebuilt::PrebuiltConfig {

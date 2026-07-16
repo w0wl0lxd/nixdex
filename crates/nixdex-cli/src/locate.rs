@@ -168,10 +168,10 @@ fn process_args(matches: Opts) -> ProcessedArgs {
 
 /// Run a file lookup against the nixdex database.
 pub fn run(matches: Opts) -> color_eyre::Result<()> {
-    color_eyre::install()?;
-    tracing_subscriber::fmt()
+    let _ = color_eyre::install().ok();
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
-        .init();
+        .try_init();
 
     let args = process_args(matches);
 
