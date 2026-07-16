@@ -10,10 +10,11 @@ publish = false
 
 [dependencies]
 clap = { workspace = true }
+dirs = { workspace = true }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
 color-eyre = { workspace = true }
-nixdex-core = { workspace = true }
+nixdex-core = { workspace = true, features = ["daemon", "prebuilt"] }
 
 [lints]
 workspace = true
