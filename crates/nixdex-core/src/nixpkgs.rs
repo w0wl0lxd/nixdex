@@ -74,6 +74,8 @@ pub struct EvalJobsOptions<'a> {
     pub check_cache_status: bool,
     /// Whether to pass `--show-trace` to Nix.
     pub show_trace: bool,
+    /// Whether to pass `--meta` to `nix-eval-jobs` to fetch `meta.mainProgram`.
+    pub meta: bool,
     /// Optional attribute path suffix for extra scopes (e.g. `haskellPackages`).
     /// When set, the evaluated expression becomes `(root).<scope>`.
     pub scope: Option<&'a str>,
@@ -269,9 +271,8 @@ pub fn eval_expr_for_nixpkgs(value: &str, scope: Option<&str>) -> Result<String>
         validate_scope(scope)?;
     }
 
-    let root = if value.starts_with('<') && value.ends_with('>') {
+    let root = if let Some(inner) = value.strip_prefix('<').and_then(|v| v.strip_suffix('>')) {
         // Only allow simple alphanumeric path lookups, not `<foo/../../../x>`.
-        let inner = &value[1..value.len() - 1];
         if inner.is_empty()
             || !inner
                 .chars()
@@ -356,8 +357,10 @@ pub async fn run_eval_jobs(options: &EvalJobsOptions<'_>) -> Result<Vec<EvalJobL
     if options.show_trace {
         cmd.arg("--show-trace");
     }
-    // `meta.mainProgram` is needed to synthesize `/bin/<mainProgram>` listings.
-    cmd.arg("--meta");
+    if options.meta {
+        // `meta.mainProgram` is needed to synthesize `/bin/<mainProgram>` listings.
+        cmd.arg("--meta");
+    }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = cmd
@@ -438,6 +441,7 @@ pub async fn list_packages_with_scopes(
     system: Option<&str>,
     extra_scopes: &[String],
     show_trace: bool,
+    main_program: bool,
 ) -> Result<PackageList> {
     let root_opts = EvalJobsOptions {
         nixpkgs,
@@ -445,6 +449,7 @@ pub async fn list_packages_with_scopes(
         select: None,
         check_cache_status: true,
         show_trace,
+        meta: main_program,
         scope: None,
     };
     let mut merged = list_packages_async(&root_opts).await?;
@@ -462,6 +467,7 @@ pub async fn list_packages_with_scopes(
             select: None,
             check_cache_status: true,
             show_trace,
+            meta: main_program,
             scope: Some(scope.as_str()),
         };
         match list_packages_async(&scope_opts).await {
@@ -487,6 +493,7 @@ pub fn list_packages(
     system: Option<&str>,
     extra_scopes: &[String],
     show_trace: bool,
+    main_program: bool,
 ) -> Result<PackageList> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -496,6 +503,7 @@ pub fn list_packages(
         system,
         extra_scopes,
         show_trace,
+        main_program,
     ))
 }
 

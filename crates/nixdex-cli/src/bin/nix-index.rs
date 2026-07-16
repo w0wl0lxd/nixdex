@@ -71,6 +71,18 @@ struct Args {
     #[arg(long)]
     path_cache: bool,
 
+    /// Ignore the existing `paths.cache` and re-fetch all store paths.
+    #[arg(long)]
+    force: bool,
+
+    /// Cache-key used to identify a `paths.cache` file; defaults to `nixpkgs`.
+    #[arg(long)]
+    cache_key: Option<String>,
+
+    /// Do not synthesize `/bin/<mainProgram>` listings from `meta.mainProgram`.
+    #[arg(long)]
+    no_main_program: bool,
+
     /// Additional nixpkgs scopes to include.
     #[arg(
         long,
@@ -102,6 +114,9 @@ async fn main() -> color_eyre::Result<()> {
         show_trace: args.show_trace,
         filter_prefix: args.filter_prefix,
         path_cache: args.path_cache,
+        force: args.force,
+        cache_key: args.cache_key,
+        main_program: !args.no_main_program,
         extra_scopes: args.extra_scopes,
     };
 

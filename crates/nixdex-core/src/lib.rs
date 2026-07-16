@@ -12,6 +12,7 @@ pub mod hydra;
 pub mod index;
 pub mod listings;
 pub mod nixpkgs;
+pub mod path_cache;
 pub mod store_path;
 
 pub use errors::{Error, Result};
@@ -27,7 +28,7 @@ pub use store_path::{Origin, StorePath};
 pub const CACHE_URL: &str = "https://cache.nixos.org";
 
 /// Maximum uncompressed size accepted from a single zstd frame (defensive cap).
-pub(crate) const MAX_ZSTD_FRAME_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const MAX_ZSTD_FRAME_BYTES: usize = 512 * 1024 * 1024;
 
 /// Maximum back-reference window log for zstd decoders (defensive cap).
 ///

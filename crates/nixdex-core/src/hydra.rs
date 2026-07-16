@@ -1,6 +1,8 @@
 //! Fetching file listings and references from the Nix binary cache.
 
 use std::io::Read;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use reqwest::header::{self, HeaderValue};
@@ -50,6 +52,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Fetcher {
     base_url: String,
     client: reqwest::Client,
+    bytes_downloaded: Arc<AtomicU64>,
 }
 
 impl Fetcher {
@@ -69,7 +72,11 @@ impl Fetcher {
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|err| Error::Request(err.to_string()))?;
-        Ok(Self { base_url, client })
+        Ok(Self {
+            base_url,
+            client,
+            bytes_downloaded: Arc::new(AtomicU64::new(0)),
+        })
     }
 
     /// Create a fetcher targeting the default binary cache.
@@ -79,6 +86,12 @@ impl Fetcher {
     /// Propagates construction errors from [`Self::new`].
     pub fn default_cache() -> Result<Self> {
         Self::new(CACHE_URL)
+    }
+
+    /// Total number of bytes downloaded from the binary cache so far.
+    #[must_use]
+    pub fn bytes_downloaded(&self) -> u64 {
+        self.bytes_downloaded.load(Ordering::Relaxed)
     }
 
     /// Return the configured base URL.
@@ -164,6 +177,10 @@ impl Fetcher {
             .bytes()
             .await
             .map_err(|err| Error::Request(err.to_string()))?;
+        let downloaded = u64::try_from(bytes.len())
+            .map_err(|_| Error::Request("response body length overflow".into()))?;
+        self.bytes_downloaded
+            .fetch_add(downloaded, Ordering::Relaxed);
         decompress_listing(&bytes)
     }
 
@@ -189,10 +206,15 @@ impl Fetcher {
     pub async fn fetch_narinfo(&self, path: &StorePath) -> Result<String> {
         let url = self.narinfo_url(path);
         let response = self.get_with_retry(&url).await?;
-        response
+        let text = response
             .text()
             .await
-            .map_err(|err| Error::Request(err.to_string()))
+            .map_err(|err| Error::Request(err.to_string()))?;
+        let downloaded = u64::try_from(text.len())
+            .map_err(|_| Error::Request("narinfo body length overflow".into()))?;
+        self.bytes_downloaded
+            .fetch_add(downloaded, Ordering::Relaxed);
+        Ok(text)
     }
 
     /// Fetch the narinfo for a store path and parse its references and `.nar` URL.
