@@ -3,9 +3,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use indicatif::{MultiProgress, ProgressBar};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::CACHE_URL;
@@ -13,7 +14,7 @@ use crate::database::Writer;
 use crate::errors::{Error, Result};
 use crate::hydra::Fetcher;
 use crate::listings;
-use crate::nixpkgs::{self, PackageList};
+use crate::nixpkgs;
 use crate::path_cache::PathCache;
 
 /// Options controlling an index build.
@@ -97,22 +98,50 @@ impl IndexBuilder {
         &self.options
     }
 
-    /// Run the index build: evaluate packages, fetch `.ls` trees, write NIXI DB.
+    /// Spawn an async task that evaluates nixpkgs and streams
+    /// [`PackageEntry`] values into a channel.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if the database directory cannot be created, evaluation
-    /// fails hard, or the writer cannot be finalized.
-    #[allow(clippy::cognitive_complexity)]
-    pub async fn build(&self) -> Result<()> {
+    /// Returns the task handle and the receiver to be passed to the listing
+    /// fetcher.
+    fn spawn_package_eval_stream(
+        &self,
+    ) -> (
+        tokio::task::JoinHandle<nixpkgs::Result<(usize, Duration)>>,
+        mpsc::Receiver<listings::PackageEntry>,
+    ) {
+        let opts = &self.options;
+        let (pkg_tx, pkg_rx) = mpsc::channel(1024);
+        let nixpkgs_expr = opts.nixpkgs.clone();
+        let system = opts.system.clone();
+        let extra_scopes = opts.extra_scopes.clone();
+        let show_trace = opts.show_trace;
+        let main_program = opts.main_program;
+
+        let handle = tokio::spawn(async move {
+            let start = Instant::now();
+            let count = nixpkgs::stream_package_entries(
+                &nixpkgs_expr,
+                system.as_deref(),
+                &extra_scopes,
+                show_trace,
+                main_program,
+                pkg_tx,
+            )
+            .await?;
+            Ok((count, start.elapsed()))
+        });
+
+        (handle, pkg_rx)
+    }
+
+    /// Prepare the output database directory, `paths.cache`, and `Writer`.
+    fn prepare_database(&self) -> Result<(PathBuf, Writer, Option<Arc<PathCache>>, PathBuf)> {
         let opts = &self.options;
 
         std::fs::create_dir_all(&opts.database).map_err(|source| Error::CreateDatabaseDir {
             path: opts.database.clone(),
             source,
         })?;
-
-        let clock = quanta::Clock::new();
 
         let cache_path = opts
             .path_cache_file
@@ -131,75 +160,111 @@ impl IndexBuilder {
         );
 
         let db_file = opts.database.join("files");
-        let mut writer =
+        let writer =
             Writer::create_with_version(&db_file, opts.compression_level, opts.format_version)
                 .map_err(|source| Error::CreateDatabase {
                     path: db_file.clone(),
                     source: Box::new(source),
                 })?;
 
-        let progress = MultiProgress::new();
+        Ok((db_file, writer, path_cache, cache_path))
+    }
 
-        let eval_pb = progress.add(ProgressBar::new_spinner());
-        eval_pb.set_message("Evaluating nixpkgs...");
-        let eval_start = clock.now();
-        let packages = nixpkgs::list_packages_with_scopes(
-            &opts.nixpkgs,
-            opts.system.as_deref(),
-            &opts.extra_scopes,
-            opts.show_trace,
-            opts.main_program,
-        )
-        .await
-        .map_err(|source| Error::QueryPackages {
-            source: Box::new(source),
-        })?;
-        let eval_elapsed = eval_start.elapsed();
-        eval_pb.finish_with_message(format!(
-            "Evaluated {} package(s) in {:?}",
-            packages.packages.len(),
-            eval_elapsed
-        ));
-
-        let fetcher = Fetcher::new(CACHE_URL).map_err(|err| {
+    /// Build a fresh binary-cache fetcher.
+    fn new_fetcher() -> Result<Fetcher> {
+        Fetcher::new(CACHE_URL).map_err(|err| {
             Error::Io(std::io::Error::other(format!(
                 "failed to create binary-cache client: {err}"
             )))
-        })?;
+        })
+    }
 
-        let starting_set = build_starting_set(packages);
+    /// Await the eval stream task and translate errors into the workspace type.
+    async fn await_eval(
+        handle: tokio::task::JoinHandle<nixpkgs::Result<(usize, Duration)>>,
+    ) -> Result<(usize, Duration)> {
+        match handle.await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(source)) => Err(Error::QueryPackages {
+                source: Box::new(source),
+            }),
+            Err(err) => Err(Error::Io(std::io::Error::other(format!(
+                "eval task panicked: {err}"
+            )))),
+        }
+    }
+
+    /// Persist the `paths.cache` sidecar if the user enabled it.
+    #[allow(clippy::cognitive_complexity)]
+    fn maybe_save_path_cache(
+        enabled: bool,
+        path_cache: Option<&Arc<PathCache>>,
+        cache_path: &Path,
+    ) {
+        if !enabled {
+            return;
+        }
+        match path_cache {
+            Some(pc) => {
+                if let Err(err) = pc.save(cache_path) {
+                    warn!(error = %err, "failed to save path cache");
+                }
+            }
+            None => warn!("path cache enabled but not initialized"),
+        }
+    }
+
+    /// Run the index build: evaluate packages, fetch `.ls` trees, write NIXI DB.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database directory cannot be created, evaluation
+    /// fails hard, or the writer cannot be finalized.
+    pub async fn build(&self) -> Result<()> {
+        let opts = &self.options;
+
+        let (db_file, mut writer, path_cache, cache_path) = self.prepare_database()?;
+        let progress = MultiProgress::new();
+        let eval_pb = progress.add(ProgressBar::new_spinner());
+        eval_pb.set_message("Evaluating nixpkgs...");
+
+        let (eval_handle, pkg_rx) = self.spawn_package_eval_stream();
+        let fetcher = Self::new_fetcher()?;
         let filter_prefix = opts.filter_prefix.as_bytes().to_vec();
-        let (indexed, failed, fetch_elapsed) = write_listings(
+        let (indexed, failed, fetch_elapsed) = match write_listings(
             &mut writer,
             &fetcher,
             opts.jobs.max(1),
-            starting_set,
+            pkg_rx,
             path_cache.clone(),
             filter_prefix,
             &db_file,
             &progress,
         )
-        .await?;
-
-        let cached = path_cache
-            .as_ref()
-            .map_or(0, |pc| pc.hits.load(Ordering::Relaxed));
-
-        if opts.path_cache {
-            if let Some(pc) = path_cache.as_ref() {
-                if let Err(err) = pc.save(&cache_path) {
-                    warn!(error = %err, "failed to save path cache");
-                }
-            } else {
-                warn!("path cache enabled but not initialized");
+        .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                eval_handle.abort();
+                return Err(err);
             }
-        }
+        };
+
+        let (eval_count, eval_elapsed) = Self::await_eval(eval_handle).await?;
+        eval_pb.finish_with_message(format!(
+            "Evaluated {eval_count} package(s) in {eval_elapsed:?}"
+        ));
+
+        Self::maybe_save_path_cache(opts.path_cache, path_cache.as_ref(), &cache_path);
 
         let size = writer.finish().map_err(|source| Error::WriteDatabase {
             path: db_file.clone(),
             source: Box::new(source),
         })?;
 
+        let cached = path_cache
+            .as_ref()
+            .map_or(0, |pc| pc.hits.load(Ordering::Relaxed));
         let bytes_downloaded = fetcher.bytes_downloaded();
 
         info!(
@@ -248,93 +313,31 @@ fn load_path_cache(
     }
 }
 
-fn build_starting_set(packages: PackageList) -> Vec<listings::PackageEntry> {
-    packages
-        .packages
-        .into_iter()
-        .flat_map(|pkg| {
-            let main_program = pkg.main_program.clone();
-            pkg.store_paths.into_iter().map(move |path| {
-                let mp = if path.origin().output == "out" {
-                    main_program.clone()
-                } else {
-                    None
-                };
-                listings::PackageEntry {
-                    path,
-                    main_program: mp,
-                }
-            })
-        })
-        .collect()
+/// Flush the in-memory writer chunk once it exceeds the configured threshold.
+fn maybe_flush_chunk(writer: &mut Writer, db_file: &Path, chunk_bytes: u64) -> Result<()> {
+    if writer.estimated_size() > chunk_bytes {
+        tracing::debug!(
+            estimated_bytes = writer.estimated_size(),
+            "chunk size reached, flushing v2 frame"
+        );
+        writer
+            .flush_chunk()
+            .map_err(|source| Error::WriteDatabase {
+                path: db_file.to_path_buf(),
+                source: Box::new(source),
+            })?;
+    }
+    Ok(())
 }
 
-#[allow(clippy::cognitive_complexity)]
-async fn write_listings(
-    writer: &mut Writer,
-    fetcher: &Fetcher,
-    jobs: usize,
-    starting_set: Vec<listings::PackageEntry>,
-    path_cache: Option<Arc<PathCache>>,
-    filter_prefix: Vec<u8>,
-    db_file: &Path,
-    progress: &MultiProgress,
-) -> Result<(usize, usize, Duration)> {
-    // Flush raw packages to a v2 frame once the in-memory chunk reaches 256 MiB.
-    const CHUNK_BYTES: u64 = 256 * 1024 * 1024;
-
-    let fetch_pb = progress.add(ProgressBar::new_spinner());
-    fetch_pb.set_message("Fetching listings...");
-    let fetch_start = quanta::Instant::now();
-
-    let mut listings = listings::fetch_listings(fetcher, jobs, starting_set, path_cache)
-        .await
-        .map_err(|source| {
-            Error::Io(std::io::Error::other(format!(
-                "failed to start listing fetcher: {source}"
-            )))
-        })?;
-
-    let mut indexed = 0usize;
-    let mut failed = 0usize;
-    let mut bytes_written = 0u64;
-
-    while let Some(result) = listings.recv().await {
-        match result {
-            Ok((store_path, tree)) => {
-                let before_len = writer.estimated_size();
-                writer
-                    .add(&store_path, &tree, &filter_prefix)
-                    .map_err(|source| Error::WriteDatabase {
-                        path: db_file.to_path_buf(),
-                        source: Box::new(source),
-                    })?;
-                let after_len = writer.estimated_size();
-                bytes_written += after_len.saturating_sub(before_len);
-                indexed += 1;
-
-                if writer.estimated_size() > CHUNK_BYTES {
-                    tracing::debug!(
-                        estimated_bytes = writer.estimated_size(),
-                        "chunk size reached, flushing v2 frame"
-                    );
-                    writer
-                        .flush_chunk()
-                        .map_err(|source| Error::WriteDatabase {
-                            path: db_file.to_path_buf(),
-                            source: Box::new(source),
-                        })?;
-                }
-            }
-            Err(err) => {
-                warn!(error = %err, "closure fetch yielded an error; skipping");
-                failed += 1;
-            }
-        }
-        fetch_pb.set_message(format!("Indexed {indexed}, failed {failed}"));
-        fetch_pb.inc(1);
-    }
-    let fetch_elapsed = fetch_start.elapsed();
+/// Finalize the listing fetch progress bar and emit the completion log line.
+fn finish_fetch_progress(
+    fetch_pb: ProgressBar,
+    indexed: usize,
+    failed: usize,
+    bytes_written: u64,
+    fetch_elapsed: Duration,
+) {
     let packages_per_sec = if fetch_elapsed.as_secs_f64() > 0.0 {
         let elapsed_secs = fetch_elapsed.as_secs_f64();
         let indexed_u64 = match u64::try_from(indexed) {
@@ -359,6 +362,62 @@ async fn write_listings(
         "Fetched {indexed} listings ({failed} failed) in {:?}",
         fetch_elapsed
     ));
+}
+
+async fn write_listings(
+    writer: &mut Writer,
+    fetcher: &Fetcher,
+    jobs: usize,
+    package_input: mpsc::Receiver<listings::PackageEntry>,
+    path_cache: Option<Arc<PathCache>>,
+    filter_prefix: Vec<u8>,
+    db_file: &Path,
+    progress: &MultiProgress,
+) -> Result<(usize, usize, Duration)> {
+    // Flush raw packages to a v2 frame once the in-memory chunk reaches 256 MiB.
+    const CHUNK_BYTES: u64 = 256 * 1024 * 1024;
+
+    let fetch_pb = progress.add(ProgressBar::new_spinner());
+    fetch_pb.set_message("Fetching listings...");
+    let fetch_start = quanta::Instant::now();
+
+    let mut listings = listings::fetch_listings(fetcher, jobs, package_input, path_cache)
+        .await
+        .map_err(|source| {
+            Error::Io(std::io::Error::other(format!(
+                "failed to start listing fetcher: {source}"
+            )))
+        })?;
+
+    let mut indexed = 0usize;
+    let mut failed = 0usize;
+    let mut bytes_written = 0u64;
+
+    while let Some(result) = listings.recv().await {
+        match result {
+            Ok((store_path, tree)) => {
+                let before_len = writer.estimated_size();
+                writer
+                    .add(&store_path, &tree, &filter_prefix)
+                    .map_err(|source| Error::WriteDatabase {
+                        path: db_file.to_path_buf(),
+                        source: Box::new(source),
+                    })?;
+                let after_len = writer.estimated_size();
+                bytes_written += after_len.saturating_sub(before_len);
+                indexed += 1;
+                maybe_flush_chunk(writer, db_file, CHUNK_BYTES)?;
+            }
+            Err(err) => {
+                warn!(error = %err, "closure fetch yielded an error; skipping");
+                failed += 1;
+            }
+        }
+        fetch_pb.set_message(format!("Indexed {indexed}, failed {failed}"));
+        fetch_pb.inc(1);
+    }
+    let fetch_elapsed = fetch_start.elapsed();
+    finish_fetch_progress(fetch_pb, indexed, failed, bytes_written, fetch_elapsed);
 
     Ok((indexed, failed, fetch_elapsed))
 }

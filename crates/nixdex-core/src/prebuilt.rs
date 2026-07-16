@@ -66,10 +66,7 @@ impl Default for PrebuiltConfig {
 impl PrebuiltConfig {
     #[cfg(feature = "prebuilt")]
     fn default_cache_dir() -> PathBuf {
-        dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from(".cache"))
-            .join("nixdex")
-            .join("prebuilt")
+        crate::nixdex_dir().join("prebuilt")
     }
 
     #[cfg(not(feature = "prebuilt"))]

@@ -3,6 +3,7 @@
 use std::io::{self, Read};
 
 pub mod basename_index;
+pub mod cache_dir;
 pub mod daemon;
 pub mod database;
 pub mod errors;
@@ -16,6 +17,7 @@ pub mod path_cache;
 pub mod prebuilt;
 pub mod store_path;
 
+pub use cache_dir::{nix_index_dir, nixdex_dir};
 pub use errors::{Error, Result};
 pub use files::{ALL_FILE_TYPES, FileEntries, FileNode, FileTree, FileTreeEntry, FileType};
 pub use hydra::Fetcher;

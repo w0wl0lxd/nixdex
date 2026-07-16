@@ -42,7 +42,6 @@ indicatif = { version = "0.18.4", default-features = false, features = [
 # Databases and indexing
 fst = "0.4"
 roaring = "0.10"
-dirs = "6"
 
 # Concurrency and collections
 memchr = "2.7"
