@@ -33,6 +33,9 @@ const MAX_NAME_BYTES: usize = 64 * 1024;
 /// Maximum total size of the postings sidecar (defensive cap).
 const MAX_POSTINGS_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Maximum total size of the FST sidecar (defensive cap).
+const MAX_FST_BYTES: u64 = 128 * 1024 * 1024;
+
 /// Sidecar basenames relative to the database directory.
 pub const FST_FILE: &str = "files.basename.fst";
 /// Postings table filename.
@@ -206,6 +209,9 @@ impl BasenameIndex {
         }
 
         let fst_bytes = std::fs::read(&fst_path)?;
+        if fst_bytes.len() > MAX_FST_BYTES as usize {
+            return Err(Error::Corrupt("fst file too large".into()));
+        }
         let map = Map::new(fst_bytes).map_err(|err| Error::Fst(err.to_string()))?;
 
         let postings = std::fs::read(&postings_path)?;
