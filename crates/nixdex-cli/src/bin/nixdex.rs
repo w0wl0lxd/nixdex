@@ -392,8 +392,6 @@ async fn run_update(opts: UpdateOpts) -> color_eyre::Result<()> {
         .await
         .wrap_err("failed to download prebuilt index")?;
 
-    nixdex_core::generate_sidecars(&dest).wrap_err("failed to generate sidecars")?;
-
     println!("updated index at {}", opts.database.display());
     Ok(())
 }
