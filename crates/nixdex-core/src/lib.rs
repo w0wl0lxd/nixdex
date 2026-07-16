@@ -13,6 +13,7 @@ pub mod hydra;
 pub mod index;
 pub mod listings;
 pub mod nixpkgs;
+pub mod package_search;
 pub mod path_cache;
 pub mod prebuilt;
 pub mod store_path;
@@ -22,8 +23,8 @@ pub use errors::{Error, Result};
 pub use files::{ALL_FILE_TYPES, FileEntries, FileNode, FileTree, FileTreeEntry, FileType};
 pub use hydra::Fetcher;
 pub use nixpkgs::{
-    EvalJob, EvalJobLine, EvalJobsOptions, Package, PackageList, eval_expr_for_nixpkgs,
-    list_packages_with_scopes,
+    EvalJob, EvalJobLine, EvalJobsOptions, Package, PackageList, PackageMeta,
+    eval_expr_for_nixpkgs, list_packages_with_scopes,
 };
 pub use store_path::{Origin, StorePath};
 
