@@ -12,7 +12,6 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::CACHE_URL;
 use crate::database::{Writer, read_attrs_sidecar};
 use crate::errors::{Error, Result};
 use crate::hydra::Fetcher;
@@ -87,6 +86,8 @@ pub struct UpdateOptions {
     pub extra_scopes: Vec<String>,
     /// Only evaluate nixpkgs; do not fetch listings or write the files database.
     pub only_eval: bool,
+    /// Base URL of the Nix binary cache to fetch listings from.
+    pub cache_url: String,
 }
 
 impl Default for UpdateOptions {
@@ -117,6 +118,7 @@ impl Default for UpdateOptions {
                 String::from("texlive.pkgs"),
             ],
             only_eval: false,
+            cache_url: crate::CACHE_URL.to_string(),
         }
     }
 }
@@ -308,8 +310,8 @@ impl IndexBuilder {
     }
 
     /// Build a fresh binary-cache fetcher.
-    fn new_fetcher() -> Result<Fetcher> {
-        Fetcher::new(CACHE_URL).map_err(|err| {
+    fn new_fetcher(&self) -> Result<Fetcher> {
+        Fetcher::new(&self.options.cache_url).map_err(|err| {
             Error::Io(std::io::Error::other(format!(
                 "failed to create binary-cache client: {err}"
             )))
@@ -403,7 +405,7 @@ impl IndexBuilder {
         eval_pb.set_message("Evaluating nixpkgs...");
 
         let stream = self.spawn_package_eval_stream();
-        let fetcher = Self::new_fetcher()?;
+        let fetcher = self.new_fetcher()?;
         let filter_prefix = if opts.small && opts.filter_prefix.is_empty() {
             b"/bin/".to_vec()
         } else {
