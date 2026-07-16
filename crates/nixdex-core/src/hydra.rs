@@ -116,6 +116,7 @@ impl Fetcher {
     ///
     /// Retries on timeouts, connection errors, and HTTP 5xx responses.
     /// HTTP 404 and other client errors are not retried.
+    /// Uses exponential backoff with jitter.
     async fn get_with_retry(&self, url: &str) -> Result<reqwest::Response> {
         const MAX_ATTEMPTS: u32 = 5;
         let mut backoff = Duration::from_secs(1);
@@ -138,7 +139,9 @@ impl Fetcher {
                     }
                     if status.is_server_error() && attempt < MAX_ATTEMPTS {
                         tracing::warn!(url, attempt, status = %status, "server error, retrying");
-                        tokio::time::sleep(backoff).await;
+                        let jitter_ms = fastrand::u64(0..=500);
+                        let jitter = Duration::from_millis(jitter_ms);
+                        tokio::time::sleep(backoff + jitter).await;
                         backoff = (backoff * 2).min(max_backoff);
                         continue;
                     }
@@ -151,7 +154,9 @@ impl Fetcher {
                     let is_transient = err.is_timeout() || err.is_connect();
                     if is_transient && attempt < MAX_ATTEMPTS {
                         tracing::warn!(url, attempt, error = %err, "transient request error, retrying");
-                        tokio::time::sleep(backoff).await;
+                        let jitter_ms = fastrand::u64(0..=500);
+                        let jitter = Duration::from_millis(jitter_ms);
+                        tokio::time::sleep(backoff + jitter).await;
                         backoff = (backoff * 2).min(max_backoff);
                         continue;
                     }

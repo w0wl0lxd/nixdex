@@ -52,7 +52,7 @@ struct Args {
     system: Option<String>,
 
     /// Zstandard compression level (1–22).
-    #[arg(short, long = "compression", default_value = "22", value_parser = clap::value_parser!(i32).range(1..=22))]
+    #[arg(short, long = "compression", default_value = "19", value_parser = clap::value_parser!(i32).range(1..=22))]
     compression_level: i32,
 
     /// On-disk database format version (1 or 2).
@@ -78,6 +78,14 @@ struct Args {
     /// Cache-key used to identify a `paths.cache` file; defaults to `nixpkgs`.
     #[arg(long)]
     cache_key: Option<String>,
+
+    /// Path to the `paths.cache` file; defaults to `<database>/paths.cache`.
+    #[arg(long)]
+    path_cache_file: Option<PathBuf>,
+
+    /// Time-to-live for cache entries in seconds (0 = no expiry); defaults to 7 days.
+    #[arg(long)]
+    path_cache_ttl: Option<u64>,
 
     /// Do not synthesize `/bin/<mainProgram>` listings from `meta.mainProgram`.
     #[arg(long)]
@@ -116,6 +124,8 @@ async fn main() -> color_eyre::Result<()> {
         path_cache: args.path_cache,
         force: args.force,
         cache_key: args.cache_key,
+        path_cache_file: args.path_cache_file,
+        path_cache_ttl: args.path_cache_ttl,
         main_program: !args.no_main_program,
         extra_scopes: args.extra_scopes,
     };
