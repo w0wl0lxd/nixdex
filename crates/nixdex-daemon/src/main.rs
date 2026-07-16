@@ -12,7 +12,10 @@ use tracing_subscriber::EnvFilter;
 #[command(author, about, version)]
 struct Args {
     /// Release URL pattern for nix-index-database.
-    #[arg(long, default_value = "https://github.com/nix-community/nix-index-database/releases/download")]
+    #[arg(
+        long,
+        default_value = "https://github.com/nix-community/nix-index-database/releases/download"
+    )]
     release_url: String,
 
     /// Architecture identifier (e.g., x86_64-linux).

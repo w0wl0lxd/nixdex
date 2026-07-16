@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use reqwest::header;
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 
 use crate::basename_index::BasenameIndex;
 use crate::database::FILE_MAGIC;
@@ -143,7 +144,7 @@ pub async fn download_and_validate(config: &PrebuiltConfig) -> Result<PathBuf> {
         .build()
         .map_err(|err| Error::Request(err.to_string()))?;
 
-    let response = client
+    let mut response = client
         .get(&url)
         .send()
         .await
@@ -169,10 +170,16 @@ pub async fn download_and_validate(config: &PrebuiltConfig) -> Result<PathBuf> {
     fs::create_dir_all(&target_dir)?;
 
     let temp_path = target_dir.join("files.tmp");
-    let mut file = fs::File::create(&temp_path)?;
+    let mut file = tokio::fs::File::create(&temp_path).await?;
 
-    let bytes = response.bytes().await.map_err(|err| Error::Request(err.to_string()))?;
-    std::io::Write::write_all(&mut file, &bytes)?;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|err| Error::Request(err.to_string()))?
+    {
+        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
+    }
+    file.flush().await?;
 
     validate_nixi(&temp_path)?;
 
@@ -188,13 +195,17 @@ pub async fn download_and_validate(config: &PrebuiltConfig) -> Result<PathBuf> {
 ///
 /// Returns an error if the file is not a valid NIXI database.
 fn validate_nixi(path: &Path) -> Result<()> {
-    let data = fs::read(path)?;
-
-    if data.len() < 12 {
-        return Err(Error::Validation("file too short for NIXI header".into()));
+    let mut file = fs::File::open(path)?;
+    let mut header = [0u8; 12];
+    if let Err(err) = std::io::Read::read_exact(&mut file, &mut header) {
+        return if err.kind() == std::io::ErrorKind::UnexpectedEof {
+            Err(Error::Validation("file too short for NIXI header".into()))
+        } else {
+            Err(Error::Io(err))
+        };
     }
 
-    let magic = data.get(0..4).ok_or_else(|| Error::Validation("file too short for magic".into()))?;
+    let (magic, version_bytes) = header.split_at(4);
     if magic != FILE_MAGIC {
         return Err(Error::Validation(format!(
             "bad magic: expected {:?}, found {:?}",
@@ -202,7 +213,6 @@ fn validate_nixi(path: &Path) -> Result<()> {
         )));
     }
 
-    let version_bytes = data.get(4..12).ok_or_else(|| Error::Validation("file too short for version".into()))?;
     let version = u64::from_le_bytes(
         version_bytes
             .try_into()
