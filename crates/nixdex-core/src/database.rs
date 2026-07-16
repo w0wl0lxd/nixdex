@@ -55,6 +55,15 @@ const FRAME_MAP_MAGIC: &[u8] = b"NFRM";
 /// Frame map sidecar version.
 const FRAME_MAP_VERSION: u32 = 1;
 
+/// Attrs sidecar filename for incremental builds.
+const ATTRS_FILE: &str = "files.attrs";
+
+/// Magic for the attrs sidecar.
+const ATTRS_MAGIC: &[u8] = b"NATR";
+
+/// Attrs sidecar version.
+const ATTRS_VERSION: u32 = 1;
+
 /// Defensive cap on the number of v2 frames (seek table entries).
 const MAX_FRAME_COUNT: usize = 1024 * 1024;
 
@@ -155,6 +164,8 @@ pub struct Writer {
     frame_map: Vec<u32>,
     /// Whether `finish` has already materialized the on-disk file.
     finished: bool,
+    /// Accumulated (attr, output, hash) triples for the attrs sidecar.
+    attrs: Vec<(String, String, String)>,
 }
 
 impl Drop for Writer {
@@ -207,6 +218,7 @@ impl Writer {
             frame_lengths: Vec::new(),
             frame_map: Vec::new(),
             finished: false,
+            attrs: Vec::new(),
         })
     }
 
@@ -238,6 +250,14 @@ impl Writer {
 
         self.raw.extend_from_slice(&package);
         self.boundaries.push(self.raw.len());
+
+        // Record (attr, output, hash) for the attrs sidecar.
+        self.attrs.push((
+            path.origin().attr.clone(),
+            path.origin().output.clone(),
+            path.hash().to_string(),
+        ));
+
         Ok(())
     }
 
@@ -375,6 +395,7 @@ impl Writer {
                     && !dir.as_os_str().is_empty()
                 {
                     self.basename_index.write_sidecars(dir)?;
+                    write_attrs_sidecar(dir, &self.attrs)?;
                 }
 
                 return Ok(size);
@@ -420,6 +441,7 @@ impl Writer {
         {
             write_frame_map(dir, &self.frame_map, self.frame_lengths.len())?;
             self.basename_index.write_sidecars(dir)?;
+            write_attrs_sidecar(dir, &self.attrs)?;
         }
 
         Ok(size)
@@ -872,6 +894,106 @@ fn read_frame_map(db_dir: &Path) -> Result<Vec<u32>> {
     }
 
     Ok(ordinal_to_frame)
+}
+
+/// Write the attrs sidecar for incremental builds.
+fn write_attrs_sidecar(db_dir: &Path, attrs: &[(String, String, String)]) -> Result<()> {
+    let path = db_dir.join(ATTRS_FILE);
+    let mut file = File::create(&path)?;
+
+    let package_count = attrs.len();
+    file.write_all(ATTRS_MAGIC)?;
+    file.write_u32::<LittleEndian>(ATTRS_VERSION)?;
+    let package_count_u32 =
+        u32::try_from(package_count).map_err(|_| Error::Corrupt("package count overflow"))?;
+    file.write_u32::<LittleEndian>(package_count_u32)?;
+
+    for (attr, output, hash) in attrs {
+        write_length_prefixed_string(&mut file, attr)?;
+        write_length_prefixed_string(&mut file, output)?;
+        write_length_prefixed_string(&mut file, hash)?;
+    }
+
+    file.flush()?;
+    Ok(())
+}
+
+/// Read the attrs sidecar for incremental builds.
+///
+/// Returns `Ok(None)` if the file is missing or has an invalid magic/version.
+pub fn read_attrs_sidecar(db_dir: &Path) -> Result<Option<Vec<(String, String, String)>>> {
+    let path = db_dir.join(ATTRS_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+
+    if bytes.len() < ATTRS_MAGIC.len() + 8 {
+        return Ok(None);
+    }
+
+    let magic = bytes
+        .get(..ATTRS_MAGIC.len())
+        .ok_or(Error::Corrupt("attrs magic missing"))?;
+    if magic != ATTRS_MAGIC {
+        return Ok(None);
+    }
+
+    let version = read_u32_le(&bytes, ATTRS_MAGIC.len())?;
+    if version != ATTRS_VERSION {
+        return Ok(None);
+    }
+
+    let package_count = usize::try_from(read_u32_le(&bytes, ATTRS_MAGIC.len() + 4)?)
+        .map_err(|_| Error::Corrupt("package count overflow"))?;
+
+    let mut attrs = Vec::with_capacity(package_count);
+    let mut offset = ATTRS_MAGIC.len() + 8;
+
+    for _ in 0..package_count {
+        let (attr, new_offset) = read_length_prefixed_string(&bytes, offset)?;
+        offset = new_offset;
+        let (output, new_offset) = read_length_prefixed_string(&bytes, offset)?;
+        offset = new_offset;
+        let (hash, new_offset) = read_length_prefixed_string(&bytes, offset)?;
+        offset = new_offset;
+        attrs.push((attr, output, hash));
+    }
+
+    if offset != bytes.len() {
+        return Err(Error::Corrupt("attrs sidecar has trailing data"));
+    }
+
+    Ok(Some(attrs))
+}
+
+/// Write a length-prefixed string (u32 LE length + UTF-8 bytes).
+fn write_length_prefixed_string<W: Write>(writer: &mut W, s: &str) -> Result<()> {
+    let bytes = s.as_bytes();
+    let len = u32::try_from(bytes.len()).map_err(|_| Error::Corrupt("string length overflow"))?;
+    writer.write_u32::<LittleEndian>(len)?;
+    writer.write_all(bytes)?;
+    Ok(())
+}
+
+/// Read a length-prefixed string from bytes at the given offset.
+///
+/// Returns `(string, new_offset)`.
+fn read_length_prefixed_string(bytes: &[u8], offset: usize) -> Result<(String, usize)> {
+    let len = usize::try_from(read_u32_le(bytes, offset)?)
+        .map_err(|_| Error::Corrupt("string length overflow"))?;
+    let string_start = offset + 4;
+    let string_end = string_start
+        .checked_add(len)
+        .ok_or(Error::Corrupt("string end overflow"))?;
+    let string_bytes = bytes
+        .get(string_start..string_end)
+        .ok_or(Error::Corrupt("string slice out of range"))?;
+    let string = std::str::from_utf8(string_bytes)
+        .map_err(|_| Error::Corrupt("string not valid UTF-8"))?
+        .to_string();
+    Ok((string, string_end))
 }
 
 /// Compute frame_starts: for each frame, the first package ordinal in that frame.
