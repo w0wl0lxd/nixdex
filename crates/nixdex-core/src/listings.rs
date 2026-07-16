@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use bytes::Bytes;
 use indexmap::IndexSet;
 use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
 use tracing::warn;
@@ -13,8 +14,51 @@ use crate::files::FileTree;
 use crate::hydra::{self, Fetcher};
 use crate::store_path::StorePath;
 
+/// A root path together with an optional `meta.mainProgram` value.
+///
+/// When a root path's `.ls` listing is missing from the binary cache, the
+/// `main_program` value is used to synthesize a `/bin/<mainProgram>` entry so
+/// that `nix-locate` can still find the package's primary executable.
+#[derive(Debug, Clone)]
+pub struct PackageEntry {
+    /// Store path to fetch/traverse.
+    pub path: StorePath,
+    /// Value of `meta.mainProgram` for this path, if any.
+    pub main_program: Option<String>,
+}
+
+impl PackageEntry {
+    /// Create a new entry with no `main_program`.
+    #[must_use]
+    pub fn new(path: StorePath) -> Self {
+        Self {
+            path,
+            main_program: None,
+        }
+    }
+}
+
 /// Result item produced by [`fetch_listings`].
-pub type ListingItem = (StorePath, Option<String>, FileTree);
+pub type ListingItem = (StorePath, FileTree);
+
+/// Return `true` if `name` is a single, safe filename component.
+fn is_valid_main_program(name: &str) -> bool {
+    if name.is_empty() || name == "." || name == ".." {
+        return false;
+    }
+    !name.contains(['/', '\\', '\0'])
+}
+
+/// Build a synthetic file tree containing just `/bin/<main_program>`.
+fn synthesize_main_program(main_program: &str) -> FileTree {
+    FileTree::directory(vec![(
+        Bytes::from_static(b"bin"),
+        FileTree::directory(vec![(
+            Bytes::copy_from_slice(main_program.as_bytes()),
+            FileTree::regular(0, true),
+        )]),
+    )])
+}
 
 /// Internal abstraction so the closure fetcher can be tested without HTTP.
 #[allow(clippy::manual_async_fn)]
@@ -57,11 +101,15 @@ impl ListingSource for Fetcher {
 /// fetched and parsed. Missing `.ls` files or missing narinfos are skipped
 /// silently; other errors are logged with [`tracing::warn`] and skipped.
 ///
+/// For root entries that carry a `main_program` value, a missing `.ls` or
+/// narinfo causes a synthetic `/bin/<main_program>` listing to be emitted
+/// instead of being skipped.
+///
 /// Concurrency is bounded by `jobs` (clamped to at least 1).
 pub async fn fetch_listings(
     fetcher: &Fetcher,
     jobs: usize,
-    starting_set: Vec<StorePath>,
+    starting_set: Vec<PackageEntry>,
 ) -> Result<mpsc::Receiver<Result<ListingItem>>> {
     fetch_listings_with_source(fetcher, jobs, starting_set).await
 }
@@ -69,11 +117,11 @@ pub async fn fetch_listings(
 async fn fetch_listings_with_source<S: ListingSource>(
     source: &S,
     jobs: usize,
-    starting_set: Vec<StorePath>,
+    starting_set: Vec<PackageEntry>,
 ) -> Result<mpsc::Receiver<Result<ListingItem>>> {
     let jobs = jobs.max(1);
     let (out_tx, out_rx) = mpsc::channel::<Result<ListingItem>>(jobs * 2);
-    let queue: Arc<Mutex<VecDeque<StorePath>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let queue: Arc<Mutex<VecDeque<PackageEntry>>> = Arc::new(Mutex::new(VecDeque::new()));
     let seen: Arc<Mutex<IndexSet<String>>> = Arc::new(Mutex::new(IndexSet::new()));
     let in_flight = Arc::new(AtomicUsize::new(0));
     let notify = Arc::new(Notify::new());
@@ -82,10 +130,10 @@ async fn fetch_listings_with_source<S: ListingSource>(
     {
         let mut q = queue.lock().await;
         let mut s = seen.lock().await;
-        for path in starting_set {
-            if s.insert(path.hash().to_string()) {
+        for entry in starting_set {
+            if s.insert(entry.path.hash().to_string()) {
                 in_flight.fetch_add(1, Ordering::SeqCst);
-                q.push_back(path);
+                q.push_back(entry);
             }
         }
     }
@@ -95,12 +143,12 @@ async fn fetch_listings_with_source<S: ListingSource>(
     tokio::spawn(async move {
         let source = source;
         loop {
-            let path = {
+            let entry = {
                 let mut q = queue.lock().await;
                 q.pop_front()
             };
 
-            if let Some(path) = path {
+            if let Some(entry) = entry {
                 let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
                     in_flight.fetch_sub(1, Ordering::SeqCst);
                     notify.notify_one();
@@ -117,7 +165,7 @@ async fn fetch_listings_with_source<S: ListingSource>(
                 tokio::spawn(async move {
                     let _permit = permit;
                     if let Some(item) =
-                        process_path(&source, &path, &queue, &seen, &in_flight, &notify).await
+                        process_path(&source, &entry, &queue, &seen, &in_flight, &notify).await
                     {
                         let _ = out_tx.send(Ok(item)).await;
                     }
@@ -137,13 +185,13 @@ async fn fetch_listings_with_source<S: ListingSource>(
 
 async fn process_path<S: ListingSource>(
     source: &S,
-    path: &StorePath,
-    queue: &Mutex<VecDeque<StorePath>>,
+    entry: &PackageEntry,
+    queue: &Mutex<VecDeque<PackageEntry>>,
     seen: &Mutex<IndexSet<String>>,
     in_flight: &AtomicUsize,
     notify: &Notify,
 ) -> Option<ListingItem> {
-    let result = process_path_inner(source, path, queue, seen, in_flight, notify).await;
+    let result = process_path_inner(source, entry, queue, seen, in_flight, notify).await;
 
     let remaining = in_flight.fetch_sub(1, Ordering::SeqCst);
     if remaining == 1 {
@@ -155,16 +203,26 @@ async fn process_path<S: ListingSource>(
 
 async fn process_path_inner<S: ListingSource>(
     source: &S,
-    path: &StorePath,
-    queue: &Mutex<VecDeque<StorePath>>,
+    entry: &PackageEntry,
+    queue: &Mutex<VecDeque<PackageEntry>>,
     seen: &Mutex<IndexSet<String>>,
     in_flight: &AtomicUsize,
     notify: &Notify,
 ) -> Option<ListingItem> {
-    let (refs, nar_url) = match source.fetch_narinfo_details(path).await {
-        Ok(details) => details,
+    let path = &entry.path;
+    let main_program = entry
+        .main_program
+        .as_deref()
+        .filter(|mp| is_valid_main_program(mp));
+
+    let refs = match source.fetch_narinfo_details(path).await {
+        Ok((refs, _nar_url)) => refs,
         Err(err) => {
-            if !err.is_not_found() {
+            if err.is_not_found() {
+                if let Some(mp) = main_program {
+                    return Some((path.clone(), synthesize_main_program(mp)));
+                }
+            } else {
                 warn!(path = %path, error = %err, "failed to fetch narinfo; skipping");
             }
             return None;
@@ -179,18 +237,20 @@ async fn process_path_inner<S: ListingSource>(
         };
         if new {
             in_flight.fetch_add(1, Ordering::SeqCst);
-            queue.lock().await.push_back(r);
+            queue.lock().await.push_back(PackageEntry::new(r));
             notify.notify_one();
         }
     }
 
     match source.fetch_file_tree(path).await {
-        Ok(tree) => Some((path.clone(), nar_url, tree)),
+        Ok(tree) => Some((path.clone(), tree)),
         Err(err) => {
-            if !err.is_not_found() {
+            if err.is_not_found() {
+                main_program.map(|mp| (path.clone(), synthesize_main_program(mp)))
+            } else {
                 warn!(path = %path, error = %err, "failed to fetch .ls listing; skipping");
+                None
             }
-            None
         }
     }
 }
@@ -198,12 +258,15 @@ async fn process_path_inner<S: ListingSource>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::files::{FileNode, FileTreeEntry};
     use bytes::Bytes;
 
-    #[derive(Clone)]
+    #[derive(Clone, Default)]
     struct MockSource {
         refs: indexmap::IndexMap<String, Vec<StorePath>>,
         trees: indexmap::IndexMap<String, FileTree>,
+        missing_narinfo: indexmap::IndexSet<String>,
+        missing_ls: indexmap::IndexSet<String>,
     }
 
     impl ListingSource for MockSource {
@@ -211,6 +274,9 @@ mod tests {
             &self,
             path: &StorePath,
         ) -> std::result::Result<(Vec<StorePath>, Option<String>), hydra::Error> {
+            if self.missing_narinfo.contains(path.hash()) {
+                return Err(hydra::Error::Request("HTTP 404".to_string()));
+            }
             let refs = self.refs.get(path.hash()).cloned().unwrap_or_else(Vec::new);
             let url = Some(format!("nar/{}.nar.xz", path.hash()));
             Ok((refs, url))
@@ -220,6 +286,9 @@ mod tests {
             &self,
             path: &StorePath,
         ) -> std::result::Result<FileTree, hydra::Error> {
+            if self.missing_ls.contains(path.hash()) {
+                return Err(hydra::Error::Request("HTTP 404".to_string()));
+            }
             self.trees
                 .get(path.hash())
                 .cloned()
@@ -265,8 +334,12 @@ mod tests {
         trees.insert("b".to_string(), leaf(b"b"));
         trees.insert("c".to_string(), leaf(b"c"));
 
-        let source = MockSource { refs, trees };
-        let mut rx = fetch_listings_with_source(&source, 2, vec![a.clone()])
+        let source = MockSource {
+            refs,
+            trees,
+            ..Default::default()
+        };
+        let mut rx = fetch_listings_with_source(&source, 2, vec![PackageEntry::new(a.clone())])
             .await
             .expect("start");
 
@@ -276,7 +349,7 @@ mod tests {
         }
 
         assert_eq!(collected.len(), 3);
-        let hashes: Vec<_> = collected.iter().map(|(p, _, _)| p.hash()).collect();
+        let hashes: Vec<_> = collected.iter().map(|(p, _)| p.hash()).collect();
         assert!(hashes.contains(&"a"));
         assert!(hashes.contains(&"b"));
         assert!(hashes.contains(&"c"));
@@ -295,8 +368,12 @@ mod tests {
         trees.insert("a".to_string(), leaf(b"a"));
         trees.insert("b".to_string(), leaf(b"b"));
 
-        let source = MockSource { refs, trees };
-        let mut rx = fetch_listings_with_source(&source, 2, vec![a.clone()])
+        let source = MockSource {
+            refs,
+            trees,
+            ..Default::default()
+        };
+        let mut rx = fetch_listings_with_source(&source, 2, vec![PackageEntry::new(a.clone())])
             .await
             .expect("start");
 
@@ -319,8 +396,12 @@ mod tests {
         let mut trees = indexmap::IndexMap::new();
         trees.insert("b".to_string(), leaf(b"b"));
 
-        let source = MockSource { refs, trees };
-        let mut rx = fetch_listings_with_source(&source, 2, vec![a.clone()])
+        let source = MockSource {
+            refs,
+            trees,
+            ..Default::default()
+        };
+        let mut rx = fetch_listings_with_source(&source, 2, vec![PackageEntry::new(a.clone())])
             .await
             .expect("start");
 
@@ -330,6 +411,137 @@ mod tests {
         }
 
         assert_eq!(collected.len(), 1);
-        assert_eq!(collected.first().map(|(p, _, _)| p.hash()), Some("b"));
+        assert_eq!(collected.first().map(|(p, _)| p.hash()), Some("b"));
+    }
+
+    fn find_entry(tree: &FileTree, path: &[u8]) -> Option<FileTreeEntry> {
+        tree.to_list(b"").into_iter().find(|e| e.path == path)
+    }
+
+    #[tokio::test]
+    async fn synthesizes_main_program_when_narinfo_missing() {
+        let a = sp("a", "a");
+
+        let source = MockSource {
+            missing_narinfo: IndexSet::from_iter(["a".to_string()]),
+            ..Default::default()
+        };
+        let mut rx = fetch_listings_with_source(
+            &source,
+            2,
+            vec![PackageEntry {
+                path: a.clone(),
+                main_program: Some("foo".to_string()),
+            }],
+        )
+        .await
+        .expect("start");
+
+        let mut collected = Vec::new();
+        while let Some(result) = rx.recv().await {
+            collected.push(result.expect("item"));
+        }
+
+        assert_eq!(collected.len(), 1);
+        let (path, tree) = collected.first().expect("one item");
+        assert_eq!(path.hash(), "a");
+        let entry = find_entry(tree, b"/bin/foo").expect("/bin/foo entry");
+        assert!(matches!(
+            entry.node,
+            FileNode::Regular {
+                executable: true,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn synthesizes_main_program_when_ls_missing() {
+        let a = sp("a", "a");
+
+        let source = MockSource {
+            missing_ls: IndexSet::from_iter(["a".to_string()]),
+            ..Default::default()
+        };
+        let mut rx = fetch_listings_with_source(
+            &source,
+            2,
+            vec![PackageEntry {
+                path: a.clone(),
+                main_program: Some("foo".to_string()),
+            }],
+        )
+        .await
+        .expect("start");
+
+        let mut collected = Vec::new();
+        while let Some(result) = rx.recv().await {
+            collected.push(result.expect("item"));
+        }
+
+        assert_eq!(collected.len(), 1);
+        let (path, tree) = collected.first().expect("one item");
+        assert_eq!(path.hash(), "a");
+        assert!(find_entry(tree, b"/bin/foo").is_some());
+    }
+
+    #[tokio::test]
+    async fn does_not_synthesize_main_program_for_references() {
+        let a = sp("a", "a");
+        let b = sp("b", "b");
+
+        let mut refs = indexmap::IndexMap::new();
+        refs.insert("a".to_string(), vec![b.clone()]);
+
+        let source = MockSource {
+            refs,
+            missing_ls: IndexSet::from_iter(["a".to_string(), "b".to_string()]),
+            ..Default::default()
+        };
+        let mut rx = fetch_listings_with_source(
+            &source,
+            2,
+            vec![PackageEntry {
+                path: a.clone(),
+                main_program: Some("foo".to_string()),
+            }],
+        )
+        .await
+        .expect("start");
+
+        let mut collected = Vec::new();
+        while let Some(result) = rx.recv().await {
+            collected.push(result.expect("item"));
+        }
+
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected.first().map(|(p, _)| p.hash()), Some("a"));
+    }
+
+    #[tokio::test]
+    async fn skips_invalid_main_program() {
+        let a = sp("a", "a");
+
+        let source = MockSource {
+            missing_narinfo: IndexSet::from_iter(["a".to_string()]),
+            ..Default::default()
+        };
+        let mut rx = fetch_listings_with_source(
+            &source,
+            2,
+            vec![PackageEntry {
+                path: a.clone(),
+                main_program: Some("foo/bar".to_string()),
+            }],
+        )
+        .await
+        .expect("start");
+
+        let mut collected = Vec::new();
+        while let Some(result) = rx.recv().await {
+            collected.push(result.expect("item"));
+        }
+
+        assert!(collected.is_empty());
     }
 }
