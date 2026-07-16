@@ -385,7 +385,8 @@ async fn nix_locate_handler(
             )
             .map_err(|e| format!("{:?}", e))
     })
-    .await else {
+    .await
+    else {
         return axum::Json(NixLocateResponse {
             matches: Vec::new(),
         });

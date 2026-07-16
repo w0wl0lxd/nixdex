@@ -144,7 +144,9 @@ impl ListingSource for CachedSource {
             let key = format!("{}.{}", path.origin().attr, path.origin().output);
 
             // Check if the package's hash matches the previous build.
-            if let Some(prev_hash) = self.attrs_map.get(&key) && prev_hash == hash {
+            if let Some(prev_hash) = self.attrs_map.get(&key)
+                && prev_hash == hash
+            {
                 // Hash matches: try to reuse from PathCache.
                 if let Some(tree) = self.cache.get_tree(hash) {
                     self.cache.hits.fetch_add(1, Ordering::Relaxed);
