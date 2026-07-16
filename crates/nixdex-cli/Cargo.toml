@@ -16,7 +16,7 @@ tracing-subscriber = { workspace = true }
 color-eyre = { workspace = true }
 tokio = { workspace = true }
 sonic-rs = { workspace = true }
-nixdex-core = { workspace = true, features = ["cli"] }
+nixdex-core = { workspace = true, features = ["cli", "daemon"] }
 clap_complete = "4.6.7"
 
 [[bin]]
