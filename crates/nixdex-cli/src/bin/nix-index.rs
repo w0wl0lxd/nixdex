@@ -55,6 +55,10 @@ struct Args {
     #[arg(short, long = "compression", default_value = "22", value_parser = clap::value_parser!(i32).range(1..=22))]
     compression_level: i32,
 
+    /// On-disk database format version (1 or 2).
+    #[arg(long, default_value = "1", value_parser = clap::value_parser!(u64).range(1..=2))]
+    format_version: u64,
+
     /// Show a stack trace in the case of a Nix evaluation error.
     #[arg(long)]
     show_trace: bool,
@@ -94,6 +98,7 @@ async fn main() -> color_eyre::Result<()> {
         nixpkgs: args.nixpkgs,
         system: args.system,
         compression_level: args.compression_level,
+        format_version: args.format_version,
         show_trace: args.show_trace,
         filter_prefix: args.filter_prefix,
         path_cache: args.path_cache,
