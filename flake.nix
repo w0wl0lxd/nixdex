@@ -20,16 +20,38 @@
         pkgs = import nixpkgs { inherit system; };
         craneLib = crane.mkLib pkgs;
 
-        src = craneLib.cleanCargoSource ./.;
+        src = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter =
+            path: type:
+            let
+              base = baseNameOf path;
+              inCratesCliAssets = pkgs.lib.hasInfix "/crates/nixdex-cli/assets" path;
+            in
+            craneLib.filterCargoSources path type
+            || (
+              inCratesCliAssets
+              && (base == "assets" || base == "command-not-found.sh" || base == "command-not-found.nu")
+            );
+        };
 
         commonArgs = {
           inherit src;
           strictDeps = true;
-          buildInputs = [ ];
+          buildInputs = [ pkgs.openssl ];
           nativeBuildInputs = [
+            pkgs.cacert
+            pkgs.clang
+            pkgs.mold
             pkgs.pkg-config
-            pkgs.openssl
           ];
+
+          # The workspace `.cargo/config.toml` enables `sccache`, which is not
+          # available (or useful) inside the Nix sandbox.
+          RUSTC_WRAPPER = "";
+
+          # `rustls-native-certs` has no system cert store in the sandbox.
+          SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
         };
 
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
@@ -42,6 +64,18 @@
             cargoExtraArgs = "-p nixdex-cli";
             doCheck = true;
             cargoTestExtraArgs = "-p nixdex-core";
+
+            postInstall = ''
+              mkdir -p $out/etc/profile.d
+              substitute ${src}/crates/nixdex-cli/assets/command-not-found.sh \
+                $out/etc/profile.d/command-not-found.sh \
+                --replace-fail "@out@" "$out"
+              chmod +x $out/etc/profile.d/command-not-found.sh
+              substitute ${src}/crates/nixdex-cli/assets/command-not-found.nu \
+                $out/etc/profile.d/command-not-found.nu \
+                --replace-fail "@out@" "$out"
+              chmod 444 $out/etc/profile.d/command-not-found.nu
+            '';
           }
         );
       in
@@ -88,5 +122,28 @@
           '';
         };
       }
-    );
+    )
+    // {
+      nixosModules.default =
+        {
+          config,
+          lib,
+          pkgs,
+          ...
+        }:
+        import ./nix/nixos-module.nix { package = self.packages.${pkgs.system}.nixdex or pkgs.nixdex; } {
+          inherit config lib pkgs;
+        };
+
+      homeModules.default =
+        {
+          config,
+          lib,
+          pkgs,
+          ...
+        }:
+        import ./nix/home-module.nix { package = self.packages.${pkgs.system}.nixdex or pkgs.nixdex; } {
+          inherit config lib pkgs;
+        };
+    };
 }
