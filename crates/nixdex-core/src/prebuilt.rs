@@ -30,6 +30,10 @@ pub enum Error {
     /// Basename secondary index error.
     #[error("basename index error: {0}")]
     BasenameIndex(#[from] crate::basename_index::Error),
+
+    /// Database sidecar generation failed.
+    #[error("database error: {0}")]
+    Database(#[from] crate::database::Error),
 }
 
 /// Convenience alias.
@@ -193,16 +197,12 @@ pub async fn download_to(config: &PrebuiltConfig, dest: &Path) -> Result<()> {
     validate_nixi(&temp_path)?;
     tokio::fs::rename(&temp_path, dest).await?;
 
-    // Generate nixdex sidecars for fast basename lookups.
+    // Generate nixdex sidecars for fast basename and package search lookups.
     // This is CPU-bound, so we use spawn_blocking to avoid blocking the async runtime.
     let dest_clone = dest.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        if let Err(err) = generate_sidecars(&dest_clone) {
-            tracing::warn!(error = %err, "failed to generate sidecars for prebuilt index");
-        }
-    })
-    .await
-    .map_err(|err| Error::Io(std::io::Error::other(err.to_string())))?;
+    tokio::task::spawn_blocking(move || generate_sidecars(&dest_clone))
+        .await
+        .map_err(|err| Error::Io(std::io::Error::other(err.to_string())))??;
 
     Ok(())
 }
