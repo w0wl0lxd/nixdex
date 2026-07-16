@@ -14,7 +14,7 @@ struct Args {
     /// Release URL pattern for nix-index-database.
     #[arg(
         long,
-        default_value = "https://github.com/nix-community/nix-index-database/releases/download"
+        default_value = "https://github.com/nix-community/nix-index-database/releases/latest/download"
     )]
     release_url: String,
 

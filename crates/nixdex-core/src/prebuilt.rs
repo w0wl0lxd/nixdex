@@ -53,9 +53,10 @@ pub struct PrebuiltConfig {
 impl Default for PrebuiltConfig {
     fn default() -> Self {
         Self {
-            release_url: "https://github.com/nix-community/nix-index-database/releases/download"
-                .to_string(),
-            architecture: "x86_64-linux".to_string(),
+            release_url:
+                "https://github.com/nix-community/nix-index-database/releases/latest/download"
+                    .to_string(),
+            architecture: default_architecture(),
             small: false,
             cache_dir: Self::default_cache_dir(),
             refresh_interval: Duration::from_secs(3600),
@@ -118,6 +119,22 @@ pub async fn check_update(config: &PrebuiltConfig) -> Result<Option<String>> {
     Ok(etag.or(last_modified))
 }
 
+/// Return the host architecture string used by `nix-index-database` assets.
+///
+/// Maps Rust `cfg` constants (`x86_64` + `linux` → `x86_64-linux`,
+/// `aarch64` + `macos` → `aarch64-darwin`, etc.).
+pub fn default_architecture() -> String {
+    let arch = match std::env::consts::ARCH {
+        "x86" => "i686",
+        other => other,
+    };
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    format!("{arch}-{os}")
+}
+
 /// Build the asset URL for the configured architecture and variant.
 fn build_asset_url(config: &PrebuiltConfig) -> String {
     let filename = if config.small {
@@ -128,12 +145,15 @@ fn build_asset_url(config: &PrebuiltConfig) -> String {
     format!("{}/{}", config.release_url, filename)
 }
 
-/// Download the prebuilt index to a temporary file, then validate and move to cache.
+/// Download the prebuilt index to `dest` with a `.tmp` + atomic rename.
+///
+/// The parent directory is created if it does not exist. The file is
+/// validated as a NIXI database before the final rename.
 ///
 /// # Errors
 ///
 /// Returns an error if download, validation, or filesystem operations fail.
-pub async fn download_and_validate(config: &PrebuiltConfig) -> Result<PathBuf> {
+pub async fn download_to(config: &PrebuiltConfig, dest: &Path) -> Result<()> {
     let url = build_asset_url(config);
     let client = reqwest::Client::builder()
         .user_agent(concat!("nixdex/", env!("CARGO_PKG_VERSION")))
@@ -154,19 +174,11 @@ pub async fn download_and_validate(config: &PrebuiltConfig) -> Result<PathBuf> {
         )));
     }
 
-    let etag = match response
-        .headers()
-        .get(header::ETAG)
-        .and_then(|v| v.to_str().ok())
-    {
-        Some(e) => e,
-        None => "unknown",
-    };
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
 
-    let target_dir = config.cache_dir.join(etag);
-    fs::create_dir_all(&target_dir)?;
-
-    let temp_path = target_dir.join("files.tmp");
+    let temp_path = dest.with_extension("tmp");
     let mut file = tokio::fs::File::create(&temp_path).await?;
 
     while let Some(chunk) = response
@@ -179,10 +191,57 @@ pub async fn download_and_validate(config: &PrebuiltConfig) -> Result<PathBuf> {
     file.flush().await?;
 
     validate_nixi(&temp_path)?;
+    tokio::fs::rename(&temp_path, dest).await?;
 
-    let final_path = target_dir.join("files");
-    fs::rename(&temp_path, &final_path)?;
+    // The prebuilt asset does not include basename sidecars. Remove any
+    // stale sidecars left behind by a previous nixdex-generated database so
+    // `nix-locate` falls back to a full scan instead of using old ordinals.
+    for suffix in ["basename.fst", "basename.postings"] {
+        let _ = tokio::fs::remove_file(dest.with_extension(suffix)).await;
+    }
 
+    Ok(())
+}
+
+/// Download the prebuilt index to a per-etag subdirectory under `cache_dir`,
+/// then validate and return the directory containing `files`.
+///
+/// # Errors
+///
+/// Returns an error if download, validation, or filesystem operations fail.
+pub async fn download_and_validate(config: &PrebuiltConfig) -> Result<PathBuf> {
+    let url = build_asset_url(config);
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("nixdex/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|err| Error::Request(err.to_string()))?;
+
+    let response = client
+        .head(&url)
+        .send()
+        .await
+        .map_err(|err| Error::Request(format!("HEAD {url}: {err}")))?;
+
+    if !response.status().is_success() {
+        return Err(Error::Request(format!(
+            "HEAD {url}: HTTP {}",
+            response.status()
+        )));
+    }
+
+    let headers = response.headers();
+    let etag = headers.get(header::ETAG).and_then(|v| v.to_str().ok());
+    let last_modified = headers
+        .get(header::LAST_MODIFIED)
+        .and_then(|v| v.to_str().ok());
+    let etag = match etag.or(last_modified) {
+        Some(e) => e,
+        None => "unknown",
+    };
+
+    let target_dir = config.cache_dir.join(etag);
+    download_to(config, &target_dir.join("files")).await?;
     Ok(target_dir)
 }
 
