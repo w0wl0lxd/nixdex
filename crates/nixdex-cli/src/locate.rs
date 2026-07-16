@@ -94,6 +94,8 @@ struct ProcessedArgs {
     hash: Option<String>,
     package_pattern: Option<String>,
     exact_basename: Option<String>,
+    exact_path: Option<String>,
+    path_prefix: Option<String>,
     file_type: Vec<FileType>,
     mode: SearchMode,
 }
@@ -117,6 +119,30 @@ fn process_args(matches: Opts) -> ProcessedArgs {
     } else {
         None
     };
+
+    // Determine if we can use the path index for rooted/prefix queries
+    let (exact_path, path_prefix) =
+        if !matches.regex && matches.at_root && !matches.pattern.is_empty() {
+            let pattern_bytes = matches.pattern.as_bytes();
+            if pattern_bytes.starts_with(b"/") {
+                // For --at-root with a full path like "/bin/ls", try exact path lookup
+                if matches.whole_name {
+                    // Pattern is anchored at end too, so it's an exact full path
+                    (Some(matches.pattern.clone()), None)
+                } else {
+                    // Pattern starts with "/" but may be a prefix; use prefix lookup
+                    (None, Some(matches.pattern.clone()))
+                }
+            } else if matches.pattern.contains('/') {
+                // Pattern contains "/" but doesn't start with it; treat as prefix
+                (None, Some(format!("/{}", matches.pattern)))
+            } else {
+                // No "/" in pattern, can't use path index
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
 
     let make_pattern = |s: &str, wrap: bool| {
         let body = if as_regex {
@@ -161,6 +187,8 @@ fn process_args(matches: Opts) -> ProcessedArgs {
         hash: matches.hash,
         package_pattern,
         exact_basename,
+        exact_path,
+        path_prefix,
         file_type,
         mode,
     }
@@ -181,6 +209,8 @@ pub fn run(matches: Opts) -> color_eyre::Result<()> {
         hash: args.hash,
         package_pattern: args.package_pattern,
         exact_basename: args.exact_basename,
+        exact_path: args.exact_path,
+        path_prefix: args.path_prefix,
         file_type: &args.file_type,
         mode: args.mode,
     };
