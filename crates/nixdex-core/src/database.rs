@@ -225,6 +225,15 @@ impl Writer {
         Ok(())
     }
 
+    /// Return the current estimated uncompressed size of the database in bytes.
+    #[must_use]
+    pub fn estimated_size(&self) -> u64 {
+        match u64::try_from(self.raw.len()) {
+            Ok(len) => len,
+            Err(_) => u64::MAX,
+        }
+    }
+
     fn do_finish(&mut self) -> Result<u64> {
         if self.finished {
             return Ok(0);
