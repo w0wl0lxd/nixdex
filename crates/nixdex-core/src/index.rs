@@ -1,15 +1,14 @@
 //! Building a nixdex index from nixpkgs and the binary cache.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 use crate::CACHE_URL;
 use crate::database::Writer;
 use crate::errors::{Error, Result};
 use crate::hydra::Fetcher;
+use crate::listings;
 use crate::nixpkgs;
 
 /// Options controlling an index build.
@@ -131,39 +130,21 @@ impl IndexBuilder {
         })?;
 
         let jobs = opts.jobs.max(1);
-        let concurrency = jobs.min(32);
-        let semaphore = Arc::new(Semaphore::new(concurrency));
         let filter_prefix = opts.filter_prefix.as_bytes().to_vec();
 
-        // Fetch trees concurrently; write serially afterwards to keep Writer single-threaded.
-        let mut tasks = Vec::with_capacity(packages.store_paths.len());
-        for store_path in packages.store_paths {
-            let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
-                return Err(Error::Io(std::io::Error::other(
-                    "index build semaphore closed unexpectedly",
-                )));
-            };
-            let fetcher = fetcher.clone();
-            tasks.push(tokio::spawn(async move {
-                let _permit = permit;
-                let result = fetcher.fetch_file_tree(&store_path).await;
-                (store_path, result)
-            }));
-        }
+        let mut listings = listings::fetch_listings(&fetcher, jobs, packages.store_paths)
+            .await
+            .map_err(|source| {
+                Error::Io(std::io::Error::other(format!(
+                    "failed to start listing fetcher: {source}"
+                )))
+            })?;
 
         let mut indexed = 0usize;
         let mut failed = 0usize;
-        for task in tasks {
-            let (store_path, result) = match task.await {
-                Ok(pair) => pair,
-                Err(err) => {
-                    warn!(error = %err, "fetch task joined with error");
-                    failed += 1;
-                    continue;
-                }
-            };
+        while let Some(result) = listings.recv().await {
             match result {
-                Ok(tree) => {
+                Ok((store_path, _nar_path, tree)) => {
                     writer
                         .add(&store_path, &tree, &filter_prefix)
                         .map_err(|source| Error::WriteDatabase {
@@ -173,11 +154,7 @@ impl IndexBuilder {
                     indexed += 1;
                 }
                 Err(err) => {
-                    warn!(
-                        path = %store_path,
-                        error = %err,
-                        "failed to fetch file listing; skipping"
-                    );
+                    warn!(error = %err, "closure fetch yielded an error; skipping");
                     failed += 1;
                 }
             }
