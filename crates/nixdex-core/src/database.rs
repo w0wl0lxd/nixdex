@@ -145,6 +145,12 @@ pub struct Writer {
     boundaries: Vec<usize>,
     /// Optional basename index accumulated during `add`.
     basename_index: BasenameIndexBuilder,
+    /// Open file handle for streaming frame writes.
+    file: Option<File>,
+    /// Compressed lengths of frames already written to `file`.
+    frame_lengths: Vec<u32>,
+    /// Global ordinal-to-frame map accumulated across flushed chunks.
+    frame_map: Vec<u32>,
     /// Whether `finish` has already materialized the on-disk file.
     finished: bool,
 }
@@ -183,13 +189,21 @@ impl Writer {
         if !SUPPORTED_VERSIONS.contains(&version) {
             return Err(Error::UnsupportedVersion { found: version });
         }
+        let path = path.as_ref().to_path_buf();
+        let mut file = File::create(&path)?;
+        file.write_all(FILE_MAGIC)?;
+        file.write_u64::<LittleEndian>(version)?;
+
         Ok(Self {
-            path: path.as_ref().to_path_buf(),
+            path,
             level,
             version,
             raw: Vec::new(),
             boundaries: Vec::new(),
             basename_index: BasenameIndexBuilder::new(),
+            file: Some(file),
+            frame_lengths: Vec::new(),
+            frame_map: Vec::new(),
             finished: false,
         })
     }
@@ -225,16 +239,113 @@ impl Writer {
         Ok(())
     }
 
+    /// Return the current estimated uncompressed size of the database in bytes.
+    #[must_use]
+    pub fn estimated_size(&self) -> u64 {
+        match u64::try_from(self.raw.len()) {
+            Ok(len) => len,
+            Err(_) => u64::MAX,
+        }
+    }
+
+    /// Compress and write the current v2 raw chunk as one or more frames.
+    ///
+    /// For v1 this is a no-op because the whole stream must be a single frame.
+    /// After flushing, `self.raw` and `self.boundaries` are cleared so the next
+    /// chunk starts fresh.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if compression or I/O fails.
+    pub fn flush_chunk(&mut self) -> Result<()> {
+        if self.raw.is_empty() || self.version != 2 {
+            return Ok(());
+        }
+
+        let raw = std::mem::take(&mut self.raw);
+        let boundaries = std::mem::take(&mut self.boundaries);
+
+        let parallelism = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .max(1);
+
+        let frames = frame_ranges(&raw, &boundaries, parallelism)?;
+        if frames.len() > MAX_FRAME_COUNT {
+            return Err(Error::Corrupt("frame count exceeds maximum"));
+        }
+
+        let base_frame_idx = self.frame_lengths.len();
+        let mut boundary_idx = 0usize;
+        for (frame_idx, (_frame_start, frame_end)) in frames.iter().enumerate() {
+            while boundary_idx < boundaries.len() {
+                let boundary = *boundaries
+                    .get(boundary_idx)
+                    .ok_or(Error::Corrupt("package boundary index out of range"))?;
+                if boundary <= *frame_end {
+                    self.frame_map.push(
+                        u32::try_from(frame_idx + base_frame_idx)
+                            .map_err(|_| Error::Corrupt("frame index overflow"))?,
+                    );
+                    boundary_idx += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        for (ord, &frame_idx) in self
+            .frame_map
+            .iter()
+            .enumerate()
+            .skip(self.frame_map.len() - boundaries.len())
+        {
+            let local_idx =
+                usize::try_from(frame_idx).map_err(|_| Error::Corrupt("frame index overflow"))?;
+            let local_idx = local_idx - base_frame_idx;
+            let (frame_start, frame_end) = frames
+                .get(local_idx)
+                .ok_or(Error::Corrupt("frame index out of range"))?;
+            let boundary = *boundaries
+                .get(ord)
+                .ok_or(Error::Corrupt("package boundary index out of range"))?;
+            if boundary < *frame_start || boundary > *frame_end {
+                return Err(Error::Corrupt("package boundary outside assigned frame"));
+            }
+        }
+
+        let slices: Vec<&[u8]> = frames
+            .iter()
+            .map(|(start, end)| {
+                raw.get(*start..*end)
+                    .ok_or(Error::Corrupt("package boundary out of range"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let compressed_frames: Vec<Vec<u8>> = slices
+            .par_iter()
+            .map(|&slice| zstd::encode_all(slice, self.level))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| Error::Io(std::io::Error::other("database file not open")))?;
+
+        for frame in compressed_frames {
+            let len_u32 = u32::try_from(frame.len())
+                .map_err(|_| Error::Corrupt("compressed frame length overflow"))?;
+            file.write_all(&frame)?;
+            self.frame_lengths.push(len_u32);
+        }
+
+        Ok(())
+    }
+
     fn do_finish(&mut self) -> Result<u64> {
         if self.finished {
             return Ok(0);
         }
         self.finished = true;
-
-        let raw = std::mem::take(&mut self.raw);
-        let mut file = File::create(&self.path)?;
-        file.write_all(FILE_MAGIC)?;
-        file.write_u64::<LittleEndian>(self.version)?;
 
         let parallelism = std::thread::available_parallelism()
             .map_or(1, std::num::NonZeroUsize::get)
@@ -242,6 +353,11 @@ impl Writer {
 
         match self.version {
             1 => {
+                let mut file = self
+                    .file
+                    .take()
+                    .ok_or_else(|| Error::Io(std::io::Error::other("database file not open")))?;
+                let raw = std::mem::take(&mut self.raw);
                 let mut encoder = zstd::Encoder::new(Vec::new(), self.level)?;
                 let n_workers = u32::try_from(parallelism)
                     .map_err(|_| Error::Corrupt("parallelism overflow"))?;
@@ -249,64 +365,50 @@ impl Writer {
                 encoder.write_all(&raw)?;
                 let compressed = encoder.finish()?;
                 file.write_all(&compressed)?;
-            }
-            2 => {
-                let frames = frame_ranges(&raw, &self.boundaries, parallelism)?;
 
-                if frames.len() > MAX_FRAME_COUNT {
-                    return Err(Error::Corrupt("frame count exceeds maximum"));
-                }
+                file.flush()?;
+                let size = file.stream_position()?;
 
-                let slices: Vec<&[u8]> = frames
-                    .iter()
-                    .map(|(start, end)| {
-                        raw.get(*start..*end)
-                            .ok_or(Error::Corrupt("package boundary out of range"))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-
-                let compressed_frames: Vec<Vec<u8>> = slices
-                    .par_iter()
-                    .map(|&slice| zstd::encode_all(slice, self.level))
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-
-                for frame in &compressed_frames {
-                    file.write_all(frame)?;
-                }
-
-                let frame_count = u32::try_from(compressed_frames.len())
-                    .map_err(|_| Error::Corrupt("frame count overflow"))?;
-                let payload_len = 4usize
-                    .checked_add(
-                        compressed_frames
-                            .len()
-                            .checked_mul(4)
-                            .ok_or(Error::Corrupt("seek table length overflow"))?,
-                    )
-                    .and_then(|len| len.checked_add(4))
-                    .ok_or(Error::Corrupt("seek table length overflow"))?;
-                let payload_len_u32 = u32::try_from(payload_len)
-                    .map_err(|_| Error::Corrupt("seek table length overflow"))?;
-
-                file.write_all(&SKIPPABLE_MAGIC.to_le_bytes())?;
-                file.write_all(&payload_len_u32.to_le_bytes())?;
-                file.write_all(&frame_count.to_le_bytes())?;
-                for frame in &compressed_frames {
-                    let len_u32 = u32::try_from(frame.len())
-                        .map_err(|_| Error::Corrupt("compressed frame length overflow"))?;
-                    file.write_all(&len_u32.to_le_bytes())?;
-                }
-                file.write_all(&payload_len_u32.to_le_bytes())?;
-
-                // Write frame_map sidecar for selective decompression.
                 if let Some(dir) = self.path.parent()
                     && !dir.as_os_str().is_empty()
                 {
-                    write_frame_map(dir, &self.boundaries, &frames)?;
+                    self.basename_index.write_sidecars(dir)?;
                 }
+
+                return Ok(size);
+            }
+            2 => {
+                self.flush_chunk()?;
             }
             _ => unreachable!(),
         }
+
+        let mut file = self
+            .file
+            .take()
+            .ok_or_else(|| Error::Io(std::io::Error::other("database file not open")))?;
+
+        let frame_count = u32::try_from(self.frame_lengths.len())
+            .map_err(|_| Error::Corrupt("frame count overflow"))?;
+        let payload_len = 4usize
+            .checked_add(
+                self.frame_lengths
+                    .len()
+                    .checked_mul(4)
+                    .ok_or(Error::Corrupt("seek table length overflow"))?,
+            )
+            .and_then(|len| len.checked_add(4))
+            .ok_or(Error::Corrupt("seek table length overflow"))?;
+        let payload_len_u32 =
+            u32::try_from(payload_len).map_err(|_| Error::Corrupt("seek table length overflow"))?;
+
+        file.write_all(&SKIPPABLE_MAGIC.to_le_bytes())?;
+        file.write_all(&payload_len_u32.to_le_bytes())?;
+        file.write_all(&frame_count.to_le_bytes())?;
+        for len in &self.frame_lengths {
+            file.write_all(&len.to_le_bytes())?;
+        }
+        file.write_all(&payload_len_u32.to_le_bytes())?;
 
         file.flush()?;
         let size = file.stream_position()?;
@@ -314,6 +416,7 @@ impl Writer {
         if let Some(dir) = self.path.parent()
             && !dir.as_os_str().is_empty()
         {
+            write_frame_map(dir, &self.frame_map, self.frame_lengths.len())?;
             self.basename_index.write_sidecars(dir)?;
         }
 
@@ -697,49 +800,11 @@ fn parse_seek_table(data: &[u8], data_start: usize) -> Result<Vec<(usize, usize)
 }
 
 /// Write the frame_map sidecar for selective decompression.
-fn write_frame_map(db_dir: &Path, boundaries: &[usize], frames: &[(usize, usize)]) -> Result<()> {
+fn write_frame_map(db_dir: &Path, frame_map: &[u32], frame_count: usize) -> Result<()> {
     let path = db_dir.join(FRAME_MAP_FILE);
     let mut file = File::create(&path)?;
 
-    // Build ordinal_to_frame: for each package ordinal, which frame contains it?
-    let package_count = boundaries.len();
-    let frame_count = frames.len();
-    let mut ordinal_to_frame = Vec::with_capacity(package_count);
-
-    let mut boundary_idx = 0usize;
-    for (frame_idx, (_frame_start, frame_end)) in frames.iter().enumerate() {
-        // Assign all packages whose boundaries fall within this frame.
-        while boundary_idx < boundaries.len() {
-            let boundary = *boundaries
-                .get(boundary_idx)
-                .ok_or(Error::Corrupt("package boundary index out of range"))?;
-            if boundary <= *frame_end {
-                ordinal_to_frame.push(
-                    u32::try_from(frame_idx).map_err(|_| Error::Corrupt("frame index overflow"))?,
-                );
-                boundary_idx += 1;
-            } else {
-                break;
-            }
-        }
-    }
-
-    // Validate every package boundary lies inside its assigned frame.
-    for (ord, &frame_idx) in ordinal_to_frame.iter().enumerate() {
-        let frame_idx_usize =
-            usize::try_from(frame_idx).map_err(|_| Error::Corrupt("frame index overflow"))?;
-        let Some((frame_start, frame_end)) = frames.get(frame_idx_usize) else {
-            return Err(Error::Corrupt("frame index out of range"));
-        };
-        let boundary = *boundaries
-            .get(ord)
-            .ok_or(Error::Corrupt("package boundary index out of range"))?;
-        if boundary < *frame_start || boundary > *frame_end {
-            return Err(Error::Corrupt("package boundary outside assigned frame"));
-        }
-    }
-
-    // Write the sidecar.
+    let package_count = frame_map.len();
     file.write_all(FRAME_MAP_MAGIC)?;
     file.write_u32::<LittleEndian>(FRAME_MAP_VERSION)?;
     let package_count_u32 =
@@ -748,7 +813,12 @@ fn write_frame_map(db_dir: &Path, boundaries: &[usize], frames: &[(usize, usize)
         u32::try_from(frame_count).map_err(|_| Error::Corrupt("frame count overflow"))?;
     file.write_u32::<LittleEndian>(package_count_u32)?;
     file.write_u32::<LittleEndian>(frame_count_u32)?;
-    for &frame_idx in &ordinal_to_frame {
+    for &frame_idx in frame_map {
+        if usize::try_from(frame_idx).map_err(|_| Error::Corrupt("frame index overflow"))?
+            >= frame_count
+        {
+            return Err(Error::Corrupt("frame index out of range"));
+        }
         file.write_u32::<LittleEndian>(frame_idx)?;
     }
 
