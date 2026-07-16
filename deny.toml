@@ -9,7 +9,6 @@ no-default-features = false
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-ignore = []
 
 [licenses]
 allow = [
@@ -22,10 +21,9 @@ allow = [
   "ISC",
   "Unicode-3.0",
   "CC0-1.0",
-  "MPL-2.0",
   "Zlib",
   "Unlicense",
-  "AGPL-3.0-only",
+  "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 private = { ignore = true, registries = [] }
