@@ -29,6 +29,7 @@ indexmap = { workspace = true }
 byteorder = { workspace = true }
 regex = { workspace = true }
 clap = { workspace = true, optional = true }
+xz2 = "0.1.7"
 
 [dev-dependencies]
 tempfile = "3"
