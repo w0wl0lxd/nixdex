@@ -118,7 +118,7 @@ impl IndexBuilder {
         })?;
 
         info!(
-            packages = packages.store_paths.len(),
+            packages = packages.packages.len(),
             scopes = opts.extra_scopes.len(),
             "listed store paths from nixpkgs"
         );
@@ -132,7 +132,26 @@ impl IndexBuilder {
         let jobs = opts.jobs.max(1);
         let filter_prefix = opts.filter_prefix.as_bytes().to_vec();
 
-        let mut listings = listings::fetch_listings(&fetcher, jobs, packages.store_paths)
+        let starting_set = packages
+            .packages
+            .into_iter()
+            .flat_map(|pkg| {
+                let main_program = pkg.main_program.clone();
+                pkg.store_paths.into_iter().map(move |path| {
+                    let mp = if path.origin().output == "out" {
+                        main_program.clone()
+                    } else {
+                        None
+                    };
+                    listings::PackageEntry {
+                        path,
+                        main_program: mp,
+                    }
+                })
+            })
+            .collect();
+
+        let mut listings = listings::fetch_listings(&fetcher, jobs, starting_set)
             .await
             .map_err(|source| {
                 Error::Io(std::io::Error::other(format!(
@@ -144,7 +163,7 @@ impl IndexBuilder {
         let mut failed = 0usize;
         while let Some(result) = listings.recv().await {
             match result {
-                Ok((store_path, _nar_path, tree)) => {
+                Ok((store_path, tree)) => {
                     writer
                         .add(&store_path, &tree, &filter_prefix)
                         .map_err(|source| Error::WriteDatabase {

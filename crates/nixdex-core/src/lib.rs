@@ -18,7 +18,7 @@ pub use errors::{Error, Result};
 pub use files::{ALL_FILE_TYPES, FileEntries, FileNode, FileTree, FileTreeEntry, FileType};
 pub use hydra::Fetcher;
 pub use nixpkgs::{
-    EvalJob, EvalJobLine, EvalJobsOptions, PackageList, eval_expr_for_nixpkgs,
+    EvalJob, EvalJobLine, EvalJobsOptions, Package, PackageList, eval_expr_for_nixpkgs,
     list_packages_with_scopes,
 };
 pub use store_path::{Origin, StorePath};
