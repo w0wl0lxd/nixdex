@@ -72,6 +72,12 @@ pub struct EvalJobsOptions<'a> {
     pub system: Option<&'a str>,
     /// Optional `--select` expression to scope evaluation (recommended for tests).
     pub select: Option<&'a str>,
+    /// Whether to pass `--no-instantiate` to `nix-eval-jobs`.
+    ///
+    /// This skips writing store derivations and can be significantly faster,
+    /// but may leave `outputs` uninstantiated. It is most useful with
+    /// metadata-only passes.
+    pub no_instantiate: bool,
     /// Whether to pass `--check-cache-status`.
     pub check_cache_status: bool,
     /// Whether to pass `--show-trace` to Nix.
@@ -117,8 +123,11 @@ pub struct EvalJob {
     #[serde(default = "default_store_dir")]
     pub store_dir: String,
     /// Output name → store path map.
+    ///
+    /// Values may be `None` when `nix-eval-jobs` is run with `--no-instantiate`
+    /// or when an output is not yet built.
     #[serde(default)]
-    pub outputs: IndexMap<String, String>,
+    pub outputs: IndexMap<String, Option<String>>,
     /// Cache availability when `--check-cache-status` is set.
     #[serde(default)]
     pub cache_status: Option<String>,
@@ -182,7 +191,7 @@ impl EvalJob {
     /// Whether this line is a successful derivation (not an error record).
     #[must_use]
     pub fn is_success(&self) -> bool {
-        self.error.is_none() && self.fatal != Some(true) && !self.outputs.is_empty()
+        self.error.is_none() && self.fatal != Some(true)
     }
 
     /// Whether the outputs look available for substitution / listing.
@@ -213,7 +222,10 @@ impl EvalJob {
         };
 
         let mut out = Vec::with_capacity(self.outputs.len());
-        for (output, path) in &self.outputs {
+        for (output, maybe_path) in &self.outputs {
+            let Some(path) = maybe_path else {
+                continue;
+            };
             let origin = Origin {
                 attr: attr.clone(),
                 output: output.clone(),
@@ -391,6 +403,9 @@ pub async fn run_eval_jobs(options: &EvalJobsOptions<'_>) -> Result<EvalJobsStre
     }
     if let Some(system) = options.system {
         cmd.arg("--system").arg(system);
+    }
+    if options.no_instantiate {
+        cmd.arg("--no-instantiate");
     }
     if let Some(select) = options.select {
         cmd.arg("--select").arg(select);
@@ -573,26 +588,21 @@ async fn stream_options_to_entries(
 ///
 /// Propagates evaluation errors for the root set.
 pub async fn stream_package_entries(
-    nixpkgs: &str,
-    system: Option<&str>,
+    base: EvalJobsOptions<'_>,
     extra_scopes: &[String],
-    show_trace: bool,
     main_program: bool,
-    meta: bool,
     tx: mpsc::Sender<PackageEntry>,
     meta_tx: mpsc::Sender<PackageMeta>,
 ) -> Result<usize> {
-    let root_opts = EvalJobsOptions {
-        nixpkgs,
-        system,
-        select: None,
-        check_cache_status: true,
-        show_trace,
-        meta,
-        scope: None,
-    };
     let meta_ref = Some(&meta_tx);
-    let mut count = stream_options_to_entries(&root_opts, &tx, meta_ref, main_program).await?;
+    let mut count = stream_options_to_entries(&base, &tx, meta_ref, main_program).await?;
+
+    // A `--select` expression is applied to the root nixpkgs set; extra scopes
+    // are separate attribute paths and should not be evaluated when the caller
+    // has explicitly narrowed the root set.
+    if base.select.is_some() {
+        return Ok(count);
+    }
 
     for scope in extra_scopes {
         if scope.is_empty() {
@@ -601,13 +611,16 @@ pub async fn stream_package_entries(
         if validate_scope(scope).is_err() {
             continue;
         }
+        // Apply the root `--select` only to the root set; scopes are already
+        // narrowed subsets.
         let scope_opts = EvalJobsOptions {
-            nixpkgs,
-            system,
+            nixpkgs: base.nixpkgs,
+            system: base.system,
             select: None,
-            check_cache_status: true,
-            show_trace,
-            meta,
+            no_instantiate: base.no_instantiate,
+            check_cache_status: base.check_cache_status,
+            show_trace: base.show_trace,
+            meta: base.meta,
             scope: Some(scope.as_str()),
         };
         match stream_options_to_entries(&scope_opts, &tx, meta_ref, main_program).await {
@@ -628,22 +641,17 @@ pub async fn stream_package_entries(
 /// Propagates hard evaluation failures for the root set. Scope failures are
 /// returned as soft-empty lists by the caller.
 pub async fn list_packages_with_scopes(
-    nixpkgs: &str,
-    system: Option<&str>,
+    base: EvalJobsOptions<'_>,
     extra_scopes: &[String],
-    show_trace: bool,
-    main_program: bool,
 ) -> Result<PackageList> {
-    let root_opts = EvalJobsOptions {
-        nixpkgs,
-        system,
-        select: None,
-        check_cache_status: true,
-        show_trace,
-        meta: main_program,
-        scope: None,
-    };
-    let mut merged = list_packages_async(&root_opts).await?;
+    let mut merged = list_packages_async(&base).await?;
+
+    // A `--select` expression is applied to the root nixpkgs set; extra scopes
+    // are separate attribute paths and should not be evaluated when the caller
+    // has explicitly narrowed the root set.
+    if base.select.is_some() {
+        return Ok(merged);
+    }
 
     for scope in extra_scopes {
         if scope.is_empty() {
@@ -653,12 +661,13 @@ pub async fn list_packages_with_scopes(
             continue;
         }
         let scope_opts = EvalJobsOptions {
-            nixpkgs,
-            system,
+            nixpkgs: base.nixpkgs,
+            system: base.system,
             select: None,
-            check_cache_status: true,
-            show_trace,
-            meta: main_program,
+            no_instantiate: base.no_instantiate,
+            check_cache_status: base.check_cache_status,
+            show_trace: base.show_trace,
+            meta: base.meta,
             scope: Some(scope.as_str()),
         };
         match list_packages_async(&scope_opts).await {
@@ -686,16 +695,20 @@ pub fn list_packages(
     show_trace: bool,
     main_program: bool,
 ) -> Result<PackageList> {
+    let base = EvalJobsOptions {
+        nixpkgs,
+        system,
+        select: None,
+        no_instantiate: false,
+        check_cache_status: true,
+        show_trace,
+        meta: main_program,
+        scope: None,
+    };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(list_packages_with_scopes(
-        nixpkgs,
-        system,
-        extra_scopes,
-        show_trace,
-        main_program,
-    ))
+    runtime.block_on(list_packages_with_scopes(base, extra_scopes))
 }
 
 /// Verify that a local nixpkgs path exists (pre-flight helper).
