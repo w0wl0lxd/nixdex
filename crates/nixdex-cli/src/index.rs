@@ -81,6 +81,10 @@ pub struct Args {
     #[arg(long)]
     pub no_main_program: bool,
 
+    /// Only evaluate nixpkgs; do not fetch listings or write the files database.
+    #[arg(long)]
+    pub only_eval: bool,
+
     /// Additional nixpkgs scopes to include.
     #[arg(
         long,
@@ -153,6 +157,7 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
         path_cache_ttl: args.path_cache_ttl,
         main_program: !args.no_main_program,
         extra_scopes: args.extra_scopes,
+        only_eval: args.only_eval,
     };
 
     nixdex_core::update_index(&options)

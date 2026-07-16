@@ -55,6 +55,8 @@ pub struct UpdateOptions {
     pub main_program: bool,
     /// Extra attribute scopes to walk during evaluation.
     pub extra_scopes: Vec<String>,
+    /// Only evaluate nixpkgs; do not fetch listings or write the files database.
+    pub only_eval: bool,
 }
 
 impl Default for UpdateOptions {
@@ -80,6 +82,7 @@ impl Default for UpdateOptions {
                 String::from("coqPackages"),
                 String::from("texlive.pkgs"),
             ],
+            only_eval: false,
         }
     }
 }
@@ -278,6 +281,29 @@ impl IndexBuilder {
         }
     }
 
+    /// Run an eval-only pass and write the package metadata sidecar.
+    async fn build_eval_only(&self) -> Result<()> {
+        let opts = &self.options;
+        std::fs::create_dir_all(&opts.database).map_err(|source| Error::CreateDatabaseDir {
+            path: opts.database.clone(),
+            source,
+        })?;
+        let eval_start = quanta::Instant::now();
+        let mut stream = self.spawn_package_eval_stream();
+        while stream.packages.recv().await.is_some() {}
+        let (eval_count, eval_elapsed) = Self::await_eval(stream.eval).await?;
+        Self::await_meta(stream.meta).await;
+        let total_elapsed = eval_start.elapsed();
+        info!(
+            eval_count,
+            ?eval_elapsed,
+            ?total_elapsed,
+            db = %opts.database.display(),
+            "eval-only run complete"
+        );
+        Ok(())
+    }
+
     /// Run the index build: evaluate packages, fetch `.ls` trees, write NIXI DB.
     ///
     /// # Errors
@@ -286,6 +312,10 @@ impl IndexBuilder {
     /// fails hard, or the writer cannot be finalized.
     pub async fn build(&self) -> Result<()> {
         let opts = &self.options;
+
+        if opts.only_eval {
+            return self.build_eval_only().await;
+        }
 
         let (db_file, mut writer, path_cache, cache_path) = self.prepare_database()?;
         let progress = MultiProgress::new();
@@ -519,11 +549,13 @@ mod tests {
     async fn index_hello_from_nixpkgs() {
         let dir = tempfile::tempdir().expect("tempdir");
         // Evaluate a tiny attrset rather than all of nixpkgs.
-        let expr = r"{ hello = (import <nixpkgs> {}).hello; }";
+        let nixpkgs_file = dir.path().join("small.nix");
+        std::fs::write(&nixpkgs_file, r"{ hello = (import <nixpkgs> {}).hello; }")
+            .expect("write fixture");
         let opts = UpdateOptions {
             jobs: 4,
             database: dir.path().to_path_buf(),
-            nixpkgs: expr.to_string(),
+            nixpkgs: nixpkgs_file.to_string_lossy().into_owned(),
             system: None,
             compression_level: 3,
             format_version: 1,
@@ -536,6 +568,7 @@ mod tests {
             path_cache_ttl: None,
             main_program: true,
             extra_scopes: vec![],
+            only_eval: false,
         };
         IndexBuilder::new(opts).build().await.expect("build");
         assert!(dir.path().join("files").exists());
