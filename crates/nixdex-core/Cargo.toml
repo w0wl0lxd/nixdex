@@ -40,6 +40,7 @@ xz2 = "0.1.7"
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true }
+proptest = { workspace = true }
 
 [lints]
 workspace = true
