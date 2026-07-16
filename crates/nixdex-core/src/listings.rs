@@ -203,6 +203,8 @@ async fn fetch_listings_with_source<S: ListingSource>(
     {
         let mut q = queue.lock().await;
         for entry in starting_set {
+            // `scc::HashSet::insert_sync` returns `Ok(())` for a newly inserted
+            // key and `Err(key)` if it already exists, so `is_ok()` is correct.
             if seen.insert_sync(entry.path.hash().to_string()).is_ok() {
                 in_flight.fetch_add(1, Ordering::SeqCst);
                 q.push_back(entry);
@@ -303,6 +305,8 @@ async fn process_path_inner<S: ListingSource>(
 
     for r in refs {
         let hash = r.hash().to_string();
+        // `scc::HashSet::insert_sync` returns `Ok(())` for a newly inserted
+        // key and `Err(key)` if it already exists, so `is_ok()` is correct.
         if seen.insert_sync(hash).is_ok() {
             in_flight.fetch_add(1, Ordering::SeqCst);
             queue.lock().await.push_back(PackageEntry::new(r));
