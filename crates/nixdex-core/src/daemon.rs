@@ -508,7 +508,10 @@ async fn nix_locate_handler(
         ));
     }
 
-    let limit = params.limit.unwrap_or(MAX_RESULT_LIMIT);
+    let limit = match params.limit {
+        Some(limit) => limit,
+        None => MAX_RESULT_LIMIT,
+    };
     if limit > MAX_RESULT_LIMIT {
         return Err(json_error(
             axum::http::StatusCode::BAD_REQUEST,
@@ -1022,7 +1025,10 @@ async fn search_handler(
         ));
     }
 
-    let limit = params.limit.unwrap_or(MAX_RESULT_LIMIT);
+    let limit = match params.limit {
+        Some(limit) => limit,
+        None => MAX_RESULT_LIMIT,
+    };
     if limit > MAX_RESULT_LIMIT {
         return Err(json_error(
             axum::http::StatusCode::BAD_REQUEST,
