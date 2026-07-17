@@ -23,7 +23,8 @@ fn comma_available() -> Option<&'static str> {
             // Prefer "," over "comma" when both are available
             let comma_candidate = dir.join(",");
             if comma_candidate.is_file()
-                && std::fs::metadata(&comma_candidate).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+                && std::fs::metadata(&comma_candidate)
+                    .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
             {
                 return Some(",");
             }
@@ -659,10 +660,8 @@ fn run_command_not_found(opts: CommandNotFoundOpts) -> color_eyre::Result<()> {
             interactive_run(&[attr], exec_cmd, &opts.args)
         }
         _ if interactive => {
-            let attrs: color_eyre::Result<Vec<String>> = providers
-                .iter()
-                .map(provider_attr)
-                .collect();
+            let attrs: color_eyre::Result<Vec<String>> =
+                providers.iter().map(provider_attr).collect();
             interactive_run(&attrs?, exec_cmd, &opts.args)
         }
         [single] if auto_install => {

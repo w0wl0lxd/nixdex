@@ -63,14 +63,17 @@ impl From<FileTreeEntry> for SerializableEntry {
             crate::files::FileNode::Regular { size, executable } => {
                 SerializableNode::Regular { size, executable }
             }
-            crate::files::FileNode::Symlink { target } => {
-                SerializableNode::Symlink { target: target.to_vec() }
-            }
+            crate::files::FileNode::Symlink { target } => SerializableNode::Symlink {
+                target: target.to_vec(),
+            },
             crate::files::FileNode::Directory { size, contents: () } => {
                 SerializableNode::Directory { size }
             }
         };
-        Self { path: entry.path, node }
+        Self {
+            path: entry.path,
+            node,
+        }
     }
 }
 
@@ -82,14 +85,17 @@ impl TryFrom<SerializableEntry> for FileTreeEntry {
             SerializableNode::Regular { size, executable } => {
                 crate::files::FileNode::Regular { size, executable }
             }
-            SerializableNode::Symlink { target } => {
-                crate::files::FileNode::Symlink { target: target.into() }
-            }
+            SerializableNode::Symlink { target } => crate::files::FileNode::Symlink {
+                target: target.into(),
+            },
             SerializableNode::Directory { size } => {
                 crate::files::FileNode::Directory { size, contents: () }
             }
         };
-        Ok(Self { path: value.path, node })
+        Ok(Self {
+            path: value.path,
+            node,
+        })
     }
 }
 
@@ -113,19 +119,30 @@ impl Writer {
     }
 
     /// Add one store path and filtered file tree to the index.
-    pub fn add(&mut self, store_path: &StorePath, files: &FileTree, filter_prefix: &[u8]) -> Result<()> {
+    pub fn add(
+        &mut self,
+        store_path: &StorePath,
+        files: &FileTree,
+        filter_prefix: &[u8],
+    ) -> Result<()> {
         let entries = files.to_list(filter_prefix);
         if entries.is_empty() {
             return Ok(());
         }
 
-        let origin_key = format!("{}.{}", store_path.origin().attr, store_path.origin().output);
-        let serializable_entries: Vec<SerializableEntry> = entries.iter().cloned().map(Into::into).collect();
+        let origin_key = format!(
+            "{}.{}",
+            store_path.origin().attr,
+            store_path.origin().output
+        );
+        let serializable_entries: Vec<SerializableEntry> =
+            entries.iter().cloned().map(Into::into).collect();
         let package = Package {
             store_path: store_path.clone(),
             entries: serializable_entries,
         };
-        let package = postcard::to_stdvec(&package).map_err(|err| Error::Postcard(err.to_string()))?;
+        let package =
+            postcard::to_stdvec(&package).map_err(|err| Error::Postcard(err.to_string()))?;
         let write = self.database.begin_write().map_err(self_redb_error)?;
         {
             let mut packages = write.open_table(PACKAGES).map_err(self_redb_error)?;
@@ -141,7 +158,10 @@ impl Writer {
                     continue;
                 }
                 let basename_str = String::from_utf8_lossy(basename).to_string();
-                let mut origins = match basenames.get(basename_str.as_str()).map_err(self_redb_error)? {
+                let mut origins = match basenames
+                    .get(basename_str.as_str())
+                    .map_err(self_redb_error)?
+                {
                     Some(value) => postcard::from_bytes(value.value())
                         .map_err(|err| Error::Postcard(err.to_string()))?,
                     None => Vec::new(),
@@ -159,8 +179,7 @@ impl Writer {
         write.commit().map_err(self_redb_error)?;
 
         for entry in entries {
-            self
-                .path_cache
+            self.path_cache
                 .entry(entry.path)
                 .or_default()
                 .push(origin_key.clone());
@@ -170,7 +189,8 @@ impl Writer {
 
     /// Finalize the path cache sidecar.
     pub fn finish(self) -> Result<()> {
-        let bytes = postcard::to_stdvec(&self.path_cache).map_err(|err| Error::Postcard(err.to_string()))?;
+        let bytes = postcard::to_stdvec(&self.path_cache)
+            .map_err(|err| Error::Postcard(err.to_string()))?;
         fs::write(self.path_cache_path, bytes)?;
         Ok(())
     }
@@ -205,20 +225,24 @@ impl Reader {
     }
 
     /// Return the package recorded for the origin key (`attr.output`).
-    pub fn package_by_origin(&self, origin: &str) -> Result<Option<(StorePath, Vec<FileTreeEntry>)>> {
+    pub fn package_by_origin(
+        &self,
+        origin: &str,
+    ) -> Result<Option<(StorePath, Vec<FileTreeEntry>)>> {
         let read = self.database.begin_read().map_err(self_redb_error)?;
         let packages = read.open_table(PACKAGES).map_err(self_redb_error)?;
         let package = packages
             .get(origin)
             .map_err(self_redb_error)?
-            .map(|value| postcard::from_bytes::<Package>(value.value()).map_err(|err| Error::Postcard(err.to_string())))
+            .map(|value| {
+                postcard::from_bytes::<Package>(value.value())
+                    .map_err(|err| Error::Postcard(err.to_string()))
+            })
             .transpose()?;
         match package {
             Some(pkg) => {
-                let entries: std::result::Result<Vec<FileTreeEntry>, String> = pkg.entries
-                    .into_iter()
-                    .map(TryInto::try_into)
-                    .collect();
+                let entries: std::result::Result<Vec<FileTreeEntry>, String> =
+                    pkg.entries.into_iter().map(TryInto::try_into).collect();
                 let entries = entries.map_err(Error::Postcard)?;
                 Ok(Some((pkg.store_path, entries)))
             }
@@ -241,7 +265,10 @@ impl Reader {
     }
 
     /// Return exact-path hits when the postcard sidecar is available.
-    pub fn exact_path_entries(&self, path: &[u8]) -> Result<Option<Vec<(StorePath, FileTreeEntry)>>> {
+    pub fn exact_path_entries(
+        &self,
+        path: &[u8],
+    ) -> Result<Option<Vec<(StorePath, FileTreeEntry)>>> {
         let Some(origins) = self.path_cache.as_ref().and_then(|cache| cache.get(path)) else {
             return Ok(None);
         };
