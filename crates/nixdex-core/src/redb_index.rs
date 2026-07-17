@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::basename_index::basename_of;
-use crate::files::{FileTree, FileTreeEntry};
+use crate::files::FileTreeEntry;
 use crate::store_path::StorePath;
 
 /// Siblings of the NIXI, `files`, database.
@@ -146,7 +146,7 @@ impl Writer {
         }
         {
             let mut basenames = write.open_table(BASENAMES).map_err(self_redb_error)?;
-            for entry in &entries {
+            for entry in entries {
                 let basename = basename_of(&entry.path);
                 if basename.is_empty() {
                     continue;
