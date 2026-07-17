@@ -1,0 +1,3 @@
+- Add redb-backed file index (`files.redb`) with exact-path cache sidecar (`files.pathcache`).
+- Add `redb` module with `Writer` for building the index and `Reader` for querying by origin key (`attr.output`), basename, or exact path.
+- Key cached package entries by origin (`attr.output`) instead of hash to preserve all attribute aliases for the same store output, ensuring `--at-root --whole-name` and `--minimal` queries return all matching origins.
