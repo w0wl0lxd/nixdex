@@ -696,3 +696,22 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("overflow"));
     }
 }
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::read_u32_le;
+
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn check_read_u32_le_no_panic() {
+        let mut bytes = [0u8; 8];
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        for i in 0..len {
+            bytes[i] = kani::any();
+        }
+        let at: usize = kani::any();
+        kani::assume(at <= bytes.len());
+        let _ = read_u32_le(&bytes[..len], at);
+    }
+}
