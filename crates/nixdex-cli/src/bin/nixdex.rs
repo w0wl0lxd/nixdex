@@ -557,13 +557,20 @@ fn run_command_not_found(opts: CommandNotFoundOpts) -> color_eyre::Result<()> {
 
     let providers = find_command_providers(&opts.cmd, &reader)?;
 
+    // For execution we only need the command basename; an absolute path like
+    // /bin/ls is not present inside the nix shell/profile.
+    let exec_cmd = std::path::Path::new(&opts.cmd)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map_or(opts.cmd.as_str(), |s| s);
+
     match providers.as_slice() {
         [] => {
             eprintln!("{}: command not found", opts.cmd);
             std::process::exit(127);
         }
-        [single] if auto_install => auto_install_and_exec(single, &opts.cmd, &opts.args),
-        [single] if auto_run => auto_run_command(single, &opts.cmd, &opts.args),
+        [single] if auto_install => auto_install_and_exec(single, exec_cmd, &opts.args),
+        [single] if auto_run => auto_run_command(single, exec_cmd, &opts.args),
         [single] if opts.json => {
             let line =
                 sonic_rs::to_string(single).wrap_err("failed to serialize command provider")?;
