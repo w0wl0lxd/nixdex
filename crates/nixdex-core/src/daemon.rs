@@ -421,6 +421,8 @@ async fn download_and_update(config: &PrebuiltConfig, cache_dir: &std::path::Pat
 async fn run_http_server(addr: &str, index_state: Arc<IndexState>) -> Result<()> {
     let app = Router::new()
         .route("/health", get(health_handler))
+        .route("/ready", get(ready_handler))
+        .route("/version", get(version_handler))
         .route("/metrics", get(metrics_handler))
         .route("/reload", post(reload_handler))
         .route("/locate", get(locate_handler))
@@ -862,6 +864,59 @@ async fn health_handler(State(index_state): State<Arc<IndexState>>) -> axum::Jso
     })
 }
 
+/// Readiness response.
+#[cfg(feature = "daemon")]
+#[derive(Serialize)]
+struct ReadyResponse {
+    ready: bool,
+    index_loaded: bool,
+    package_db_loaded: bool,
+}
+
+/// HTTP handler for `/ready`.
+#[cfg(feature = "daemon")]
+async fn ready_handler(
+    State(index_state): State<Arc<IndexState>>,
+) -> (axum::http::StatusCode, axum::Json<ReadyResponse>) {
+    index_state.requests_total.fetch_add(1, Ordering::Relaxed);
+    let index_loaded = matches!(index_state.basename.read(), Ok(g) if g.is_some());
+    let package_db_loaded = matches!(index_state.package_db.read(), Ok(g) if g.is_some());
+    let ready = index_loaded && package_db_loaded;
+
+    let status = if ready {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (
+        status,
+        axum::Json(ReadyResponse {
+            ready,
+            index_loaded,
+            package_db_loaded,
+        }),
+    )
+}
+
+/// Version response.
+#[cfg(feature = "daemon")]
+#[derive(Serialize)]
+struct VersionResponse {
+    version: &'static str,
+}
+
+/// HTTP handler for `/version`.
+#[cfg(feature = "daemon")]
+async fn version_handler(
+    State(index_state): State<Arc<IndexState>>,
+) -> axum::Json<VersionResponse> {
+    index_state.requests_total.fetch_add(1, Ordering::Relaxed);
+    axum::Json(VersionResponse {
+        version: env!("CARGO_PKG_VERSION"),
+    })
+}
+
 /// Reload response.
 #[cfg(feature = "daemon")]
 #[derive(Serialize)]
@@ -1055,4 +1110,41 @@ struct SearchResponse {
     count: Option<usize>,
     names: Option<Vec<String>>,
     results: Vec<crate::PackageMeta>,
+}
+
+#[cfg(test)]
+#[cfg(feature = "daemon")]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    fn empty_state() -> Arc<IndexState> {
+        let (reload_tx, _reload_rx) = tokio::sync::mpsc::unbounded_channel();
+        Arc::new(IndexState {
+            basename: Arc::new(std::sync::RwLock::new(None)),
+            reader: Arc::new(std::sync::RwLock::new(None)),
+            package_db: Arc::new(std::sync::RwLock::new(None)),
+            database_dir: Arc::new(std::sync::RwLock::new(None)),
+            start_time: Instant::now(),
+            requests_total: AtomicU64::new(0),
+            reload: reload_tx,
+        })
+    }
+
+    #[tokio::test]
+    async fn version_handler_returns_version() {
+        let state = empty_state();
+        let response = version_handler(axum::extract::State(state)).await;
+        assert_eq!(response.0.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn ready_handler_returns_503_when_unloaded() {
+        let state = empty_state();
+        let (status, response) = ready_handler(axum::extract::State(state)).await;
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!response.0.ready);
+        assert!(!response.0.index_loaded);
+        assert!(!response.0.package_db_loaded);
+    }
 }
