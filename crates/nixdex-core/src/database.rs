@@ -33,6 +33,7 @@ use crate::files::{FileNode, FileTree, FileTreeEntry, FileType};
 use crate::frcode;
 use crate::nixpkgs::PackageMeta;
 use crate::path_index::{PathIndex, PathIndexBuilder};
+use crate::redb_index;
 use crate::store_path::StorePath;
 
 /// Database format versions supported by this build.
@@ -185,6 +186,8 @@ pub struct Writer {
     finished: bool,
     /// Accumulated (attr, output, hash) triples for the attrs sidecar.
     attrs: Vec<(String, String, String)>,
+    /// Optional redb index written alongside the NIXI database.
+    redb: Option<redb_index::Writer>,
 }
 
 impl Drop for Writer {
@@ -226,6 +229,13 @@ impl Writer {
         file.write_all(FILE_MAGIC)?;
         file.write_u64::<LittleEndian>(version)?;
 
+        let redb = path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(redb_index::Writer::create)
+            .transpose()
+            .map_err(|err| Error::Io(std::io::Error::other(err.to_string())))?;
+
         Ok(Self {
             path,
             level,
@@ -239,6 +249,7 @@ impl Writer {
             frame_map: Vec::new(),
             finished: false,
             attrs: Vec::new(),
+            redb,
         })
     }
 
@@ -290,6 +301,12 @@ impl Writer {
 
         // Record full paths in the path index using the same ordinal
         self.path_index.record_package(ordinal, paths)?;
+
+        // Add to redb index if enabled
+        if let Some(redb) = &mut self.redb {
+            redb.add(path, files, filter_prefix)
+                .map_err(|err| Error::Io(std::io::Error::other(err.to_string())))?;
+        }
 
         let mut package = Vec::new();
         let json = sonic_rs::to_vec(path).map_err(|err| Error::Json(err.to_string()))?;
@@ -448,6 +465,10 @@ impl Writer {
                     self.basename_index.write_sidecars(dir)?;
                     write_attrs_sidecar(dir, &self.attrs)?;
                     self.path_index.write_sidecars(dir)?;
+                    if let Some(redb) = self.redb.take() {
+                        redb.finish()
+                            .map_err(|err| Error::Io(std::io::Error::other(err.to_string())))?;
+                    }
                 }
 
                 return Ok(size);
@@ -495,6 +516,10 @@ impl Writer {
             self.basename_index.write_sidecars(dir)?;
             write_attrs_sidecar(dir, &self.attrs)?;
             self.path_index.write_sidecars(dir)?;
+            if let Some(redb) = self.redb.take() {
+                redb.finish()
+                    .map_err(|err| Error::Io(std::io::Error::other(err.to_string())))?;
+            }
         }
 
         Ok(size)
@@ -560,6 +585,8 @@ pub struct Reader {
     frame_map: Option<Vec<u32>>,
     /// For each frame, the first package ordinal in that frame.
     frame_starts: Option<Vec<u32>>,
+    /// Optional redb reader for fast exact-path lookups.
+    redb: Option<redb_index::Reader>,
 }
 
 impl Reader {
@@ -638,6 +665,21 @@ impl Reader {
             (None, None)
         };
 
+        // Try to open redb index for fast exact-path lookups.
+        let redb = if let Some(dir) = path_buf.parent()
+            && !dir.as_os_str().is_empty()
+        {
+            match redb_index::Reader::open(dir) {
+                Ok(r) => Some(r),
+                Err(err) => {
+                    tracing::debug!(%err, "redb index unavailable; falling back to scan");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             path: path_buf,
             version,
@@ -645,6 +687,7 @@ impl Reader {
             frames,
             frame_map,
             frame_starts,
+            redb,
         })
     }
 
@@ -1720,18 +1763,36 @@ pub fn search_results(
         source: Box::new(source),
     })?;
 
-    let mut results = reader
-        .search_entries(
-            &path_pattern,
-            package_re.as_ref(),
-            options.hash.as_deref(),
-            None, // package_labels not used with ordinals
-            package_ordinals.as_ref(),
-        )
-        .map_err(|source| crate::Error::ReadDatabase {
-            path: index_file,
-            source: Box::new(source),
-        })?;
+    // Try redb index for exact-path lookups when available
+    let mut results = if let (Some(redb), Some(exact_path)) = (&reader.redb, &options.exact_path) {
+        let path_bytes = exact_path.as_bytes();
+        match redb.exact_path_entries(path_bytes) {
+            Ok(Some(hits)) => hits,
+            Ok(None) => Vec::new(),
+            Err(err) => {
+                tracing::debug!(%err, "redb exact-path lookup failed; falling back to scan");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    // If redb didn't return results (or wasn't used), fall back to full scan
+    if results.is_empty() {
+        results = reader
+            .search_entries(
+                &path_pattern,
+                package_re.as_ref(),
+                options.hash.as_deref(),
+                None, // package_labels not used with ordinals
+                package_ordinals.as_ref(),
+            )
+            .map_err(|source| crate::Error::ReadDatabase {
+                path: index_file,
+                source: Box::new(source),
+            })?;
+    }
 
     match options.sort {
         SearchSort::None => {}
