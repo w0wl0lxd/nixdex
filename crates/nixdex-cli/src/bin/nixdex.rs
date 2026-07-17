@@ -13,6 +13,24 @@ use tracing_subscriber::EnvFilter;
 use nixdex_cli::{index, locate};
 use nixdex_core::package_search::{SearchDb, SearchField, SearchSort};
 
+/// Check whether `comma` (the `,` command) is available on `$PATH`.
+#[cfg(unix)]
+fn comma_available() -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            let candidate = dir.join(",");
+            candidate.is_file()
+                && std::fs::metadata(&candidate).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+        })
+    })
+}
+
+#[cfg(not(unix))]
+fn comma_available() -> bool {
+    false
+}
+
 /// Resolve the default nix-index database directory.
 fn default_db_dir() -> &'static str {
     static CACHE: OnceLock<String> = OnceLock::new();
@@ -584,6 +602,7 @@ fn run_command_not_found(opts: CommandNotFoundOpts) -> color_eyre::Result<()> {
         .wrap_err_with(|| format!("failed to open index at {}", files.display()))?;
 
     let providers = find_command_providers(&opts.cmd, &reader)?;
+    let comma = comma_available();
 
     // For execution we only need the command basename; an absolute path like
     // /bin/ls is not present inside the nix shell/profile.
@@ -610,6 +629,9 @@ fn run_command_not_found(opts: CommandNotFoundOpts) -> color_eyre::Result<()> {
                 "The program '{}' is currently not installed. It is provided by the package '{}'.",
                 opts.cmd, single
             );
+            if comma {
+                eprintln!("  Run it without installing: , {}", opts.cmd);
+            }
             std::process::exit(127);
         }
         _ if auto_install || auto_run => {
@@ -634,6 +656,9 @@ fn run_command_not_found(opts: CommandNotFoundOpts) -> color_eyre::Result<()> {
             );
             for provider in &providers {
                 eprintln!("  {provider}");
+            }
+            if comma {
+                eprintln!("  Run one without installing: , {}", opts.cmd);
             }
             std::process::exit(127);
         }
