@@ -1,5 +1,6 @@
 //! Recursive closure traversal for binary-cache `.ls` listings.
 
+use indexmap::IndexMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -103,6 +104,8 @@ impl ListingSource for Fetcher {
 struct CachedSource {
     inner: Fetcher,
     cache: Arc<PathCache>,
+    /// Map of `attr.output` -> store-path hash from the previous build.
+    attrs_map: IndexMap<String, String>,
 }
 
 #[allow(clippy::manual_async_fn)]
@@ -138,6 +141,21 @@ impl ListingSource for CachedSource {
     ) -> impl std::future::Future<Output = std::result::Result<FileTree, hydra::Error>> + Send {
         async move {
             let hash = path.hash();
+            let key = format!("{}.{}", path.origin().attr, path.origin().output);
+
+            // Check if the package's hash matches the previous build.
+            if let Some(prev_hash) = self.attrs_map.get(&key)
+                && prev_hash == hash
+            {
+                // Hash matches: try to reuse from PathCache.
+                if let Some(tree) = self.cache.get_tree(hash) {
+                    self.cache.hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(tree);
+                }
+                // Hash matches but tree not in cache: fall through to fetch.
+            }
+
+            // Normal cache lookup.
             if let Some(tree) = self.cache.get_tree(hash) {
                 self.cache.hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(tree);
@@ -172,7 +190,8 @@ impl ListingSource for CachedSource {
 ///
 /// When `path_cache` is `Some`, fetched narinfo references and `.ls` trees are
 /// looked up from the cache before making HTTP requests and written back on
-/// misses.
+/// misses. The `attrs_map` provides `attr.output` -> store-path hash mappings
+/// from the previous build to skip fetches for unchanged packages.
 ///
 /// Concurrency is bounded by `jobs` (clamped to at least 1).
 pub async fn fetch_listings(
@@ -181,12 +200,14 @@ pub async fn fetch_listings(
     input: mpsc::Receiver<PackageEntry>,
     path_cache: Option<Arc<PathCache>>,
     filter_prefix: &[u8],
+    attrs_map: IndexMap<String, String>,
 ) -> Result<mpsc::Receiver<Result<ListingItem>>> {
     let prefix = Bytes::copy_from_slice(filter_prefix);
     if let Some(cache) = path_cache {
         let source = CachedSource {
             inner: fetcher.clone(),
             cache,
+            attrs_map,
         };
         fetch_listings_with_source(&source, jobs, input, prefix).await
     } else {

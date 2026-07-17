@@ -15,10 +15,12 @@ pub mod listings;
 pub mod nixpkgs;
 pub mod package_search;
 pub mod path_cache;
+pub mod path_index;
 pub mod prebuilt;
 pub mod store_path;
 
 pub use cache_dir::{nix_index_dir, nixdex_dir};
+pub use database::generate_sidecars;
 pub use errors::{Error, Result};
 pub use files::{ALL_FILE_TYPES, FileEntries, FileNode, FileTree, FileTreeEntry, FileType};
 pub use hydra::Fetcher;
