@@ -88,6 +88,8 @@ pub struct EvalJobsOptions<'a> {
     /// Optional attribute path suffix for extra scopes (e.g. `haskellPackages`).
     /// When set, the evaluated expression becomes `(root).<scope>`.
     pub scope: Option<&'a str>,
+    /// Whether to disable nixpkgs overlays (`overlays = []`).
+    pub no_overlays: bool,
 }
 
 /// A subset of the `meta` attrset emitted by `nix-eval-jobs --meta`.
@@ -319,7 +321,11 @@ fn validate_scope(scope: &str) -> Result<()> {
 /// # Errors
 ///
 /// Returns [`Error::InvalidArgument`] for rejected inputs.
-pub fn eval_expr_for_nixpkgs(value: &str, scope: Option<&str>) -> Result<String> {
+pub fn eval_expr_for_nixpkgs(
+    value: &str,
+    scope: Option<&str>,
+    no_overlays: bool,
+) -> Result<String> {
     if let Some(scope) = scope {
         validate_scope(scope)?;
     }
@@ -335,7 +341,8 @@ pub fn eval_expr_for_nixpkgs(value: &str, scope: Option<&str>) -> Result<String>
                 "invalid path lookup {value:?}"
             )));
         }
-        format!("import {value} {{ config = {{ allowAliases = false; }}; }}")
+        let overlays = if no_overlays { "overlays = []; " } else { "" };
+        format!("import {value} {{ config = {{ allowAliases = false; }}; {overlays}}}")
     } else {
         let path = Path::new(value);
         let abs: PathBuf = path.canonicalize().map_err(|err| {
@@ -349,7 +356,8 @@ pub fn eval_expr_for_nixpkgs(value: &str, scope: Option<&str>) -> Result<String>
             // File roots are evaluated as-is (fixtures like research/small.nix).
             format!("import \"{escaped}\"")
         } else if abs.is_dir() {
-            format!("import \"{escaped}\" {{ config = {{ allowAliases = false; }}; }}")
+            let overlays = if no_overlays { "overlays = []; " } else { "" };
+            format!("import \"{escaped}\" {{ config = {{ allowAliases = false; }}; {overlays}}}")
         } else {
             return Err(Error::InvalidArgument(format!(
                 "nixpkgs path is neither a file nor a directory: {}",
@@ -399,7 +407,7 @@ pub async fn run_eval_jobs(options: &EvalJobsOptions<'_>) -> Result<EvalJobsStre
         }
         cmd.arg("--flake").arg(options.nixpkgs);
     } else {
-        let expr = eval_expr_for_nixpkgs(options.nixpkgs, options.scope)?;
+        let expr = eval_expr_for_nixpkgs(options.nixpkgs, options.scope, options.no_overlays)?;
         cmd.arg("--expr").arg(expr);
     }
     if let Some(system) = options.system {
@@ -667,6 +675,7 @@ pub async fn stream_package_entries(
             show_trace: base.show_trace,
             meta: base.meta,
             scope: Some(scope.as_str()),
+            no_overlays: base.no_overlays,
         };
         match stream_options_to_entries(&scope_opts, &tx, meta_ref, main_program).await {
             Ok(n) => count += n,
@@ -714,6 +723,7 @@ pub async fn list_packages_with_scopes(
             show_trace: base.show_trace,
             meta: base.meta,
             scope: Some(scope.as_str()),
+            no_overlays: base.no_overlays,
         };
         match list_packages_async(&scope_opts).await {
             Ok(more) => {
@@ -749,6 +759,7 @@ pub fn list_packages(
         show_trace,
         meta: main_program,
         scope: None,
+        no_overlays: false,
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -824,22 +835,29 @@ mod tests {
 
     #[test]
     fn rejects_injection_in_nixpkgs_arg() {
-        assert!(eval_expr_for_nixpkgs(r"$(rm -rf /)", None).is_err());
-        assert!(eval_expr_for_nixpkgs(r#"foo"; builtins.trace "x" 1#"#, None).is_err());
-        assert!(eval_expr_for_nixpkgs("<nixpkgs/../../etc>", None).is_err());
+        assert!(eval_expr_for_nixpkgs(r"$(rm -rf /)", None, false).is_err());
+        assert!(eval_expr_for_nixpkgs(r#"foo"; builtins.trace "x" 1#"#, None, false).is_err());
+        assert!(eval_expr_for_nixpkgs("<nixpkgs/../../etc>", None, false).is_err());
     }
 
     #[test]
     fn accepts_path_lookup_and_scope() {
-        let expr = eval_expr_for_nixpkgs("<nixpkgs>", Some("haskellPackages")).expect("ok");
+        let expr = eval_expr_for_nixpkgs("<nixpkgs>", Some("haskellPackages"), false).expect("ok");
         assert!(expr.contains("import <nixpkgs>"));
         assert!(expr.ends_with(".haskellPackages"));
     }
 
     #[test]
     fn rejects_bad_scope() {
-        assert!(eval_expr_for_nixpkgs("<nixpkgs>", Some("foo;bar")).is_err());
-        assert!(eval_expr_for_nixpkgs("<nixpkgs>", Some("../x")).is_err());
+        assert!(eval_expr_for_nixpkgs("<nixpkgs>", Some("foo;bar"), false).is_err());
+        assert!(eval_expr_for_nixpkgs("<nixpkgs>", Some("../x"), false).is_err());
+    }
+
+    #[test]
+    fn no_overlays_adds_empty_overlays() {
+        let expr = eval_expr_for_nixpkgs("<nixpkgs>", None, true).expect("ok");
+        assert!(expr.contains("import <nixpkgs>"));
+        assert!(expr.contains("overlays = []"));
     }
 
     #[test]
@@ -849,7 +867,7 @@ mod tests {
         let path = dir.path().join(file_name);
         std::fs::File::create(&path).expect("create file");
 
-        let expr = eval_expr_for_nixpkgs(path.to_str().expect("utf-8 path"), None)
+        let expr = eval_expr_for_nixpkgs(path.to_str().expect("utf-8 path"), None, false)
             .expect("build expression");
 
         assert!(expr.starts_with("import \""), "expr: {expr}");
