@@ -71,6 +71,7 @@ async fn main() -> color_eyre::Result<()> {
         prebuilt: prebuilt_config,
         http_addr: args.http_addr,
         local_database: args.database,
+        local_refresh_interval: Duration::from_secs(args.interval),
     };
 
     match nixdex_core::daemon::run(&config).await {
