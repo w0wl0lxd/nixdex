@@ -223,6 +223,9 @@ impl PathIndex {
                 for ord in ordinals {
                     matched.insert(ord);
                 }
+            } else if !key.is_empty() && key > prefix {
+                // Stop as soon as a key no longer starts with the prefix.
+                break;
             }
         }
 
