@@ -65,6 +65,9 @@ const ATTRS_MAGIC: &[u8] = b"NATR";
 /// Attrs sidecar version.
 const ATTRS_VERSION: u32 = 1;
 
+/// Maximum size of the attrs sidecar (defensive cap).
+const MAX_ATTRS_BYTES: usize = 1024 * 1024 * 1024;
+
 /// Defensive cap on the number of v2 frames (seek table entries).
 const MAX_FRAME_COUNT: usize = 1024 * 1024;
 
@@ -988,6 +991,11 @@ pub fn read_attrs_sidecar(db_dir: &Path) -> Result<Option<Vec<(String, String, S
         Err(err) => return Err(err.into()),
     };
 
+    // Reject oversized sidecar files immediately.
+    if bytes.len() > MAX_ATTRS_BYTES {
+        return Err(Error::Corrupt("attrs sidecar exceeds maximum size"));
+    }
+
     if bytes.len() < ATTRS_MAGIC.len() + 8 {
         return Ok(None);
     }
@@ -1006,6 +1014,15 @@ pub fn read_attrs_sidecar(db_dir: &Path) -> Result<Option<Vec<(String, String, S
 
     let package_count = usize::try_from(read_u32_le(&bytes, ATTRS_MAGIC.len() + 4)?)
         .map_err(|_| Error::Corrupt("package count overflow"))?;
+
+    // Validate package_count against remaining bytes (minimum 12 bytes per record: 3 * 4-byte length headers).
+    let remaining_bytes = bytes.len().saturating_sub(ATTRS_MAGIC.len() + 8);
+    let min_bytes_per_record = 12; // 3 length-prefixed strings, each with 4-byte header
+    if package_count > 0 && remaining_bytes / package_count < min_bytes_per_record {
+        return Err(Error::Corrupt(
+            "attrs sidecar package count exceeds remaining bytes",
+        ));
+    }
 
     let mut attrs = Vec::with_capacity(package_count);
     let mut offset = ATTRS_MAGIC.len() + 8;
@@ -1291,10 +1308,9 @@ fn resolve_path_ordinals(
     // Try exact path lookup first
     if let Some(path) = exact_path {
         match index.lookup_path_ordinals(path.as_bytes()) {
-            Ok(ordinals) if !ordinals.is_empty() => {
+            Ok(ordinals) => {
                 return Some(ordinals.into_iter().collect());
             }
-            Ok(_) => {} // Empty result, fall through to prefix
             Err(err) => {
                 if path_sidecars_exist(dir) {
                     tracing::warn!(%err, "path index exact lookup failed; falling back to full scan");
@@ -1307,10 +1323,9 @@ fn resolve_path_ordinals(
     // Try prefix lookup
     if let Some(prefix) = path_prefix {
         match index.lookup_prefix_ordinals(prefix.as_bytes()) {
-            Ok(ordinals) if !ordinals.is_empty() => {
+            Ok(ordinals) => {
                 return Some(ordinals.into_iter().collect());
             }
-            Ok(_) => {} // Empty result
             Err(err) => {
                 if path_sidecars_exist(dir) {
                     tracing::warn!(%err, "path index prefix lookup failed; falling back to full scan");
