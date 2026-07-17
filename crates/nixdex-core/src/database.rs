@@ -595,6 +595,7 @@ impl Reader {
     /// # Errors
     ///
     /// Returns an error if the path does not exist or is not a valid database.
+    #[allow(clippy::cognitive_complexity)]
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path_buf = path.as_ref().to_path_buf();
 

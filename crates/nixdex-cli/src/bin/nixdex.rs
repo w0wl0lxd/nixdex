@@ -605,6 +605,7 @@ fn find_command_providers(
     Ok(providers)
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_command_not_found(opts: CommandNotFoundOpts) -> color_eyre::Result<()> {
     let auto_install =
         opts.auto_install || std::env::var("NIX_AUTO_INSTALL").is_ok_and(|v| !v.is_empty());
