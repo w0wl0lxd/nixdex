@@ -1731,12 +1731,19 @@ pub fn search_results(
         }
     }
 
-    Ok(results
+    let mut results: Vec<_> = results
         .into_iter()
         .filter(|(store_path, entry)| {
             should_include_match(options, &path_pattern, store_path, entry)
         })
-        .collect())
+        .collect();
+
+    // Apply limit before returning to avoid materializing full results
+    if let Some(limit) = options.limit {
+        results.truncate(limit);
+    }
+
+    Ok(results)
 }
 
 /// Search the database for entries matching the supplied options and print them.
