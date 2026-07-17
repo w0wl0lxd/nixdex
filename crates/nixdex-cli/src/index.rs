@@ -59,6 +59,9 @@ pub struct Args {
 
     /// Pass a Nix function to `nix-eval-jobs --select` to filter or transform the
     /// evaluation root before attribute traversal.
+    ///
+    /// The expression must be a function accepting the package set, for example
+    /// `p: { inherit (p) hello coreutils; }`.
     #[arg(long, value_name = "EXPR")]
     pub select: Option<String>,
 
@@ -79,6 +82,9 @@ pub struct Args {
     pub compression_level: i32,
 
     /// On-disk database format version (1 or 2).
+    ///
+    /// nixdex writes format v2 by default, which is a nixdex extension.
+    /// v1 is fully compatible with upstream nix-index.
     #[arg(long, default_value = "2", value_parser = clap::value_parser!(u64).range(1..=2))]
     pub format_version: u64,
 
