@@ -1,5 +1,8 @@
 //! Search package metadata (attr/description) sidecar built by `nix-index`.
 
+const MAX_PATTERN_BYTES: usize = 1024;
+const REGEX_SIZE_LIMIT: usize = 1_000_000;
+
 use std::fmt;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -115,6 +118,11 @@ impl SearchDb {
         exact: bool,
         limit: Option<usize>,
     ) -> Result<Vec<&PackageMeta>> {
+        if pattern.len() > MAX_PATTERN_BYTES {
+            return Err(Error::Parse(format!(
+                "pattern exceeds maximum length of {MAX_PATTERN_BYTES} bytes"
+            )));
+        }
         let mut matches: Vec<&PackageMeta> = if regex {
             let anchored = if exact {
                 format!("^(?:{pattern})$")
@@ -123,6 +131,8 @@ impl SearchDb {
             };
             let re = RegexBuilder::new(&anchored)
                 .case_insensitive(!case_sensitive)
+                .size_limit(REGEX_SIZE_LIMIT)
+                .dfa_size_limit(REGEX_SIZE_LIMIT)
                 .build()
                 .map_err(|source| Error::Parse(format!("invalid regex: {source}")))?;
             self.records
@@ -165,6 +175,11 @@ impl SearchDb {
         case_sensitive: bool,
         limit: Option<usize>,
     ) -> Result<Vec<&PackageMeta>> {
+        if pattern.len() > MAX_PATTERN_BYTES {
+            return Err(Error::Parse(format!(
+                "pattern exceeds maximum length of {MAX_PATTERN_BYTES} bytes"
+            )));
+        }
         let matcher = if case_sensitive {
             SkimMatcherV2::default().respect_case()
         } else {
@@ -467,6 +482,18 @@ mod tests {
             .search("hello", false, SearchField::Attr, true, false, None)
             .expect("search");
         assert_eq!(case_sensitive.len(), 0);
+    }
+
+    #[test]
+    fn search_rejects_oversized_pattern() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("packages.json");
+        write_fixture(&path, &[test_record("hello", "A greeting")]);
+
+        let db = SearchDb::open(&path).expect("open");
+        let long = "a".repeat(MAX_PATTERN_BYTES + 1);
+        let result = db.search(&long, false, SearchField::Attr, false, false, None);
+        assert!(result.is_err());
     }
 
     #[test]
