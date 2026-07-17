@@ -20,6 +20,10 @@ serde = { workspace = true }
 nixdex-core = { workspace = true, features = ["cli", "daemon"] }
 clap_complete = "4.6.7"
 
+[dev-dependencies]
+bytes = { workspace = true }
+tempfile = "3"
+
 [[bin]]
 name = "nix-index"
 path = "src/bin/nix-index.rs"
