@@ -51,6 +51,8 @@ enum Cmd {
     Search(SearchOpts),
     /// Show metadata for a single attribute.
     Info(InfoOpts),
+    /// Print database statistics and sidecar status.
+    Stats(StatsOpts),
     /// Generate shell completions.
     Completions(CompletionsOpts),
     /// Build a nixdex database (alias for `nix-index`).
@@ -100,8 +102,8 @@ struct SearchOpts {
     #[arg(long, conflicts_with_all = ["regex", "exact"])]
     fuzzy: bool,
 
-    /// Which fields to search: `attr`, `description`, `main-program`, or `both`.
-    #[arg(short, long, default_value = "both")]
+    /// Which fields to search.
+    #[arg(short, long, value_enum, default_value_t = SearchField::Both)]
     field: SearchField,
 
     /// Only print attribute paths.
@@ -142,6 +144,19 @@ struct InfoOpts {
     json: bool,
 }
 
+/// Options for `nixdex stats`.
+#[derive(Debug, Parser)]
+#[command(author, about, version)]
+struct StatsOpts {
+    /// Directory where the index is stored.
+    #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
+    database: PathBuf,
+
+    /// Print the statistics as JSON.
+    #[arg(long)]
+    json: bool,
+}
+
 /// Generate shell completions for `nixdex`.
 #[derive(Debug, Parser)]
 #[command(author, about, version)]
@@ -162,6 +177,14 @@ struct WhichOpts {
     /// Directory where the index is stored.
     #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
     database: PathBuf,
+
+    /// Print all matching packages instead of the first one.
+    #[arg(long)]
+    all: bool,
+
+    /// Print the result(s) as JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Options for `nixdex update`.
@@ -338,32 +361,105 @@ fn run_info(opts: InfoOpts) -> color_eyre::Result<()> {
     Ok(())
 }
 
+fn run_stats(opts: StatsOpts) -> color_eyre::Result<()> {
+    let files = opts.database.join("files");
+    if !files.is_file() {
+        color_eyre::eyre::bail!("no database found at {}", files.display());
+    }
+
+    let reader = nixdex_core::database::Reader::open(&files)
+        .wrap_err_with(|| format!("failed to open index at {}", files.display()))?;
+
+    let file_size = std::fs::metadata(&files)?.len();
+    let package_count = reader.package_count();
+
+    let sidecar_names = [
+        "files.basename.fst",
+        "files.basename.postings",
+        "files.basename.names",
+        "files.packages.names",
+        "files.path.fst",
+        "files.path.postings",
+        "files.attrs",
+        "packages.json",
+    ];
+    let mut sidecar_sizes = std::collections::BTreeMap::new();
+    for name in sidecar_names {
+        let path = opts.database.join(name);
+        let size = if path.is_file() {
+            Some(std::fs::metadata(&path)?.len())
+        } else {
+            None
+        };
+        sidecar_sizes.insert(name, size);
+    }
+
+    if opts.json {
+        #[derive(serde::Serialize)]
+        struct StatsJson {
+            version: u64,
+            files_size: u64,
+            package_count: Option<usize>,
+            sidecars: std::collections::BTreeMap<&'static str, Option<u64>>,
+        }
+        let stats = StatsJson {
+            version: reader.version(),
+            files_size: file_size,
+            package_count,
+            sidecars: sidecar_sizes,
+        };
+        println!(
+            "{}",
+            sonic_rs::to_string(&stats).wrap_err("failed to serialize stats")?
+        );
+    } else {
+        println!("database: {}", opts.database.display());
+        println!("files: {} bytes (version {})", file_size, reader.version());
+        if let Some(count) = package_count {
+            println!("packages: {count}");
+        } else {
+            println!("packages: unknown");
+        }
+        println!("sidecars:");
+        for (name, size) in sidecar_sizes {
+            match size {
+                Some(s) => println!("  {name}: {s} bytes"),
+                None => println!("  {name}: missing"),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_which(opts: WhichOpts) -> color_eyre::Result<()> {
-    let cmd = opts.cmd;
     let files = opts.database.join("files");
     let reader = nixdex_core::database::Reader::open(&files)
         .wrap_err_with(|| format!("failed to open index at {}", files.display()))?;
 
-    let full_path = if cmd.starts_with('/') {
-        cmd.clone()
-    } else {
-        format!("/bin/{cmd}")
+    let providers = find_command_providers(&opts.cmd, &reader)?;
+    let Some(first) = providers.first() else {
+        color_eyre::eyre::bail!("no package found for command '{}'", opts.cmd);
     };
-    let pattern = format!("^{}$", regex::escape(&full_path));
-    let re = regex::bytes::Regex::new(&pattern).wrap_err("invalid path pattern")?;
 
-    let results = reader
-        .search_entries(&re, None, None, None, None)
-        .map_err(|err| color_eyre::eyre::eyre!("search failed: {err}"))?;
-
-    for (store_path, entry) in results {
-        if entry.node.is_executable() {
-            println!("{}", format_which_attr(&store_path));
-            return Ok(());
+    if opts.json {
+        let output = if opts.all {
+            sonic_rs::to_string(&providers)
+        } else {
+            sonic_rs::to_string(first)
         }
+        .wrap_err("failed to serialize which result")?;
+        println!("{output}");
+        return Ok(());
     }
 
-    color_eyre::eyre::bail!("no package found for command '{}'", cmd)
+    if opts.all {
+        for provider in providers {
+            println!("{provider}");
+        }
+    } else {
+        println!("{first}");
+    }
+    Ok(())
 }
 
 fn format_which_attr(store_path: &nixdex_core::StorePath) -> String {
@@ -521,6 +617,7 @@ async fn main() -> color_eyre::Result<()> {
     match opts.cmd {
         Cmd::Search(search_opts) => run_search(search_opts),
         Cmd::Info(info_opts) => run_info(info_opts),
+        Cmd::Stats(stats_opts) => run_stats(stats_opts),
         Cmd::Completions(opts) => {
             run_completions(opts);
             Ok(())
