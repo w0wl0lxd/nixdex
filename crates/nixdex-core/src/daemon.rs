@@ -586,7 +586,10 @@ async fn nix_locate_handler(
             exclude_fhs: params.exclude_fhs,
         };
 
-        crate::search_database_results(&options).map_err(|e| format!("search error: {e:?}"))
+        crate::search_database_results(&options).map_err(|e| match e {
+            crate::Error::Parse(_) => format!("bad_request: {e}"),
+            _ => format!("search error: {e:?}"),
+        })
     });
 
     let results = match search_task.await {
