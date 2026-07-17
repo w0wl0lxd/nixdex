@@ -201,6 +201,7 @@ pub async fn fetch_listings(
     path_cache: Option<Arc<PathCache>>,
     filter_prefix: &[u8],
     attrs_map: IndexMap<String, String>,
+    no_closure: bool,
 ) -> Result<mpsc::Receiver<Result<ListingItem>>> {
     let prefix = Bytes::copy_from_slice(filter_prefix);
     if let Some(cache) = path_cache {
@@ -209,9 +210,9 @@ pub async fn fetch_listings(
             cache,
             attrs_map,
         };
-        fetch_listings_with_source(&source, jobs, input, prefix).await
+        fetch_listings_with_source(&source, jobs, input, prefix, no_closure).await
     } else {
-        fetch_listings_with_source(fetcher, jobs, input, prefix).await
+        fetch_listings_with_source(fetcher, jobs, input, prefix, no_closure).await
     }
 }
 
@@ -220,6 +221,7 @@ async fn fetch_listings_with_source<S: ListingSource>(
     jobs: usize,
     mut input: mpsc::Receiver<PackageEntry>,
     filter_prefix: Bytes,
+    no_closure: bool,
 ) -> Result<mpsc::Receiver<Result<ListingItem>>> {
     let jobs = jobs.max(1);
     let (out_tx, out_rx) = mpsc::channel::<Result<ListingItem>>(jobs * 2);
@@ -289,9 +291,10 @@ async fn fetch_listings_with_source<S: ListingSource>(
                 let prefix = filter_prefix.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if let Some(item) =
-                        process_path(&source, &entry, &queue, &seen, &in_flight, &notify, prefix)
-                            .await
+                    if let Some(item) = process_path(
+                        &source, &entry, &queue, &seen, &in_flight, &notify, prefix, no_closure,
+                    )
+                    .await
                     {
                         let _ = out_tx.send(Ok(item)).await;
                     }
@@ -318,9 +321,19 @@ async fn process_path<S: ListingSource>(
     in_flight: &AtomicUsize,
     notify: &Notify,
     filter_prefix: Bytes,
+    no_closure: bool,
 ) -> Option<ListingItem> {
-    let result =
-        process_path_inner(source, entry, queue, seen, in_flight, notify, filter_prefix).await;
+    let result = process_path_inner(
+        source,
+        entry,
+        queue,
+        seen,
+        in_flight,
+        notify,
+        filter_prefix,
+        no_closure,
+    )
+    .await;
 
     let remaining = in_flight.fetch_sub(1, Ordering::SeqCst);
     if remaining == 1 {
@@ -339,6 +352,7 @@ async fn process_path_inner<S: ListingSource>(
     in_flight: &AtomicUsize,
     notify: &Notify,
     filter_prefix: Bytes,
+    no_closure: bool,
 ) -> Option<ListingItem> {
     let path = &entry.path;
     let main_program_string = entry.main_program.clone().or_else(|| {
@@ -352,7 +366,9 @@ async fn process_path_inner<S: ListingSource>(
     // For command-not-found-style `/bin/` indexes, a package's own `/bin/`
     // entries live in its own store path; recursing into every dependency
     // (and fetching their `.ls` listings) is the dominant cost and not needed.
-    let shallow = filter_prefix.starts_with(b"/bin/");
+    // `--no-closure` lets the user request the same non-recursive behaviour for
+    // any prefix, which is useful when only root package listings are desired.
+    let shallow = no_closure || filter_prefix.starts_with(b"/bin/");
 
     if !shallow {
         let refs = match source.fetch_narinfo_details(path).await {
@@ -496,6 +512,7 @@ mod tests {
             2,
             input_channel(vec![PackageEntry::new(a.clone())]),
             Bytes::new(),
+            false,
         )
         .await
         .expect("start");
@@ -510,6 +527,46 @@ mod tests {
         assert!(hashes.contains(&"a"));
         assert!(hashes.contains(&"b"));
         assert!(hashes.contains(&"c"));
+    }
+
+    #[tokio::test]
+    async fn no_closure_skips_references() {
+        let a = sp("a", "a");
+        let b = sp("b", "b");
+        let c = sp("c", "c");
+
+        let mut refs = indexmap::IndexMap::new();
+        refs.insert("a".to_string(), vec![b.clone()]);
+        refs.insert("b".to_string(), vec![c.clone()]);
+        refs.insert("c".to_string(), vec![]);
+
+        let mut trees = indexmap::IndexMap::new();
+        trees.insert("a".to_string(), leaf(b"a"));
+        trees.insert("b".to_string(), leaf(b"b"));
+        trees.insert("c".to_string(), leaf(b"c"));
+
+        let source = MockSource {
+            refs,
+            trees,
+            ..Default::default()
+        };
+        let mut rx = fetch_listings_with_source(
+            &source,
+            2,
+            input_channel(vec![PackageEntry::new(a.clone())]),
+            Bytes::new(),
+            true,
+        )
+        .await
+        .expect("start");
+
+        let mut collected = Vec::new();
+        while let Some(result) = rx.recv().await {
+            collected.push(result.expect("item"));
+        }
+
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].0.hash(), "a");
     }
 
     #[tokio::test]
@@ -535,6 +592,7 @@ mod tests {
             2,
             input_channel(vec![PackageEntry::new(a.clone())]),
             Bytes::new(),
+            false,
         )
         .await
         .expect("start");
@@ -568,6 +626,7 @@ mod tests {
             2,
             input_channel(vec![PackageEntry::new(a.clone())]),
             Bytes::new(),
+            false,
         )
         .await
         .expect("start");
@@ -601,6 +660,7 @@ mod tests {
                 main_program: Some("foo".to_string()),
             }]),
             Bytes::new(),
+            false,
         )
         .await
         .expect("start");
@@ -639,6 +699,7 @@ mod tests {
                 main_program: Some("foo".to_string()),
             }]),
             Bytes::new(),
+            false,
         )
         .await
         .expect("start");
@@ -675,6 +736,7 @@ mod tests {
                 main_program: Some("foo".to_string()),
             }]),
             Bytes::new(),
+            false,
         )
         .await
         .expect("start");
@@ -704,6 +766,7 @@ mod tests {
                 main_program: Some("foo/bar".to_string()),
             }]),
             Bytes::new(),
+            false,
         )
         .await
         .expect("start");
