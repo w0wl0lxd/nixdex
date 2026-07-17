@@ -1,0 +1,3 @@
+- Fix redb index to use the same filtered file entries as the NIXI database so excluded prefixes are not cached.
+- Apply `--hash` and `--package` filters to exact-path redb lookup results.
+- Replace `unreachable!()` arms in `database.rs` with `Error::Corrupt` for unknown database versions.

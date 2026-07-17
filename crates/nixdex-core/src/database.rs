@@ -302,9 +302,9 @@ impl Writer {
         // Record full paths in the path index using the same ordinal
         self.path_index.record_package(ordinal, paths)?;
 
-        // Add to redb index if enabled
+        // Add to redb index if enabled, using the same filtered entries as the NIXI output.
         if let Some(redb) = &mut self.redb {
-            redb.add(path, files, filter_prefix)
+            redb.add(path, &entries)
                 .map_err(|err| Error::Io(std::io::Error::other(err.to_string())))?;
         }
 
@@ -476,7 +476,7 @@ impl Writer {
             2 => {
                 self.flush_chunk()?;
             }
-            _ => unreachable!(),
+            _ => return Err(Error::Corrupt("unsupported database version")),
         }
 
         let mut file = self
@@ -639,7 +639,7 @@ impl Reader {
                 }
             }
             2 => parse_seek_table(&data, DATA_START)?,
-            _ => unreachable!(),
+            _ => return Err(Error::Corrupt("unsupported database version")),
         };
 
         // Try to read frame_map sidecar for selective decompression.
@@ -1764,11 +1764,20 @@ pub fn search_results(
         source: Box::new(source),
     })?;
 
-    // Try redb index for exact-path lookups when available
+    // Try redb index for exact-path lookups when available.
+    // Apply the same package/hash filters the full scan would use.
     let mut results = if let (Some(redb), Some(exact_path)) = (&reader.redb, &options.exact_path) {
         let path_bytes = exact_path.as_bytes();
         match redb.exact_path_entries(path_bytes) {
-            Ok(Some(hits)) => hits,
+            Ok(Some(mut hits)) => {
+                hits.retain(|(store_path, _)| {
+                    package_re
+                        .as_ref()
+                        .is_none_or(|re| re.is_match(store_path.name().as_bytes()))
+                        && options.hash.as_deref().is_none_or(|h| h == store_path.hash())
+                });
+                hits
+            }
             Ok(None) => Vec::new(),
             Err(err) => {
                 tracing::debug!(%err, "redb exact-path lookup failed; falling back to scan");
