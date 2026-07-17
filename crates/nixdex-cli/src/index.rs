@@ -108,6 +108,13 @@ pub struct Args {
     #[arg(long)]
     pub no_overlays: bool,
 
+    /// Do not recurse into runtime references when fetching `.ls` listings.
+    ///
+    /// This indexes only the store paths that belong directly to each package
+    /// and is much faster when full closure listings are not needed.
+    #[arg(long)]
+    pub no_closure: bool,
+
     /// Build a small database containing only files under `/bin/`.
     ///
     /// This is equivalent to `--filter-prefix /bin/` and is much faster to build
@@ -235,6 +242,7 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
         path_cache_ttl: args.path_cache_ttl,
         main_program: !args.no_main_program,
         no_overlays: args.no_overlays,
+        no_closure: args.no_closure,
         extra_scopes: args.extra_scopes,
         only_eval: args.only_eval,
         cache_url: args.cache_url,
