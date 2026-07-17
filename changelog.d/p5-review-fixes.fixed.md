@@ -1,0 +1,1 @@
+- Address CodeRabbit review comments: forward full `$argv` in Fish handler, default prebuilt architecture to host, normalize rooted locate patterns, cap result limits in daemon endpoints, make minimal `nix-locate` results omit unused fields, coalesce `/reload` requests over a bounded one-slot channel, and apply `spawn_blocking`/`spawn_blocking` for CPU-bound searches.

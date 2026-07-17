@@ -1430,12 +1430,15 @@ dependencies = [
 name = "nixdex-cli"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "clap",
  "clap_complete",
  "color-eyre",
  "nixdex-core",
  "regex",
+ "serde",
  "sonic-rs",
+ "tempfile",
  "tokio",
  "tracing-subscriber",
 ]

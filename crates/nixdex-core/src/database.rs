@@ -18,7 +18,9 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use memchr;
 use mmap_guard;
 use rayon::prelude::*;
-use regex::bytes::Regex;
+use regex::bytes::{Regex, RegexBuilder};
+use serde::Serialize;
+use sonic_rs;
 use thiserror::Error;
 
 use indexmap::IndexSet;
@@ -29,6 +31,7 @@ use crate::basename_index::{
 };
 use crate::files::{FileNode, FileTree, FileTreeEntry, FileType};
 use crate::frcode;
+use crate::nixpkgs::PackageMeta;
 use crate::path_index::{PathIndex, PathIndexBuilder};
 use crate::store_path::StorePath;
 
@@ -40,6 +43,12 @@ const DEFAULT_WRITE_VERSION: u64 = 2;
 
 /// Magic bytes identifying a nix-index / nixdex database file.
 pub const FILE_MAGIC: &[u8] = b"NIXI";
+
+/// Maximum length (in bytes) of a user-supplied search regex.
+const MAX_PATTERN_BYTES: usize = 1024;
+
+/// Maximum memory (in bytes) allowed for regex compilation (NFA/DFA).
+const REGEX_SIZE_LIMIT: usize = 1_000_000;
 
 /// Magic of the trailing zstd skippable frame used by version 2 seek tables.
 const SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
@@ -235,14 +244,42 @@ impl Writer {
 
     /// Add a package and its file tree to the database.
     ///
-    /// Entries are only added if their path starts with `filter_prefix`.
+    /// Entries are only added if their path starts with `filter_prefix` and does
+    /// not start with any of `exclude_prefixes`.
     /// Packages with no matching entries are skipped.
     ///
     /// # Errors
     ///
     /// Returns an error when encoding or writing fails.
     pub fn add(&mut self, path: &StorePath, files: &FileTree, filter_prefix: &[u8]) -> Result<()> {
-        let entries = files.to_list(filter_prefix);
+        self.add_excluding(path, files, filter_prefix, &[])
+    }
+
+    /// Add a package and its file tree to the database, excluding paths.
+    ///
+    /// Entries are only added if their path starts with `filter_prefix` and does
+    /// not start with any of `exclude_prefixes`.
+    /// Packages with no matching entries are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when encoding or writing fails.
+    pub fn add_excluding(
+        &mut self,
+        path: &StorePath,
+        files: &FileTree,
+        filter_prefix: &[u8],
+        exclude_prefixes: &[&[u8]],
+    ) -> Result<()> {
+        let entries: Vec<FileTreeEntry> = files
+            .to_list(filter_prefix)
+            .into_iter()
+            .filter(|entry| {
+                !exclude_prefixes
+                    .iter()
+                    .any(|prefix| entry.path.starts_with(prefix))
+            })
+            .collect();
         if entries.is_empty() {
             return Ok(());
         }
@@ -621,6 +658,13 @@ impl Reader {
     #[must_use]
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    /// Return the number of packages in the database, if known from the on-disk
+    /// frame map. Returns `None` for databases without a frame map.
+    #[must_use]
+    pub fn package_count(&self) -> Option<usize> {
+        self.frame_map.as_ref().map(std::vec::Vec::len)
     }
 
     /// Scan every frame in parallel, yielding `(StorePath, FileTreeEntry)` matches.
@@ -1224,6 +1268,34 @@ pub enum SearchMode {
     Minimal,
 }
 
+/// Sort order for search results.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SearchSort {
+    /// Preserve the order returned by the database reader.
+    #[default]
+    None,
+    /// Sort by file size ascending.
+    SizeAsc,
+    /// Sort by file size descending.
+    SizeDesc,
+    /// Sort by attribute path ascending.
+    AttrAsc,
+}
+
+impl std::str::FromStr for SearchSort {
+    type Err = crate::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "" | "none" | "relevance" => Ok(Self::None),
+            "size" | "size-asc" => Ok(Self::SizeAsc),
+            "size-desc" => Ok(Self::SizeDesc),
+            "attr" | "attr-asc" => Ok(Self::AttrAsc),
+            _ => Err(crate::Error::Parse(format!("unknown sort order: {s}"))),
+        }
+    }
+}
+
 /// Options for a database search.
 #[derive(Debug, Clone)]
 pub struct SearchOptions<'a> {
@@ -1245,6 +1317,21 @@ pub struct SearchOptions<'a> {
     pub file_type: &'a [FileType],
     /// Output formatting mode.
     pub mode: SearchMode,
+    /// Emit each match as a JSON object (one per line) instead of the default
+    /// human-readable format.
+    pub json: bool,
+    /// Maximum number of results to print. `None` means unlimited.
+    pub limit: Option<usize>,
+    /// Print the number of matching entries instead of the entries themselves.
+    pub count: bool,
+    /// Sort order for results.
+    pub sort: SearchSort,
+    /// Minimum file size in bytes.
+    pub min_size: Option<u64>,
+    /// Maximum file size in bytes.
+    pub max_size: Option<u64>,
+    /// Exclude results from FHS-style packages (`-fhs` / `-usr-target`).
+    pub exclude_fhs: bool,
 }
 
 /// Resolve the set of candidate package ordinals from the basename secondary index.
@@ -1396,12 +1483,46 @@ fn should_include_match(
         return false;
     }
 
+    let size = entry.node.size();
+    if options.min_size.is_some_and(|min| size < min) {
+        return false;
+    }
+    if options.max_size.is_some_and(|max| size > max) {
+        return false;
+    }
+
+    if options.exclude_fhs {
+        let name = store_path.name();
+        if name.contains("-fhs") || name.contains("-usr-target") {
+            return false;
+        }
+    }
+
     true
+}
+
+/// JSON-serializable full search result emitted by `--json`.
+#[derive(Serialize)]
+struct MatchJson {
+    attr: String,
+    size: u64,
+    #[serde(rename = "type")]
+    kind: String,
+    path: String,
+    store_path: String,
+}
+
+/// JSON-serializable minimal search result emitted by `--minimal --json`.
+#[derive(Serialize)]
+struct MinimalMatchJson {
+    attr: String,
 }
 
 /// Print a single search result according to `SearchMode` and color settings.
 ///
 /// Mutates `printed_attrs` for `--minimal` de-duplication.
+///
+/// Returns `true` if a line was actually emitted.
 #[allow(clippy::print_stdout)] // search is a CLI-facing printer for now
 fn print_match(
     options: &SearchOptions<'_>,
@@ -1409,14 +1530,85 @@ fn print_match(
     printed_attrs: &mut IndexSet<String>,
     store_path: &StorePath,
     entry: &FileTreeEntry,
-) {
+) -> bool {
     let attr = format_attr(store_path);
 
+    if options.json {
+        print_match_json(options, printed_attrs, store_path, entry, &attr)
+    } else {
+        print_match_text(
+            options,
+            path_pattern,
+            printed_attrs,
+            store_path,
+            entry,
+            &attr,
+        )
+    }
+}
+
+#[allow(clippy::print_stdout)]
+fn print_match_json(
+    options: &SearchOptions<'_>,
+    printed_attrs: &mut IndexSet<String>,
+    store_path: &StorePath,
+    entry: &FileTreeEntry,
+    attr: &str,
+) -> bool {
     match options.mode {
         SearchMode::Minimal => {
-            if printed_attrs.insert(attr.clone()) {
-                println!("{attr}");
+            if printed_attrs.insert(attr.into()) {
+                let record = MinimalMatchJson {
+                    attr: attr.to_string(),
+                };
+                if let Ok(line) = sonic_rs::to_string(&record) {
+                    println!("{line}");
+                    return true;
+                }
             }
+            false
+        }
+        SearchMode::Full { .. } => {
+            let (kind, size) = match &entry.node {
+                FileNode::Regular { executable, size } => {
+                    (if *executable { "x" } else { "r" }, *size)
+                }
+                FileNode::Directory { size, .. } => ("d", *size),
+                FileNode::Symlink { .. } => ("s", 0),
+            };
+            let record = MatchJson {
+                attr: attr.to_string(),
+                size,
+                kind: kind.to_string(),
+                path: String::from_utf8_lossy(&entry.path).into_owned(),
+                store_path: store_path.as_str(),
+            };
+            if let Ok(line) = sonic_rs::to_string(&record) {
+                println!("{line}");
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
+#[allow(clippy::print_stdout)]
+fn print_match_text(
+    options: &SearchOptions<'_>,
+    path_pattern: &Regex,
+    printed_attrs: &mut IndexSet<String>,
+    store_path: &StorePath,
+    entry: &FileTreeEntry,
+    attr: &str,
+) -> bool {
+    match options.mode {
+        SearchMode::Minimal => {
+            if printed_attrs.insert(attr.into()) {
+                println!("{attr}");
+                return true;
+            }
+            false
         }
         SearchMode::Full { color, .. } => {
             let (typ, size) = match &entry.node {
@@ -1455,25 +1647,42 @@ fn print_match(
             } else {
                 println!("{path_str}");
             }
+            true
         }
     }
 }
 
-/// Search the database for entries matching the supplied options and print them.
+/// Search the database for entries matching the supplied options.
 ///
+/// Returns the filtered and sorted `(StorePath, FileTreeEntry)` pairs. This is
+/// the shared engine used by both the CLI `nix-locate` and the daemon's
+/// `/nix-locate` endpoint.
+///
+/// Compile a user-supplied regex with defensive size/length limits.
+fn compile_search_regex(pattern: &str, kind: &str) -> crate::Result<Regex> {
+    if pattern.len() > MAX_PATTERN_BYTES {
+        return Err(crate::Error::Parse(format!(
+            "{kind} regex exceeds maximum length of {MAX_PATTERN_BYTES} bytes"
+        )));
+    }
+    RegexBuilder::new(pattern)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .dfa_size_limit(REGEX_SIZE_LIMIT)
+        .build()
+        .map_err(|err| crate::Error::Parse(format!("invalid {kind} regex '{pattern}': {err}")))
+}
+
 /// # Errors
 ///
 /// Returns an error if the database cannot be read or the pattern is invalid.
-pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
+pub fn search_results(
+    options: &SearchOptions<'_>,
+) -> crate::Result<Vec<(crate::StorePath, crate::files::FileTreeEntry)>> {
     let index_file = options.database.join("files");
 
-    let path_pattern = Regex::new(&options.pattern).map_err(|err| {
-        crate::Error::Parse(format!("invalid path pattern '{}': {err}", options.pattern))
-    })?;
+    let path_pattern = compile_search_regex(&options.pattern, "path")?;
     let package_re = match &options.package_pattern {
-        Some(pat) => Some(Regex::new(pat).map_err(|err| {
-            crate::Error::Parse(format!("invalid package pattern '{pat}': {err}"))
-        })?),
+        Some(pat) => Some(compile_search_regex(pat, "package")?),
         None => None,
     };
 
@@ -1503,7 +1712,7 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
         .as_ref()
         .is_some_and(RoaringBitmap::is_empty)
     {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let reader = Reader::open(&index_file).map_err(|source| crate::Error::ReadDatabase {
@@ -1511,7 +1720,7 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
         source: Box::new(source),
     })?;
 
-    let results = reader
+    let mut results = reader
         .search_entries(
             &path_pattern,
             package_re.as_ref(),
@@ -1524,19 +1733,74 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
             source: Box::new(source),
         })?;
 
+    match options.sort {
+        SearchSort::None => {}
+        SearchSort::SizeAsc => {
+            results.sort_by_key(|(_, entry)| entry.node.size());
+        }
+        SearchSort::SizeDesc => {
+            results.sort_by_key(|(_, entry)| std::cmp::Reverse(entry.node.size()));
+        }
+        SearchSort::AttrAsc => {
+            results.sort_by(|(a, _), (b, _)| a.origin().attr.cmp(&b.origin().attr));
+        }
+    }
+
+    let mut results: Vec<_> = results
+        .into_iter()
+        .filter(|(store_path, entry)| {
+            should_include_match(options, &path_pattern, store_path, entry)
+        })
+        .collect();
+
+    // Apply limit before returning to avoid materializing full results
+    if let Some(limit) = options.limit {
+        results.truncate(limit);
+    }
+
+    Ok(results)
+}
+
+/// Search the database for entries matching the supplied options and print them.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be read or the pattern is invalid.
+pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
+    let results = search_results(options)?;
+
     // Track printed attrs for --minimal de-duplication (ordered set).
     let mut printed_attrs: IndexSet<String> = IndexSet::new();
 
+    let mut matched = 0usize;
+    let mut printed = 0usize;
+
     for (store_path, entry) in results {
-        if should_include_match(options, &path_pattern, &store_path, &entry) {
-            print_match(
-                options,
-                &path_pattern,
-                &mut printed_attrs,
-                &store_path,
-                &entry,
-            );
+        matched += 1;
+
+        if options.count {
+            continue;
         }
+
+        if options.limit.is_some_and(|limit| printed >= limit) {
+            break;
+        }
+
+        if print_match(
+            options,
+            &Regex::new(&options.pattern).map_err(|err| {
+                crate::Error::Parse(format!("invalid path pattern '{}': {err}", options.pattern))
+            })?,
+            &mut printed_attrs,
+            &store_path,
+            &entry,
+        ) {
+            printed += 1;
+        }
+    }
+
+    if options.count {
+        println!("{matched}");
     }
 
     Ok(())
@@ -1544,12 +1808,14 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
 
 /// Generate nixdex sidecars for an existing NIXI database.
 ///
-/// Reads the `files` database at `db_path`, extracts all package basenames,
-/// and writes the sidecar files (`files.basename.fst`, `files.basename.postings`,
-/// `files.packages.names`, `files.frame_map`) to the same directory.
+/// Reads the `files` database at `db_path`, extracts all package basenames and
+/// metadata, and writes the sidecar files (`files.basename.fst`,
+/// `files.basename.postings`, `files.basename.names`, `files.frame_map`,
+/// `packages.json`) to the same directory.
 ///
-/// This enables fast basename lookups via `BasenameIndex` for prebuilt indexes
-/// downloaded from upstream nix-index-database releases.
+/// This enables fast basename lookups via `BasenameIndex` and package search
+/// via `SearchDb` for prebuilt indexes downloaded from upstream
+/// nix-index-database releases.
 ///
 /// # Errors
 ///
@@ -1562,9 +1828,12 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
         .filter(|p| !p.as_os_str().is_empty())
         .ok_or(Error::Corrupt("database path has no parent directory"))?;
 
-    // Scan all frames to extract package paths and build the basename index.
+    // Scan all frames to extract package paths and build secondary indexes.
     let mut builder = BasenameIndexBuilder::new();
+    let mut path_builder = PathIndexBuilder::new();
     let mut all_package_labels: Vec<String> = Vec::new();
+    let mut all_package_meta: Vec<PackageMeta> = Vec::new();
+    let mut all_package_attrs: Vec<(String, String, String)> = Vec::new();
 
     for (offset, len) in &reader.frames {
         let start = *offset;
@@ -1581,18 +1850,35 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
                 .map_err(Error::Io)?
         };
 
-        scan_frame_for_packages(&raw, &mut builder, &mut all_package_labels)?;
+        scan_frame_for_packages(
+            &raw,
+            &mut builder,
+            &mut path_builder,
+            &mut all_package_labels,
+            &mut all_package_meta,
+            &mut all_package_attrs,
+        )?;
     }
 
-    // Write basename sidecars.
+    // Write basename and path sidecars.
     builder
         .write_sidecars(db_dir)
         .map_err(Error::SecondaryIndex)?;
+    path_builder
+        .write_sidecars(db_dir)
+        .map_err(Error::PathIndex)?;
 
     // Write frame_map sidecar if we have v2 frame data.
     if let (Some(frame_map), Some(_frame_starts)) = (&reader.frame_map, &reader.frame_starts) {
         write_frame_map(db_dir, frame_map, reader.frames.len())?;
     }
+
+    // Synthesize a packages.json sidecar from package footers so that
+    // package metadata search works for prebuilt file-only indexes.
+    write_packages_json(db_dir, &all_package_meta)?;
+
+    // Write attrs sidecar so prebuilt indexes can be reused for incremental builds.
+    write_attrs_sidecar(db_dir, &all_package_attrs)?;
 
     tracing::info!(
         db_path = %db_path.display(),
@@ -1603,11 +1889,29 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Write a `packages.json` NDJSON sidecar from extracted package metadata.
+fn write_packages_json(db_dir: &Path, packages: &[PackageMeta]) -> Result<()> {
+    let path = db_dir.join("packages.json");
+    let file = std::fs::File::create(&path).map_err(Error::Io)?;
+    let mut writer = std::io::BufWriter::new(file);
+
+    for package in packages {
+        let line = sonic_rs::to_string(package).map_err(|err| Error::Json(err.to_string()))?;
+        writeln!(writer, "{line}").map_err(Error::Io)?;
+    }
+
+    writer.flush().map_err(Error::Io)?;
+    Ok(())
+}
+
 /// Scan a single frame's frcode data to extract package paths.
 fn scan_frame_for_packages(
     raw: &[u8],
     builder: &mut BasenameIndexBuilder,
+    path_builder: &mut PathIndexBuilder,
     all_package_labels: &mut Vec<String>,
+    all_package_meta: &mut Vec<PackageMeta>,
+    all_package_attrs: &mut Vec<(String, String, String)>,
 ) -> Result<()> {
     let mut decoder = frcode::Decoder::new(std::io::Cursor::new(raw));
     let mut current_paths: Vec<Vec<u8>> = Vec::new();
@@ -1633,12 +1937,25 @@ fn scan_frame_for_packages(
                         sonic_rs::from_slice(json).map_err(|_| Error::StorePathParse {
                             path: json.to_vec(),
                         })?;
-                    let label = format!("{}.{}", pkg.origin().attr, pkg.origin().output);
+                    let attr = pkg.origin().attr.clone();
+                    let output = pkg.origin().output.clone();
+                    let label = format!("{}.{}", attr, output);
                     all_package_labels.push(label.clone());
-                    builder
-                        .record_package(label, current_paths.clone())
+                    all_package_meta.push(PackageMeta {
+                        attr: attr.clone(),
+                        name: pkg.name().to_string(),
+                        description: None,
+                        main_program: None,
+                    });
+                    all_package_attrs.push((attr, output, pkg.hash().to_string()));
+
+                    let paths = std::mem::take(&mut current_paths);
+                    let ordinal = builder
+                        .record_package(label, paths.clone())
                         .map_err(Error::SecondaryIndex)?;
-                    current_paths.clear();
+                    path_builder
+                        .record_package(ordinal, paths)
+                        .map_err(Error::PathIndex)?;
                 }
             } else {
                 // File entry: extract path.
@@ -1747,6 +2064,13 @@ mod tests {
             path_prefix: None,
             file_type: &[],
             mode: SearchMode::Minimal,
+            json: false,
+            limit: None,
+            count: false,
+            sort: SearchSort::None,
+            min_size: None,
+            max_size: None,
+            exclude_fhs: false,
         };
         search(&options).expect("search ok");
     }
@@ -1780,6 +2104,18 @@ mod tests {
         assert_eq!(format_grouped(1234), "1,234");
         assert_eq!(format_grouped(16_524), "16,524");
         assert_eq!(format_grouped(1_000_000), "1,000,000");
+    }
+
+    #[test]
+    fn compile_search_regex_rejects_oversized_patterns() {
+        let long = "a".repeat(MAX_PATTERN_BYTES + 1);
+        assert!(compile_search_regex(&long, "path").is_err());
+    }
+
+    #[test]
+    fn compile_search_regex_accepts_valid_patterns() {
+        let re = compile_search_regex(r"bin/hello", "path").unwrap();
+        assert!(re.is_match(b"/bin/hello"));
     }
 
     #[test]

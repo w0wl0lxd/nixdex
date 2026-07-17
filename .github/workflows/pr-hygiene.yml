@@ -9,6 +9,18 @@ permissions:
   pull-requests: read
 
 jobs:
+  changelog:
+    name: changelog fragment present
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check changelog fragment
+        env:
+          BASE_REF: origin/${{ github.event.pull_request.base.ref }}
+        run: python3 scripts/changelog.py check --base "$BASE_REF"
+
   title-and-body:
     name: conventional title + no AI slop
     runs-on: ubuntu-latest

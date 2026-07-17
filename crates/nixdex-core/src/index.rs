@@ -12,7 +12,6 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::CACHE_URL;
 use crate::database::{Writer, read_attrs_sidecar};
 use crate::errors::{Error, Result};
 use crate::hydra::Fetcher;
@@ -39,9 +38,11 @@ struct WriteListingsContext<'a> {
     jobs: usize,
     path_cache: Option<Arc<PathCache>>,
     filter_prefix: &'a [u8],
+    exclude_prefixes: Vec<Vec<u8>>,
     db_file: &'a Path,
     progress: &'a MultiProgress,
     attrs_map: IndexMap<String, String>,
+    no_closure: bool,
 }
 
 /// Options controlling an index build.
@@ -49,6 +50,10 @@ struct WriteListingsContext<'a> {
 pub struct UpdateOptions {
     /// Number of concurrent HTTP requests.
     pub jobs: usize,
+    /// Per-request HTTP timeout in seconds.
+    pub timeout: u64,
+    /// Maximum number of retries for transient HTTP failures.
+    pub retries: u32,
     /// Directory where the index database is stored.
     pub database: PathBuf,
     /// nixpkgs path/expression (for example `<nixpkgs>`).
@@ -83,23 +88,33 @@ pub struct UpdateOptions {
     pub path_cache_ttl: Option<u64>,
     /// Synthesize `/bin/<mainProgram>` listings from `meta.mainProgram`.
     pub main_program: bool,
+    /// Disable nixpkgs overlays during evaluation.
+    pub no_overlays: bool,
+    /// Do not recurse into runtime references when fetching `.ls` listings.
+    pub no_closure: bool,
     /// Extra attribute scopes to walk during evaluation.
     pub extra_scopes: Vec<String>,
     /// Only evaluate nixpkgs; do not fetch listings or write the files database.
     pub only_eval: bool,
+    /// Base URL of the Nix binary cache to fetch listings from.
+    pub cache_url: String,
+    /// Only add paths that do not start with any of these prefixes.
+    pub exclude_prefix: Vec<String>,
 }
 
 impl Default for UpdateOptions {
     fn default() -> Self {
         Self {
             jobs: 100,
+            timeout: 30,
+            retries: 4,
             database: PathBuf::from("/tmp/nix-index"),
             nixpkgs: String::from("<nixpkgs>"),
             system: None,
             select: None,
             no_instantiate: false,
             check_cache_status: true,
-            compression_level: 19,
+            compression_level: 22,
             format_version: 2,
             show_trace: false,
             filter_prefix: String::new(),
@@ -110,6 +125,8 @@ impl Default for UpdateOptions {
             path_cache_file: None,
             path_cache_ttl: None,
             main_program: true,
+            no_overlays: false,
+            no_closure: false,
             extra_scopes: vec![
                 String::from("haskellPackages"),
                 String::from("rPackages"),
@@ -117,6 +134,8 @@ impl Default for UpdateOptions {
                 String::from("texlive.pkgs"),
             ],
             only_eval: false,
+            cache_url: crate::CACHE_URL.to_string(),
+            exclude_prefix: Vec::new(),
         }
     }
 }
@@ -203,6 +222,7 @@ impl IndexBuilder {
         let main_program = opts.main_program;
         let no_instantiate = opts.no_instantiate;
         let check_cache_status = opts.check_cache_status;
+        let no_overlays = opts.no_overlays;
 
         let meta_handle = self.spawn_meta_writer(meta_rx);
         let handle = tokio::spawn(async move {
@@ -218,6 +238,7 @@ impl IndexBuilder {
                 // descriptions and `mainProgram` values.
                 meta: true,
                 scope: None,
+                no_overlays,
             };
             let count =
                 nixpkgs::stream_package_entries(base, &extra_scopes, main_program, pkg_tx, meta_tx)
@@ -308,12 +329,17 @@ impl IndexBuilder {
     }
 
     /// Build a fresh binary-cache fetcher.
-    fn new_fetcher() -> Result<Fetcher> {
-        Fetcher::new(CACHE_URL).map_err(|err| {
-            Error::Io(std::io::Error::other(format!(
-                "failed to create binary-cache client: {err}"
-            )))
-        })
+    fn new_fetcher(&self) -> Result<Fetcher> {
+        use std::time::Duration;
+        Fetcher::builder(&self.options.cache_url)
+            .timeout(Duration::from_secs(self.options.timeout))
+            .max_attempts(self.options.retries.saturating_add(1))
+            .build()
+            .map_err(|err| {
+                Error::Io(std::io::Error::other(format!(
+                    "failed to create binary-cache client: {err}"
+                )))
+            })
     }
 
     /// Await the eval stream task and translate errors into the workspace type.
@@ -403,12 +429,17 @@ impl IndexBuilder {
         eval_pb.set_message("Evaluating nixpkgs...");
 
         let stream = self.spawn_package_eval_stream();
-        let fetcher = Self::new_fetcher()?;
+        let fetcher = self.new_fetcher()?;
         let filter_prefix = if opts.small && opts.filter_prefix.is_empty() {
             b"/bin/".to_vec()
         } else {
             opts.filter_prefix.as_bytes().to_vec()
         };
+        let exclude_prefixes = opts
+            .exclude_prefix
+            .iter()
+            .map(|s| s.as_bytes().to_vec())
+            .collect();
         let (indexed, failed, fetch_elapsed) = match write_listings(
             WriteListingsContext {
                 writer: &mut ctx.writer,
@@ -416,9 +447,11 @@ impl IndexBuilder {
                 jobs: opts.jobs.max(1),
                 path_cache: ctx.path_cache.clone(),
                 filter_prefix: &filter_prefix,
+                exclude_prefixes,
                 db_file: &ctx.db_file,
                 progress: &progress,
                 attrs_map: ctx.attrs_map,
+                no_closure: opts.no_closure,
             },
             stream.packages,
         )
@@ -565,6 +598,7 @@ async fn write_listings(
         ctx.path_cache,
         ctx.filter_prefix,
         ctx.attrs_map,
+        ctx.no_closure,
     )
     .await
     .map_err(|source| {
@@ -581,8 +615,13 @@ async fn write_listings(
         match result {
             Ok((store_path, tree)) => {
                 let before_len = ctx.writer.estimated_size();
+                let exclude_slices: Vec<&[u8]> = ctx
+                    .exclude_prefixes
+                    .iter()
+                    .map(std::vec::Vec::as_slice)
+                    .collect();
                 ctx.writer
-                    .add(&store_path, &tree, ctx.filter_prefix)
+                    .add_excluding(&store_path, &tree, ctx.filter_prefix, &exclude_slices)
                     .map_err(|source| Error::WriteDatabase {
                         path: ctx.db_file.to_path_buf(),
                         source: Box::new(source),
@@ -624,7 +663,7 @@ mod tests {
     fn default_options_match_upstream_baseline() {
         let opts = UpdateOptions::default();
         assert_eq!(opts.jobs, 100);
-        assert_eq!(opts.compression_level, 19);
+        assert_eq!(opts.compression_level, 22);
         assert_eq!(opts.format_version, 2);
         assert_eq!(opts.nixpkgs, "<nixpkgs>");
         assert!(!opts.path_cache);
@@ -643,6 +682,8 @@ mod tests {
             .expect("write fixture");
         let opts = UpdateOptions {
             jobs: 4,
+            timeout: 30,
+            retries: 4,
             database: dir.path().to_path_buf(),
             nixpkgs: nixpkgs_file.to_string_lossy().into_owned(),
             system: None,
@@ -660,8 +701,12 @@ mod tests {
             path_cache_file: None,
             path_cache_ttl: None,
             main_program: true,
+            no_overlays: false,
+            no_closure: false,
             extra_scopes: vec![],
             only_eval: false,
+            cache_url: crate::CACHE_URL.to_string(),
+            exclude_prefix: Vec::new(),
         };
         IndexBuilder::new(opts).build().await.expect("build");
         assert!(dir.path().join("files").exists());
