@@ -1631,12 +1631,18 @@ fn print_match_text(
     }
 }
 
-/// Search the database for entries matching the supplied options and print them.
+/// Search the database for entries matching the supplied options.
+///
+/// Returns the filtered and sorted `(StorePath, FileTreeEntry)` pairs. This is
+/// the shared engine used by both the CLI `nix-locate` and the daemon's
+/// `/nix-locate` endpoint.
 ///
 /// # Errors
 ///
 /// Returns an error if the database cannot be read or the pattern is invalid.
-pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
+pub fn search_results(
+    options: &SearchOptions<'_>,
+) -> crate::Result<Vec<(crate::StorePath, crate::files::FileTreeEntry)>> {
     let index_file = options.database.join("files");
 
     let path_pattern = Regex::new(&options.pattern).map_err(|err| {
@@ -1675,7 +1681,7 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
         .as_ref()
         .is_some_and(RoaringBitmap::is_empty)
     {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let reader = Reader::open(&index_file).map_err(|source| crate::Error::ReadDatabase {
@@ -1709,6 +1715,22 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
         }
     }
 
+    Ok(results
+        .into_iter()
+        .filter(|(store_path, entry)| {
+            should_include_match(options, &path_pattern, store_path, entry)
+        })
+        .collect())
+}
+
+/// Search the database for entries matching the supplied options and print them.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be read or the pattern is invalid.
+pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
+    let results = search_results(options)?;
+
     // Track printed attrs for --minimal de-duplication (ordered set).
     let mut printed_attrs: IndexSet<String> = IndexSet::new();
 
@@ -1716,10 +1738,6 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
     let mut printed = 0usize;
 
     for (store_path, entry) in results {
-        if !should_include_match(options, &path_pattern, &store_path, &entry) {
-            continue;
-        }
-
         matched += 1;
 
         if options.count {
@@ -1732,7 +1750,9 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
 
         if print_match(
             options,
-            &path_pattern,
+            &Regex::new(&options.pattern).map_err(|err| {
+                crate::Error::Parse(format!("invalid path pattern '{}': {err}", options.pattern))
+            })?,
             &mut printed_attrs,
             &store_path,
             &entry,
