@@ -11,7 +11,7 @@ use color_eyre::eyre::WrapErr;
 use tracing_subscriber::EnvFilter;
 
 use nixdex_cli::{index, locate};
-use nixdex_core::package_search::{SearchDb, SearchField};
+use nixdex_core::package_search::{SearchDb, SearchField, SearchSort};
 
 /// Resolve the default nix-index database directory.
 fn default_db_dir() -> &'static str {
@@ -105,6 +105,10 @@ struct SearchOpts {
     /// Which fields to search.
     #[arg(short, long, value_enum, default_value_t = SearchField::Both)]
     field: SearchField,
+
+    /// Sort results by attr, name, or main-program. Append `-desc` for descending order.
+    #[arg(long, value_enum, default_value_t = SearchSort::None)]
+    sort: SearchSort,
 
     /// Only print attribute paths.
     #[arg(long)]
@@ -296,7 +300,13 @@ fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
 
     let db = SearchDb::open(&sidecar).wrap_err("failed to load package metadata sidecar")?;
     let matches = if opts.fuzzy {
-        db.search_fuzzy(&opts.pattern, opts.field, opts.case_sensitive, opts.limit)
+        db.search_fuzzy(
+            &opts.pattern,
+            opts.field,
+            opts.case_sensitive,
+            opts.sort,
+            opts.limit,
+        )
     } else {
         db.search(
             &opts.pattern,
@@ -304,6 +314,7 @@ fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
             opts.field,
             opts.case_sensitive,
             opts.exact,
+            opts.sort,
             opts.limit,
         )
     }
@@ -353,7 +364,15 @@ fn run_info(opts: InfoOpts) -> color_eyre::Result<()> {
 
     let db = SearchDb::open(&sidecar).wrap_err("failed to load package metadata sidecar")?;
     let matches = db
-        .search(&opts.attr, false, SearchField::Attr, true, true, None)
+        .search(
+            &opts.attr,
+            false,
+            SearchField::Attr,
+            true,
+            true,
+            SearchSort::None,
+            None,
+        )
         .wrap_err("lookup failed")?;
 
     let Some(record) = matches.first() else {

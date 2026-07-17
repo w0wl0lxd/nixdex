@@ -16,6 +16,86 @@ use regex::RegexBuilder;
 use crate::errors::{Error, Result};
 use crate::nixpkgs::PackageMeta;
 
+/// How to order package search results.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum SearchSort {
+    /// Preserve the natural order returned by the search strategy.
+    #[default]
+    None,
+    /// Sort by attribute path ascending.
+    Attr,
+    /// Sort by attribute path descending.
+    AttrDesc,
+    /// Sort by package name ascending.
+    Name,
+    /// Sort by package name descending.
+    NameDesc,
+    /// Sort by `meta.mainProgram` ascending.
+    MainProgram,
+    /// Sort by `meta.mainProgram` descending.
+    MainProgramDesc,
+}
+
+impl fmt::Display for SearchSort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => write!(f, "none"),
+            Self::Attr => write!(f, "attr"),
+            Self::AttrDesc => write!(f, "attr-desc"),
+            Self::Name => write!(f, "name"),
+            Self::NameDesc => write!(f, "name-desc"),
+            Self::MainProgram => write!(f, "main-program"),
+            Self::MainProgramDesc => write!(f, "main-program-desc"),
+        }
+    }
+}
+
+impl FromStr for SearchSort {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "" | "none" | "relevance" => Ok(Self::None),
+            "attr" => Ok(Self::Attr),
+            "attr-desc" | "attr:desc" | "attr-descending" => Ok(Self::AttrDesc),
+            "name" => Ok(Self::Name),
+            "name-desc" | "name:desc" | "name-descending" => Ok(Self::NameDesc),
+            "main-program" | "mainprogram" | "main_program" => Ok(Self::MainProgram),
+            "main-program-desc" | "main-program:desc" | "mainprogram-desc" => {
+                Ok(Self::MainProgramDesc)
+            }
+            _ => Err(Error::Parse(format!("unknown search sort order: {s}"))),
+        }
+    }
+}
+
+#[cfg(feature = "cli")]
+impl clap::ValueEnum for SearchSort {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[
+            Self::None,
+            Self::Attr,
+            Self::AttrDesc,
+            Self::Name,
+            Self::NameDesc,
+            Self::MainProgram,
+            Self::MainProgramDesc,
+        ]
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(match self {
+            Self::None => clap::builder::PossibleValue::new("none"),
+            Self::Attr => clap::builder::PossibleValue::new("attr"),
+            Self::AttrDesc => clap::builder::PossibleValue::new("attr-desc"),
+            Self::Name => clap::builder::PossibleValue::new("name"),
+            Self::NameDesc => clap::builder::PossibleValue::new("name-desc"),
+            Self::MainProgram => clap::builder::PossibleValue::new("main-program"),
+            Self::MainProgramDesc => clap::builder::PossibleValue::new("main-program-desc"),
+        })
+    }
+}
+
 /// Which fields of a package record to match against.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum SearchField {
@@ -116,6 +196,7 @@ impl SearchDb {
         field: SearchField,
         case_sensitive: bool,
         exact: bool,
+        sort: SearchSort,
         limit: Option<usize>,
     ) -> Result<Vec<&PackageMeta>> {
         if pattern.len() > MAX_PATTERN_BYTES {
@@ -156,6 +237,8 @@ impl SearchDb {
                 .collect()
         };
 
+        Self::sort_records(&mut matches, sort);
+
         if let Some(limit) = limit {
             matches.truncate(limit);
         }
@@ -173,6 +256,7 @@ impl SearchDb {
         pattern: &str,
         field: SearchField,
         case_sensitive: bool,
+        sort: SearchSort,
         limit: Option<usize>,
     ) -> Result<Vec<&PackageMeta>> {
         if pattern.len() > MAX_PATTERN_BYTES {
@@ -194,13 +278,58 @@ impl SearchDb {
             })
             .collect();
 
-        scored.sort_by_key(|&(score, _)| std::cmp::Reverse(score));
+        if sort == SearchSort::None {
+            scored.sort_by_key(|&(score, _)| std::cmp::Reverse(score));
+        } else {
+            scored.sort_by(|(score_a, a), (score_b, b)| {
+                let ord = Self::compare_records(a, b, sort);
+                if ord == std::cmp::Ordering::Equal {
+                    score_b.cmp(score_a)
+                } else {
+                    ord
+                }
+            });
+        }
 
         if let Some(limit) = limit {
             scored.truncate(limit);
         }
 
         Ok(scored.into_iter().map(|(_, record)| record).collect())
+    }
+
+    /// Sort a slice of package records in-place according to `sort`.
+    fn sort_records(matches: &mut Vec<&PackageMeta>, sort: SearchSort) {
+        if sort == SearchSort::None {
+            return;
+        }
+        matches.sort_by(|a, b| Self::compare_records(a, b, sort));
+    }
+
+    /// Compare two records according to `sort`.
+    fn compare_records(a: &PackageMeta, b: &PackageMeta, sort: SearchSort) -> std::cmp::Ordering {
+        let ord = match sort {
+            SearchSort::None => std::cmp::Ordering::Equal,
+            SearchSort::Attr | SearchSort::AttrDesc => a.attr.cmp(&b.attr),
+            SearchSort::Name | SearchSort::NameDesc => a.name.cmp(&b.name),
+            SearchSort::MainProgram | SearchSort::MainProgramDesc => {
+                let a_main = match a.main_program.as_deref() {
+                    Some(v) => v,
+                    None => "",
+                };
+                let b_main = match b.main_program.as_deref() {
+                    Some(v) => v,
+                    None => "",
+                };
+                a_main.cmp(b_main)
+            }
+        };
+        match sort {
+            SearchSort::AttrDesc | SearchSort::NameDesc | SearchSort::MainProgramDesc => {
+                ord.reverse()
+            }
+            _ => ord,
+        }
     }
 }
 
@@ -376,7 +505,15 @@ mod tests {
 
         let db = SearchDb::open(&path).expect("open");
         let hits = db
-            .search("nix", false, SearchField::Attr, false, false, None)
+            .search(
+                "nix",
+                false,
+                SearchField::Attr,
+                false,
+                false,
+                SearchSort::None,
+                None,
+            )
             .expect("search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].attr, "nix");
@@ -396,6 +533,7 @@ mod tests {
                 SearchField::Description,
                 false,
                 false,
+                SearchSort::None,
                 None,
             )
             .expect("search");
@@ -417,7 +555,15 @@ mod tests {
 
         let db = SearchDb::open(&path).expect("open");
         let hits = db
-            .search("^g", true, SearchField::Both, false, false, None)
+            .search(
+                "^g",
+                true,
+                SearchField::Both,
+                false,
+                false,
+                SearchSort::None,
+                None,
+            )
             .expect("search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].attr, "git");
@@ -438,7 +584,15 @@ mod tests {
 
         let db = SearchDb::open(&path).expect("open");
         let hits = db
-            .search("a|b|c", true, SearchField::Attr, false, false, Some(2))
+            .search(
+                "a|b|c",
+                true,
+                SearchField::Attr,
+                false,
+                false,
+                SearchSort::None,
+                Some(2),
+            )
             .expect("search");
         assert_eq!(hits.len(), 2);
     }
@@ -455,12 +609,28 @@ mod tests {
 
         let db = SearchDb::open(&path).expect("open");
         let hits = db
-            .search("git", false, SearchField::MainProgram, false, false, None)
+            .search(
+                "git",
+                false,
+                SearchField::MainProgram,
+                false,
+                false,
+                SearchSort::None,
+                None,
+            )
             .expect("search");
         assert_eq!(hits.len(), 2);
 
         let exact = db
-            .search("git", false, SearchField::MainProgram, false, true, None)
+            .search(
+                "git",
+                false,
+                SearchField::MainProgram,
+                false,
+                true,
+                SearchSort::None,
+                None,
+            )
             .expect("search");
         assert_eq!(exact.len(), 1);
         assert_eq!(exact[0].attr, "git");
@@ -474,12 +644,28 @@ mod tests {
 
         let db = SearchDb::open(&path).expect("open");
         let hits = db
-            .search("hello", false, SearchField::Attr, false, false, None)
+            .search(
+                "hello",
+                false,
+                SearchField::Attr,
+                false,
+                false,
+                SearchSort::None,
+                None,
+            )
             .expect("search");
         assert_eq!(hits.len(), 1);
 
         let case_sensitive = db
-            .search("hello", false, SearchField::Attr, true, false, None)
+            .search(
+                "hello",
+                false,
+                SearchField::Attr,
+                true,
+                false,
+                SearchSort::None,
+                None,
+            )
             .expect("search");
         assert_eq!(case_sensitive.len(), 0);
     }
@@ -492,7 +678,15 @@ mod tests {
 
         let db = SearchDb::open(&path).expect("open");
         let long = "a".repeat(MAX_PATTERN_BYTES + 1);
-        let result = db.search(&long, false, SearchField::Attr, false, false, None);
+        let result = db.search(
+            &long,
+            false,
+            SearchField::Attr,
+            false,
+            false,
+            SearchSort::None,
+            None,
+        );
         assert!(result.is_err());
     }
 
@@ -507,12 +701,28 @@ mod tests {
 
         let db = SearchDb::open(&path).expect("open");
         let hits = db
-            .search("greet", false, SearchField::Description, false, false, None)
+            .search(
+                "greet",
+                false,
+                SearchField::Description,
+                false,
+                false,
+                SearchSort::None,
+                None,
+            )
             .expect("search");
         assert_eq!(hits.len(), 1);
 
         let exact = db
-            .search("greet", false, SearchField::Description, false, true, None)
+            .search(
+                "greet",
+                false,
+                SearchField::Description,
+                false,
+                true,
+                SearchSort::None,
+                None,
+            )
             .expect("search");
         assert_eq!(exact.len(), 0);
 
@@ -523,6 +733,7 @@ mod tests {
                 SearchField::Description,
                 false,
                 true,
+                SearchSort::None,
                 None,
             )
             .expect("search");
@@ -544,7 +755,7 @@ mod tests {
 
         let db = SearchDb::open(&path).expect("open");
         let hits = db
-            .search_fuzzy("nvim", SearchField::Both, false, None)
+            .search_fuzzy("nvim", SearchField::Both, false, SearchSort::None, None)
             .expect("search");
 
         assert!(hits.len() >= 2, "expected at least neovim matches");
@@ -557,8 +768,86 @@ mod tests {
         );
 
         let limited = db
-            .search_fuzzy("nvim", SearchField::Both, false, Some(2))
+            .search_fuzzy("nvim", SearchField::Both, false, SearchSort::None, Some(2))
             .expect("search");
         assert_eq!(limited.len(), 2);
+    }
+
+    #[test]
+    fn sort_orders_results() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("packages.json");
+        let mut alpha = test_record("alpha", "First");
+        alpha.name = "z-name".into();
+        alpha.main_program = Some("alpha".into());
+        let mut beta = test_record("beta", "Second");
+        beta.name = "a-name".into();
+        beta.main_program = Some("beta".into());
+        let mut gamma = test_record("gamma", "Third");
+        gamma.main_program = None;
+        write_fixture(&path, &[alpha, beta, gamma]);
+
+        let db = SearchDb::open(&path).expect("open");
+        let all = db
+            .search(
+                ".*",
+                true,
+                SearchField::Attr,
+                false,
+                false,
+                SearchSort::None,
+                None,
+            )
+            .expect("search");
+        assert_eq!(all.len(), 3);
+
+        let by_attr = db
+            .search(
+                ".*",
+                true,
+                SearchField::Attr,
+                false,
+                false,
+                SearchSort::Attr,
+                None,
+            )
+            .expect("search");
+        assert_eq!(
+            by_attr.iter().map(|r| r.attr.as_str()).collect::<Vec<_>>(),
+            vec!["alpha", "beta", "gamma"]
+        );
+
+        let by_name = db
+            .search(
+                ".*",
+                true,
+                SearchField::Attr,
+                false,
+                false,
+                SearchSort::Name,
+                None,
+            )
+            .expect("search");
+        assert_eq!(
+            by_name.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["a-name", "gamma", "z-name"]
+        );
+
+        let by_main = db
+            .search(
+                ".*",
+                true,
+                SearchField::Attr,
+                false,
+                false,
+                SearchSort::MainProgram,
+                None,
+            )
+            .expect("search");
+        let mains: Vec<_> = by_main
+            .iter()
+            .map(|r| r.main_program.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(mains, vec!["", "alpha", "beta"]);
     }
 }
