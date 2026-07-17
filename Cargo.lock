@@ -1387,6 +1387,7 @@ dependencies = [
  "color-eyre",
  "nixdex-core",
  "regex",
+ "serde",
  "sonic-rs",
  "tokio",
  "tracing-subscriber",
