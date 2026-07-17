@@ -44,6 +44,11 @@ struct Args {
     /// (`files.basename.*`, `packages.json`) are loaded if present.
     #[arg(long)]
     database: Option<PathBuf>,
+
+    /// Bearer token required for `POST /reload` when not bound to loopback.
+    /// If unset, `/reload` is only accepted from loopback addresses.
+    #[arg(long, env = "NIXDEX_ADMIN_TOKEN")]
+    admin_token: Option<String>,
 }
 
 #[tokio::main]
@@ -72,6 +77,7 @@ async fn main() -> color_eyre::Result<()> {
         http_addr: args.http_addr,
         local_database: args.database,
         local_refresh_interval: Duration::from_secs(args.interval),
+        admin_token: args.admin_token,
     };
 
     match nixdex_core::daemon::run(&config).await {
