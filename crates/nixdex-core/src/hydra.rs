@@ -47,11 +47,65 @@ impl Error {
 /// Convenience alias for this module.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Builder for a [`Fetcher`] with configurable HTTP timeout and retries.
+#[derive(Debug)]
+pub struct FetcherBuilder {
+    base_url: String,
+    timeout: Duration,
+    max_attempts: u32,
+}
+
+impl FetcherBuilder {
+    /// Set the per-request timeout (default: 30 seconds).
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Set the maximum number of request attempts (default: 5).
+    ///
+    /// A value of `1` means no retries.
+    #[must_use]
+    pub fn max_attempts(mut self, max_attempts: u32) -> Self {
+        self.max_attempts = max_attempts.max(1);
+        self
+    }
+
+    /// Build the configured [`Fetcher`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `base_url` is empty or the HTTP client fails to build.
+    pub fn build(self) -> Result<Fetcher> {
+        let base_url = self.base_url.trim_end_matches('/').to_string();
+        if base_url.is_empty() {
+            return Err(Error::Request("binary cache URL must not be empty".into()));
+        }
+        let connect_timeout = std::cmp::min(self.timeout, Duration::from_secs(10));
+        let client = reqwest::Client::builder()
+            .user_agent(concat!("nixdex/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(connect_timeout)
+            .timeout(self.timeout)
+            .build()
+            .map_err(|err| Error::Request(err.to_string()))?;
+        Ok(Fetcher {
+            base_url,
+            client,
+            timeout: self.timeout,
+            max_attempts: self.max_attempts,
+            bytes_downloaded: Arc::new(AtomicU64::new(0)),
+        })
+    }
+}
+
 /// Client for a Nix binary cache (for example `https://cache.nixos.org`).
 #[derive(Debug, Clone)]
 pub struct Fetcher {
     base_url: String,
     client: reqwest::Client,
+    timeout: Duration,
+    max_attempts: u32,
     bytes_downloaded: Arc<AtomicU64>,
 }
 
@@ -62,21 +116,20 @@ impl Fetcher {
     ///
     /// Returns an error when `base_url` is empty or the HTTP client fails to build.
     pub fn new(base_url: impl Into<String>) -> Result<Self> {
-        let base_url = base_url.into().trim_end_matches('/').to_string();
-        if base_url.is_empty() {
-            return Err(Error::Request("binary cache URL must not be empty".into()));
+        Self::builder(base_url).build()
+    }
+
+    /// Start building a fetcher with custom timeout and retry settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `base_url` is empty.
+    pub fn builder(base_url: impl Into<String>) -> FetcherBuilder {
+        FetcherBuilder {
+            base_url: base_url.into(),
+            timeout: Duration::from_secs(30),
+            max_attempts: 5,
         }
-        let client = reqwest::Client::builder()
-            .user_agent(concat!("nixdex/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|err| Error::Request(err.to_string()))?;
-        Ok(Self {
-            base_url,
-            client,
-            bytes_downloaded: Arc::new(AtomicU64::new(0)),
-        })
     }
 
     /// Create a fetcher targeting the default binary cache.
@@ -119,15 +172,16 @@ impl Fetcher {
     /// Uses exponential backoff with jitter.
     #[allow(clippy::cognitive_complexity)]
     async fn get_with_retry(&self, url: &str) -> Result<reqwest::Response> {
-        const MAX_ATTEMPTS: u32 = 5;
+        let max_attempts = self.max_attempts;
         let mut backoff = Duration::from_secs(1);
         let max_backoff = Duration::from_secs(16);
         let accept = HeaderValue::from_static("br, gzip, deflate");
 
-        for attempt in 1..=MAX_ATTEMPTS {
+        for attempt in 1..=max_attempts {
             let response = self
                 .client
                 .get(url)
+                .timeout(self.timeout)
                 .header(header::ACCEPT_ENCODING, accept.clone())
                 .send()
                 .await;
@@ -138,7 +192,7 @@ impl Fetcher {
                     if status == reqwest::StatusCode::NOT_FOUND {
                         return Err(Error::Request(format!("{url}: HTTP {status}")));
                     }
-                    if status.is_server_error() && attempt < MAX_ATTEMPTS {
+                    if status.is_server_error() && attempt < max_attempts {
                         tracing::warn!(url, attempt, status = %status, "server error, retrying");
                         let jitter_ms = fastrand::u64(0..=500);
                         let jitter = Duration::from_millis(jitter_ms);
@@ -153,7 +207,7 @@ impl Fetcher {
                 }
                 Err(err) => {
                     let is_transient = err.is_timeout() || err.is_connect();
-                    if is_transient && attempt < MAX_ATTEMPTS {
+                    if is_transient && attempt < max_attempts {
                         tracing::warn!(url, attempt, error = %err, "transient request error, retrying");
                         let jitter_ms = fastrand::u64(0..=500);
                         let jitter = Duration::from_millis(jitter_ms);
@@ -167,7 +221,7 @@ impl Fetcher {
         }
 
         Err(Error::Request(format!(
-            "{url}: failed after {MAX_ATTEMPTS} attempts"
+            "{url}: failed after {max_attempts} attempts"
         )))
     }
 
