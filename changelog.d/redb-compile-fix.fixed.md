@@ -1,0 +1,1 @@
+- Fix redb index compilation: remove unused `FileTree` import and iterate over entry slice directly.
