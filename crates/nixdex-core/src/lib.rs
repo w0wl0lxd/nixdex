@@ -82,6 +82,17 @@ pub fn search_database(options: &database::SearchOptions<'_>) -> Result<()> {
     database::search(options)
 }
 
+/// Search the database and return matched `(StorePath, FileTreeEntry)` pairs.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be read or the query is unsupported.
+pub fn search_database_results(
+    options: &database::SearchOptions<'_>,
+) -> Result<Vec<(StorePath, crate::files::FileTreeEntry)>> {
+    database::search_results(options)
+}
+
 #[cfg(test)]
 mod tests {
     use super::bounded_zstd_decode;

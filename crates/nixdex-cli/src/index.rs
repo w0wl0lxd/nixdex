@@ -8,6 +8,22 @@ use clap::Parser;
 use color_eyre::eyre::WrapErr;
 use tracing_subscriber::EnvFilter;
 
+/// Maximum number of concurrent HTTP requests the indexer may make.
+const MAX_JOBS: usize = 1000;
+
+/// Parse and validate the `--requests` value.
+fn parse_jobs(s: &str) -> Result<usize, String> {
+    let n: usize = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a valid integer"))?;
+    if n == 0 || n > MAX_JOBS {
+        return Err(format!(
+            "--requests must be between 1 and {MAX_JOBS}, got {n}"
+        ));
+    }
+    Ok(n)
+}
+
 /// Resolve the default nix-index database directory.
 fn default_db_dir() -> &'static str {
     static CACHE: OnceLock<String> = OnceLock::new();
@@ -26,8 +42,16 @@ fn default_db_dir() -> &'static str {
 #[command(name = "nix-index", author, about, version)]
 pub struct Args {
     /// Make REQUESTS HTTP requests in parallel.
-    #[arg(short = 'r', long = "requests", default_value = "100")]
+    #[arg(short = 'r', long = "requests", default_value = "100", value_parser = parse_jobs)]
     pub jobs: usize,
+
+    /// HTTP request timeout in seconds.
+    #[arg(long, default_value = "30", value_parser = clap::value_parser!(u64).range(1..))]
+    pub timeout: u64,
+
+    /// Number of retries for transient HTTP failures.
+    #[arg(long, default_value = "4", value_parser = clap::value_parser!(u32).range(0..=20))]
+    pub retries: u32,
 
     /// Directory where the index is stored.
     #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
@@ -43,6 +67,9 @@ pub struct Args {
 
     /// Pass a Nix function to `nix-eval-jobs --select` to filter or transform the
     /// evaluation root before attribute traversal.
+    ///
+    /// The expression must be a function accepting the package set, for example
+    /// `p: { inherit (p) hello coreutils; }`.
     #[arg(long, value_name = "EXPR")]
     pub select: Option<String>,
 
@@ -59,10 +86,13 @@ pub struct Args {
     pub no_check_cache_status: bool,
 
     /// Zstandard compression level (1–22).
-    #[arg(short, long = "compression", default_value = "19", value_parser = clap::value_parser!(i32).range(1..=22))]
+    #[arg(short, long = "compression", default_value = "22", value_parser = clap::value_parser!(i32).range(1..=22))]
     pub compression_level: i32,
 
     /// On-disk database format version (1 or 2).
+    ///
+    /// nixdex writes format v2 by default, which is a nixdex extension.
+    /// v1 is fully compatible with upstream nix-index.
     #[arg(long, default_value = "2", value_parser = clap::value_parser!(u64).range(1..=2))]
     pub format_version: u64,
 
@@ -73,6 +103,25 @@ pub struct Args {
     /// Only add paths starting with PREFIX (for example `/bin/`).
     #[arg(long, default_value = "")]
     pub filter_prefix: String,
+
+    /// Skip paths starting with PREFIX (can be given multiple times).
+    #[arg(long)]
+    pub exclude_prefix: Vec<String>,
+
+    /// Disable nixpkgs overlays when evaluating the package set.
+    ///
+    /// This is equivalent to passing `--arg overlays '[]'` to `nix-env` and
+    /// avoids evaluating packages added or modified by user overlays, which are
+    /// unlikely to be cached on the official binary cache.
+    #[arg(long)]
+    pub no_overlays: bool,
+
+    /// Do not recurse into runtime references when fetching `.ls` listings.
+    ///
+    /// This indexes only the store paths that belong directly to each package
+    /// and is much faster when full closure listings are not needed.
+    #[arg(long)]
+    pub no_closure: bool,
 
     /// Build a small database containing only files under `/bin/`.
     ///
@@ -120,6 +169,10 @@ pub struct Args {
         ]
     )]
     pub extra_scopes: Vec<String>,
+
+    /// Base URL of the Nix binary cache to fetch listings from.
+    #[arg(long, default_value_t = String::from(nixdex_core::CACHE_URL))]
+    pub cache_url: String,
 
     /// Download a prebuilt `files` database instead of evaluating nixpkgs.
     #[arg(long)]
@@ -179,6 +232,8 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
 
     let options = nixdex_core::index::UpdateOptions {
         jobs: args.jobs,
+        timeout: args.timeout,
+        retries: args.retries,
         database: args.database,
         nixpkgs: args.nixpkgs,
         system: args.system,
@@ -196,12 +251,42 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
         path_cache_file: args.path_cache_file,
         path_cache_ttl: args.path_cache_ttl,
         main_program: !args.no_main_program,
+        no_overlays: args.no_overlays,
+        no_closure: args.no_closure,
         extra_scopes: args.extra_scopes,
         only_eval: args.only_eval,
+        cache_url: args.cache_url,
+        exclude_prefix: args.exclude_prefix,
     };
 
     nixdex_core::update_index(&options)
         .await
         .wrap_err("nix-index failed")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_jobs_accepts_valid_values() {
+        assert_eq!(parse_jobs("1").unwrap(), 1);
+        assert_eq!(parse_jobs("100").unwrap(), 100);
+        assert_eq!(parse_jobs("1000").unwrap(), 1000);
+    }
+
+    #[test]
+    fn parse_jobs_rejects_zero_and_huge_values() {
+        assert!(parse_jobs("0").is_err());
+        assert!(parse_jobs("1001").is_err());
+        assert!(parse_jobs("not-a-number").is_err());
+    }
+
+    #[test]
+    fn args_parsing_rejects_invalid_requests() {
+        let result =
+            Args::try_parse_from(["nix-index", "--requests", "0", "-d", "/tmp/nix-index-test"]);
+        assert!(result.is_err());
+    }
 }

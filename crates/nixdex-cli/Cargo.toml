@@ -16,8 +16,13 @@ tracing-subscriber = { workspace = true }
 color-eyre = { workspace = true }
 tokio = { workspace = true }
 sonic-rs = { workspace = true }
-nixdex-core = { workspace = true, features = ["cli"] }
+serde = { workspace = true }
+nixdex-core = { workspace = true, features = ["cli", "daemon"] }
 clap_complete = "4.6.7"
+
+[dev-dependencies]
+bytes = { workspace = true }
+tempfile = "3"
 
 [[bin]]
 name = "nix-index"

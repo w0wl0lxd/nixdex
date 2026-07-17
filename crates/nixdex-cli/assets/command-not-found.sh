@@ -3,6 +3,14 @@
 # Shell integration for nixdex / nix-locate.
 # Source this file from your shell profile to get command-not-found suggestions.
 
+comma_cmd() {
+    if command -v , >/dev/null 2>&1; then
+        printf '%s' ','
+    elif command -v comma >/dev/null 2>&1; then
+        printf '%s' 'comma'
+    fi
+}
+
 command_not_found_handle () {
     # Do not run when inside Midnight Commander or within a pipe.
     if [ -n "${MC_SID-}" ] || ! [ -t 1 ]; then
@@ -12,6 +20,8 @@ command_not_found_handle () {
 
     local toplevel=nixpkgs
     local cmd=$1
+    local comma
+    comma=$(comma_cmd)
     local attrs
     attrs=$(@out@/bin/nix-locate --minimal --no-group --type x --type s --whole-name --at-root "/bin/$cmd")
     local len
@@ -56,7 +66,20 @@ EOF
                 fi
             else
                 if [ -e "$HOME/.nix-profile/manifest.json" ]; then
-                    cat >&2 <<EOF
+                    if [ -n "$comma" ]; then
+                        cat >&2 <<EOF
+The program '$cmd' is currently not installed. You can install it
+by typing:
+  nix profile install $toplevel#$attrs
+
+Or run it once with:
+  nix shell $toplevel#$attrs -c $cmd ...
+
+Or run it once with:
+  $comma $cmd
+EOF
+                    else
+                        cat >&2 <<EOF
 The program '$cmd' is currently not installed. You can install it
 by typing:
   nix profile install $toplevel#$attrs
@@ -64,8 +87,22 @@ by typing:
 Or run it once with:
   nix shell $toplevel#$attrs -c $cmd ...
 EOF
+                    fi
                 else
-                    cat >&2 <<EOF
+                    if [ -n "$comma" ]; then
+                        cat >&2 <<EOF
+The program '$cmd' is currently not installed. You can install it
+by typing:
+  nix-env -iA $toplevel.$attrs
+
+Or run it once with:
+  nix-shell -p $attrs --run '$cmd ...'
+
+Or run it once with:
+  $comma $cmd
+EOF
+                    else
+                        cat >&2 <<EOF
 The program '$cmd' is currently not installed. You can install it
 by typing:
   nix-env -iA $toplevel.$attrs
@@ -73,6 +110,7 @@ by typing:
 Or run it once with:
   nix-shell -p $attrs --run '$cmd ...'
 EOF
+                    fi
                 fi
             fi
             ;;
@@ -103,6 +141,13 @@ EOF
             done <<EOF
 $attrs
 EOF
+            if [ -n "$comma" ]; then
+                cat >&2 <<EOF
+
+Or run it once with:
+  $comma $cmd
+EOF
+            fi
             ;;
     esac
 

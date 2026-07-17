@@ -40,6 +40,12 @@ secrets:
       exit 1
     fi
 
+changelog:
+    python3 scripts/changelog.py collect
+
+changelog-check:
+    python3 scripts/changelog.py check --base origin/main
+
 rail-plan:
     cargo rail plan --merge-base --explain
 
@@ -49,7 +55,7 @@ rail-run PROFILE='local':
 rail-validate:
     cargo rail config validate
 
-validate: secrets fmt check clippy test
+validate: secrets fmt check clippy test changelog-check
 
 benchmark:
     cargo bench --bench search
