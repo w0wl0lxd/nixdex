@@ -140,6 +140,15 @@ impl<T> FileNode<T> {
             }
         )
     }
+
+    /// Return the size of this node (0 for symlinks).
+    #[must_use]
+    pub fn size(&self) -> u64 {
+        match self {
+            Self::Regular { size, .. } | Self::Directory { size, .. } => *size,
+            Self::Symlink { .. } => 0,
+        }
+    }
 }
 
 /// Directory contents as a sorted vector of `(name, subtree)` pairs.
