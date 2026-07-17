@@ -1,0 +1,1 @@
+Apply `cargo fmt` to the redb index and CLI command-not-found code.
