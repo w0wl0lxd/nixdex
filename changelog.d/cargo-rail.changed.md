@@ -1,0 +1,1 @@
+- Track `.config/rail.toml` and wire `cargo-rail` into `mise.toml` and `justfile` for dependency linting.

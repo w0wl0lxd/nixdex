@@ -40,6 +40,15 @@ secrets:
       exit 1
     fi
 
+rail-plan:
+    cargo rail plan --merge-base --explain
+
+rail-run PROFILE='local':
+    cargo rail run --merge-base --profile '{{PROFILE}}'
+
+rail-validate:
+    cargo rail config validate
+
 validate: secrets fmt check clippy test
 
 benchmark:
