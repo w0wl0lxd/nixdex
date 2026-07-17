@@ -103,7 +103,7 @@ impl Default for UpdateOptions {
             select: None,
             no_instantiate: false,
             check_cache_status: true,
-            compression_level: 19,
+            compression_level: 22,
             format_version: 2,
             show_trace: false,
             filter_prefix: String::new(),
@@ -641,7 +641,7 @@ mod tests {
     fn default_options_match_upstream_baseline() {
         let opts = UpdateOptions::default();
         assert_eq!(opts.jobs, 100);
-        assert_eq!(opts.compression_level, 19);
+        assert_eq!(opts.compression_level, 22);
         assert_eq!(opts.format_version, 2);
         assert_eq!(opts.nixpkgs, "<nixpkgs>");
         assert!(!opts.path_cache);
