@@ -83,6 +83,8 @@ pub struct UpdateOptions {
     pub path_cache_ttl: Option<u64>,
     /// Synthesize `/bin/<mainProgram>` listings from `meta.mainProgram`.
     pub main_program: bool,
+    /// Disable nixpkgs overlays during evaluation.
+    pub no_overlays: bool,
     /// Extra attribute scopes to walk during evaluation.
     pub extra_scopes: Vec<String>,
     /// Only evaluate nixpkgs; do not fetch listings or write the files database.
@@ -114,6 +116,7 @@ impl Default for UpdateOptions {
             path_cache_file: None,
             path_cache_ttl: None,
             main_program: true,
+            no_overlays: false,
             extra_scopes: vec![
                 String::from("haskellPackages"),
                 String::from("rPackages"),
@@ -209,6 +212,7 @@ impl IndexBuilder {
         let main_program = opts.main_program;
         let no_instantiate = opts.no_instantiate;
         let check_cache_status = opts.check_cache_status;
+        let no_overlays = opts.no_overlays;
 
         let meta_handle = self.spawn_meta_writer(meta_rx);
         let handle = tokio::spawn(async move {
@@ -224,6 +228,7 @@ impl IndexBuilder {
                 // descriptions and `mainProgram` values.
                 meta: true,
                 scope: None,
+                no_overlays,
             };
             let count =
                 nixpkgs::stream_package_entries(base, &extra_scopes, main_program, pkg_tx, meta_tx)
@@ -677,6 +682,7 @@ mod tests {
             path_cache_file: None,
             path_cache_ttl: None,
             main_program: true,
+            no_overlays: false,
             extra_scopes: vec![],
             only_eval: false,
             cache_url: crate::CACHE_URL.to_string(),
