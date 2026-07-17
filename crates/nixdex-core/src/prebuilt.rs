@@ -252,12 +252,18 @@ pub async fn download_and_validate(config: &PrebuiltConfig) -> Result<PathBuf> {
     let last_modified = headers
         .get(header::LAST_MODIFIED)
         .and_then(|v| header_to_string(v, "Last-Modified"));
-    let etag = match etag.or(last_modified) {
-        Some(e) => e,
+    let cache_key = match etag.or(last_modified) {
+        Some(e) => {
+            // Derive a fixed-length safe digest from the header value.
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(e.as_bytes());
+            format!("{:x}", hasher.finalize())
+        }
         None => "unknown".to_string(),
     };
 
-    let target_dir = config.cache_dir.join(etag);
+    let target_dir = config.cache_dir.join(cache_key);
     download_to(config, &target_dir.join("files")).await?;
     Ok(target_dir)
 }

@@ -68,12 +68,16 @@ clap = { version = "4", features = ["derive", "env"] }
 # Testing
 proptest = "1"
 
+# Benchmarking
+criterion = "0.5"
+
 # Workspace crates
 nixdex-core = { path = "crates/nixdex-core" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
 unused_must_use = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
