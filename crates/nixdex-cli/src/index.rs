@@ -59,7 +59,7 @@ pub struct Args {
     pub no_check_cache_status: bool,
 
     /// Zstandard compression level (1–22).
-    #[arg(short, long = "compression", default_value = "19", value_parser = clap::value_parser!(i32).range(1..=22))]
+    #[arg(short, long = "compression", default_value = "22", value_parser = clap::value_parser!(i32).range(1..=22))]
     pub compression_level: i32,
 
     /// On-disk database format version (1 or 2).
