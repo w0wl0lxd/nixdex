@@ -1,5 +1,5 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use nixdex_core::package_search::{SearchDb, SearchField};
+use nixdex_core::package_search::{SearchDb, SearchField, SearchSort};
 use std::io::Write;
 
 fn build_fixture(count: usize) -> Vec<u8> {
@@ -33,6 +33,7 @@ fn bench_search(c: &mut Criterion) {
                     SearchField::Attr,
                     false,
                     false,
+                    SearchSort::None,
                     None,
                 )
                 .unwrap(),
@@ -49,6 +50,7 @@ fn bench_search(c: &mut Criterion) {
                     SearchField::Both,
                     false,
                     false,
+                    SearchSort::None,
                     None,
                 )
                 .unwrap(),
@@ -65,6 +67,7 @@ fn bench_search(c: &mut Criterion) {
                     SearchField::Attr,
                     false,
                     false,
+                    SearchSort::None,
                     None,
                 )
                 .unwrap(),
