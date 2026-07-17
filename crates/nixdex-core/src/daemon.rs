@@ -673,6 +673,42 @@ async fn nix_locate_handler(
 }
 
 #[cfg(feature = "daemon")]
+fn deserialize_file_types<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct FileTypeVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for FileTypeVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a comma-separated string or a sequence of file types")
+        }
+
+        fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect())
+        }
+
+        fn visit_seq<S>(self, seq: S) -> std::result::Result<Self::Value, S::Error>
+        where
+            S: serde::de::SeqAccess<'de>,
+        {
+            serde::Deserialize::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+        }
+    }
+
+    deserializer.deserialize_any(FileTypeVisitor)
+}
+
+#[cfg(feature = "daemon")]
 #[derive(Deserialize)]
 struct NixLocateParams {
     pattern: String,
@@ -688,7 +724,7 @@ struct NixLocateParams {
     whole_name: bool,
     #[serde(default)]
     minimal: bool,
-    #[serde(default, rename = "type")]
+    #[serde(default, rename = "type", deserialize_with = "deserialize_file_types")]
     file_type: Vec<String>,
     #[serde(default)]
     limit: Option<usize>,
