@@ -118,14 +118,8 @@ impl Writer {
         })
     }
 
-    /// Add one store path and filtered file tree to the index.
-    pub fn add(
-        &mut self,
-        store_path: &StorePath,
-        files: &FileTree,
-        filter_prefix: &[u8],
-    ) -> Result<()> {
-        let entries = files.to_list(filter_prefix);
+    /// Add one store path and its already-filtered file entries to the index.
+    pub fn add(&mut self, store_path: &StorePath, entries: &[FileTreeEntry]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -180,7 +174,7 @@ impl Writer {
 
         for entry in entries {
             self.path_cache
-                .entry(entry.path)
+                .entry(entry.path.clone())
                 .or_default()
                 .push(origin_key.clone());
         }
