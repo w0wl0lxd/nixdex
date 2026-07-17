@@ -367,7 +367,11 @@ fn run_info(opts: InfoOpts) -> color_eyre::Result<()> {
         );
     } else {
         let desc = record.description.as_deref().map_or("—", |d| d);
-        println!("{}\t{}\t{}", record.attr, record.name, desc);
+        let main = record.main_program.as_deref().map_or("—", |m| m);
+        println!("{}", record.attr);
+        println!("  name:          {}", record.name);
+        println!("  description:   {}", desc);
+        println!("  main_program:  {}", main);
     }
 
     Ok(())
