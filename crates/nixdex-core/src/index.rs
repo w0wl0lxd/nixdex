@@ -42,6 +42,7 @@ struct WriteListingsContext<'a> {
     db_file: &'a Path,
     progress: &'a MultiProgress,
     attrs_map: IndexMap<String, String>,
+    no_closure: bool,
 }
 
 /// Options controlling an index build.
@@ -85,6 +86,8 @@ pub struct UpdateOptions {
     pub main_program: bool,
     /// Disable nixpkgs overlays during evaluation.
     pub no_overlays: bool,
+    /// Do not recurse into runtime references when fetching `.ls` listings.
+    pub no_closure: bool,
     /// Extra attribute scopes to walk during evaluation.
     pub extra_scopes: Vec<String>,
     /// Only evaluate nixpkgs; do not fetch listings or write the files database.
@@ -117,6 +120,7 @@ impl Default for UpdateOptions {
             path_cache_ttl: None,
             main_program: true,
             no_overlays: false,
+            no_closure: false,
             extra_scopes: vec![
                 String::from("haskellPackages"),
                 String::from("rPackages"),
@@ -436,6 +440,7 @@ impl IndexBuilder {
                 db_file: &ctx.db_file,
                 progress: &progress,
                 attrs_map: ctx.attrs_map,
+                no_closure: opts.no_closure,
             },
             stream.packages,
         )
@@ -582,6 +587,7 @@ async fn write_listings(
         ctx.path_cache,
         ctx.filter_prefix,
         ctx.attrs_map,
+        ctx.no_closure,
     )
     .await
     .map_err(|source| {
@@ -683,6 +689,7 @@ mod tests {
             path_cache_ttl: None,
             main_program: true,
             no_overlays: false,
+            no_closure: false,
             extra_scopes: vec![],
             only_eval: false,
             cache_url: crate::CACHE_URL.to_string(),
