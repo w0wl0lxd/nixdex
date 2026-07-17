@@ -19,10 +19,13 @@ const MAX_RESULT_LIMIT: usize = 10_000;
 use axum::{
     Router,
     extract::State,
-    http::header::CONTENT_TYPE,
+    http::{StatusCode, header},
     response::IntoResponse,
+    response::Response,
     routing::{get, post},
 };
+#[cfg(feature = "daemon")]
+use std::net::SocketAddr;
 #[cfg(feature = "daemon")]
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "daemon")]
@@ -33,17 +36,40 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 #[cfg(feature = "daemon")]
-struct IndexState {
-    basename: Arc<std::sync::RwLock<Option<Arc<BasenameIndex>>>>,
-    reader: Arc<std::sync::RwLock<Option<Arc<Reader>>>>,
-    package_db: Arc<std::sync::RwLock<Option<Arc<crate::package_search::SearchDb>>>>,
+#[derive(Clone)]
+struct IndexSnapshot {
     /// Directory that currently holds the loaded `files` database and sidecars.
-    database_dir: Arc<std::sync::RwLock<Option<PathBuf>>>,
+    database_dir: PathBuf,
+    /// Loaded basename index.
+    basename: Arc<BasenameIndex>,
+    /// Loaded database reader.
+    reader: Arc<Reader>,
+    /// Loaded package metadata database, if present.
+    package_db: Option<Arc<crate::package_search::SearchDb>>,
+}
+
+#[cfg(feature = "daemon")]
+struct IndexState {
+    /// Currently loaded index; replaced atomically so requests never see a partially loaded state.
+    index: Arc<std::sync::RwLock<Option<IndexSnapshot>>>,
     start_time: Instant,
     requests_total: AtomicU64,
+    /// Bearer token required for the `POST /reload` admin endpoint.
+    admin_token: Option<String>,
     /// Bounded one-slot channel used by HTTP `/reload` to request an immediate index refresh.
     /// Pending requests cannot grow beyond one; new requests replace pending ones.
     reload: tokio::sync::mpsc::Sender<()>,
+}
+
+#[cfg(feature = "daemon")]
+fn read_snapshot(index_state: &IndexState) -> Option<IndexSnapshot> {
+    match index_state.index.read() {
+        Ok(guard) => guard.as_ref().cloned(),
+        Err(err) => {
+            tracing::warn!(error = %err, "index lock poisoned");
+            None
+        }
+    }
 }
 
 /// Configuration for a prebuilt-index daemon.
@@ -57,6 +83,9 @@ pub struct DaemonConfig {
     pub local_database: Option<PathBuf>,
     /// How often to reload the local database when running in local mode.
     pub local_refresh_interval: std::time::Duration,
+    /// Bearer token required for the `POST /reload` admin endpoint.
+    /// If unset, `/reload` is only accepted from loopback addresses.
+    pub admin_token: Option<String>,
 }
 
 impl Default for DaemonConfig {
@@ -66,6 +95,7 @@ impl Default for DaemonConfig {
             http_addr: "127.0.0.1:3750".to_string(),
             local_database: None,
             local_refresh_interval: std::time::Duration::from_secs(3600),
+            admin_token: None,
         }
     }
 }
@@ -94,12 +124,10 @@ enum SignalAction {
 pub async fn run(config: &DaemonConfig) -> Result<()> {
     let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel(1);
     let index_state = Arc::new(IndexState {
-        basename: Arc::new(std::sync::RwLock::new(None)),
-        reader: Arc::new(std::sync::RwLock::new(None)),
-        package_db: Arc::new(std::sync::RwLock::new(None)),
-        database_dir: Arc::new(std::sync::RwLock::new(None)),
+        index: Arc::new(std::sync::RwLock::new(None)),
         start_time: Instant::now(),
         requests_total: AtomicU64::new(0),
+        admin_token: config.admin_token.clone(),
         reload: reload_tx,
     });
 
@@ -297,6 +325,7 @@ async fn handle_refresh_tick(
 }
 
 #[cfg(feature = "daemon")]
+#[allow(clippy::cognitive_complexity)]
 fn load_and_store_index(cache_dir: &std::path::Path, index_state: &IndexState) {
     let index_dir = if cache_dir.join("files").exists() {
         cache_dir.to_path_buf()
@@ -304,23 +333,53 @@ fn load_and_store_index(cache_dir: &std::path::Path, index_state: &IndexState) {
         cache_dir.join("current")
     };
 
-    if let Ok(mut state) = index_state.database_dir.write() {
-        *state = Some(index_dir.clone());
-    }
-
     if !ensure_sidecars(&index_dir) {
         return;
     }
 
-    let Ok(index) = crate::basename_index::BasenameIndex::open(&index_dir) else {
-        return;
+    let basename = match crate::basename_index::BasenameIndex::open(&index_dir) {
+        Ok(index) => index,
+        Err(err) => {
+            tracing::warn!(error = %err, path = %index_dir.display(), "failed to load basename index");
+            return;
+        }
     };
-    if let Ok(mut state) = index_state.basename.write() {
-        *state = Some(Arc::new(index));
+
+    let files_path = index_dir.join("files");
+    let reader = match Reader::open(&files_path) {
+        Ok(reader) => reader,
+        Err(err) => {
+            tracing::warn!(error = %err, path = %files_path.display(), "failed to open database reader");
+            return;
+        }
+    };
+
+    let package_db = {
+        let packages_json = index_dir.join("packages.json");
+        if packages_json.exists() {
+            match crate::package_search::SearchDb::open(&packages_json) {
+                Ok(db) => Some(Arc::new(db)),
+                Err(err) => {
+                    tracing::warn!(error = %err, path = %packages_json.display(), "failed to load package metadata sidecar");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
+    let snapshot = IndexSnapshot {
+        database_dir: index_dir.clone(),
+        basename: Arc::new(basename),
+        reader: Arc::new(reader),
+        package_db,
+    };
+
+    if let Ok(mut state) = index_state.index.write() {
+        *state = Some(snapshot);
     }
 
-    load_reader(&index_dir, index_state);
-    load_package_db(&index_dir, index_state);
     tracing::info!(index_dir = %index_dir.display(), "index loaded");
 }
 
@@ -340,36 +399,6 @@ fn ensure_sidecars(index_dir: &std::path::Path) -> bool {
         return false;
     }
     true
-}
-
-#[cfg(feature = "daemon")]
-fn load_package_db(index_dir: &std::path::Path, index_state: &IndexState) {
-    let packages_json = index_dir.join("packages.json");
-    if !packages_json.exists() {
-        return;
-    }
-    match crate::package_search::SearchDb::open(&packages_json) {
-        Ok(db) => {
-            if let Ok(mut state) = index_state.package_db.write() {
-                *state = Some(Arc::new(db));
-            }
-        }
-        Err(err) => {
-            tracing::warn!(error = %err, path = %packages_json.display(), "failed to load package metadata sidecar");
-        }
-    }
-}
-
-#[cfg(feature = "daemon")]
-fn load_reader(index_dir: &std::path::Path, index_state: &IndexState) {
-    let files_path = index_dir.join("files");
-    let Ok(reader) = Reader::open(&files_path) else {
-        tracing::warn!(path = %files_path.display(), "failed to open database reader");
-        return;
-    };
-    if let Ok(mut state) = index_state.reader.write() {
-        *state = Some(Arc::new(reader));
-    }
 }
 
 /// Refresh the prebuilt index if a new version is available.
@@ -417,6 +446,73 @@ async fn download_and_update(config: &PrebuiltConfig, cache_dir: &std::path::Pat
     Ok(())
 }
 
+/// Authenticate `POST /reload` requests.
+///
+/// If `admin_token` is configured, the caller must present it as an
+/// `Authorization: Bearer <token>` header (compared in constant time).
+/// If no token is configured, the endpoint is restricted to loopback addresses.
+#[cfg(feature = "daemon")]
+async fn admin_auth_middleware(
+    State(index_state): State<Arc<IndexState>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    fn unauthorized() -> Response {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::WWW_AUTHENTICATE,
+            axum::http::HeaderValue::from_static("Bearer"),
+        );
+        (StatusCode::UNAUTHORIZED, headers).into_response()
+    }
+
+    if let Some(expected) = &index_state.admin_token {
+        let presented = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| h.strip_prefix("Bearer "));
+
+        let Some(presented) = presented else {
+            return unauthorized();
+        };
+
+        if constant_time_bearer_eq(presented, expected) {
+            next.run(request).await
+        } else {
+            unauthorized()
+        }
+    } else if addr.ip().is_loopback() {
+        next.run(request).await
+    } else {
+        unauthorized()
+    }
+}
+
+/// Compare a presented bearer token to the expected value in constant time.
+#[cfg(feature = "daemon")]
+fn constant_time_bearer_eq(presented: &str, expected: &str) -> bool {
+    use subtle::ConstantTimeEq;
+
+    let presented_bytes = presented.as_bytes();
+    let expected_bytes = expected.as_bytes();
+    let n = expected_bytes.len();
+
+    // Zero-pad the presented token to the expected length so the same comparison
+    // path runs regardless of input length, then fold in the length equality bit.
+    let mut padded = vec![0u8; n];
+    for (i, b) in presented_bytes.iter().take(n).enumerate() {
+        if let Some(slot) = padded.get_mut(i) {
+            *slot = *b;
+        }
+    }
+
+    let bytes_match = padded.as_slice().ct_eq(expected_bytes).unwrap_u8();
+    let len_match = u8::from(presented_bytes.len() == n);
+    (bytes_match & len_match) == 1
+}
+
 /// Run the HTTP server for basename lookups.
 #[cfg(feature = "daemon")]
 async fn run_http_server(addr: &str, index_state: Arc<IndexState>) -> Result<()> {
@@ -425,7 +521,14 @@ async fn run_http_server(addr: &str, index_state: Arc<IndexState>) -> Result<()>
         .route("/ready", get(ready_handler))
         .route("/version", get(version_handler))
         .route("/metrics", get(metrics_handler))
-        .route("/reload", post(reload_handler))
+        .route(
+            "/reload",
+            post(reload_handler)
+                .route_layer(axum::middleware::from_fn_with_state(
+                    Arc::clone(&index_state),
+                    admin_auth_middleware,
+                )),
+        )
         .route("/locate", get(locate_handler))
         .route("/nix-locate", get(nix_locate_handler))
         .route("/search", get(search_handler))
@@ -437,7 +540,7 @@ async fn run_http_server(addr: &str, index_state: Arc<IndexState>) -> Result<()>
 
     tracing::info!(addr, "HTTP server listening");
 
-    axum::serve(listener, app)
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .map_err(crate::Error::from)?;
 
@@ -451,22 +554,13 @@ async fn locate_handler(
     axum::extract::Query(params): axum::extract::Query<LocateParams>,
 ) -> axum::Json<LocateResponse> {
     index_state.requests_total.fetch_add(1, Ordering::Relaxed);
-    let index = {
-        let Ok(guard) = index_state.basename.read() else {
-            return axum::Json(LocateResponse {
-                packages: Vec::new(),
-            });
-        };
-        guard.as_ref().map(Arc::clone)
-    };
-
-    let Some(index) = index else {
+    let Some(snapshot) = read_snapshot(&index_state) else {
         return axum::Json(LocateResponse {
             packages: Vec::new(),
         });
     };
 
-    let packages = match index.lookup_basename(params.basename.as_bytes()) {
+    let packages = match snapshot.basename.lookup_basename(params.basename.as_bytes()) {
         Ok(pkgs) => pkgs.into_iter().map(std::string::String::from).collect(),
         Err(_) => Vec::new(),
     };
@@ -519,19 +613,14 @@ async fn nix_locate_handler(
         ));
     }
 
-    let database_dir = {
-        let guard = index_state.database_dir.read().map_err(|_| {
-            json_error(
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to read database state",
-            )
-        })?;
-        guard.as_ref().cloned().ok_or_else(|| {
-            json_error(
+    let database_dir = match read_snapshot(&index_state) {
+        Some(snapshot) => snapshot.database_dir,
+        None => {
+            return Err(json_error(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "no database loaded",
-            )
-        })?
+            ));
+        }
     };
 
     // Build the path regex with anchors based on at_root/whole_name.
@@ -845,14 +934,13 @@ struct HealthResponse {
 #[cfg(feature = "daemon")]
 async fn health_handler(State(index_state): State<Arc<IndexState>>) -> axum::Json<HealthResponse> {
     index_state.requests_total.fetch_add(1, Ordering::Relaxed);
-    let index_loaded = matches!(index_state.basename.read(), Ok(g) if g.is_some());
-    let package_db_loaded = matches!(index_state.package_db.read(), Ok(g) if g.is_some());
-    let package_count = match index_state.reader.read() {
-        Ok(g) => g.as_ref().and_then(|r| r.package_count()),
-        Err(err) => {
-            tracing::warn!(error = %err, "reader lock poisoned in health check");
-            None
-        }
+    let (index_loaded, package_db_loaded, package_count) = match read_snapshot(&index_state) {
+        Some(snapshot) => (
+            true,
+            snapshot.package_db.is_some(),
+            snapshot.reader.package_count(),
+        ),
+        None => (false, false, None),
     };
 
     axum::Json(HealthResponse {
@@ -880,8 +968,10 @@ async fn ready_handler(
     State(index_state): State<Arc<IndexState>>,
 ) -> (axum::http::StatusCode, axum::Json<ReadyResponse>) {
     index_state.requests_total.fetch_add(1, Ordering::Relaxed);
-    let index_loaded = matches!(index_state.basename.read(), Ok(g) if g.is_some());
-    let package_db_loaded = matches!(index_state.package_db.read(), Ok(g) if g.is_some());
+    let (index_loaded, package_db_loaded) = match read_snapshot(&index_state) {
+        Some(snapshot) => (true, snapshot.package_db.is_some()),
+        None => (false, false),
+    };
     let ready = index_loaded && package_db_loaded;
 
     let status = if ready {
@@ -937,9 +1027,13 @@ async fn reload_handler(State(index_state): State<Arc<IndexState>>) -> axum::Jso
 #[cfg(feature = "daemon")]
 async fn metrics_handler(State(index_state): State<Arc<IndexState>>) -> impl IntoResponse {
     let total = index_state.requests_total.load(Ordering::Relaxed);
-    let index_loaded = u64::from(matches!(index_state.basename.read(), Ok(g) if g.is_some()));
-    let package_db_loaded =
-        u64::from(matches!(index_state.package_db.read(), Ok(g) if g.is_some()));
+    let (index_loaded, package_db_loaded) = match read_snapshot(&index_state) {
+        Some(snapshot) => (
+            u64::from(true),
+            u64::from(snapshot.package_db.is_some()),
+        ),
+        None => (0, 0),
+    };
     let uptime = index_state.start_time.elapsed().as_secs();
     let version = env!("CARGO_PKG_VERSION");
 
@@ -961,7 +1055,7 @@ async fn metrics_handler(State(index_state): State<Arc<IndexState>>) -> impl Int
          nixdex_version_info{{version=\"{version}\"}} 1\n"
     );
 
-    ([(CONTENT_TYPE, "text/plain; version=0.0.4")], body)
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
 
 /// Parameters for `/search`.
@@ -1036,14 +1130,14 @@ async fn search_handler(
         ));
     }
 
-    let db = {
-        let Ok(guard) = index_state.package_db.read() else {
+    let db = match read_snapshot(&index_state) {
+        Some(snapshot) => snapshot.package_db,
+        None => {
             return Err(json_error(
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to read package database state",
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "no package database loaded",
             ));
-        };
-        guard.as_ref().map(Arc::clone)
+        }
     };
 
     let Some(db) = db else {
@@ -1119,19 +1213,43 @@ struct SearchResponse {
 #[cfg(feature = "daemon")]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
     use std::sync::atomic::AtomicU64;
 
     fn empty_state() -> Arc<IndexState> {
         let (reload_tx, _reload_rx) = tokio::sync::mpsc::channel(1);
         Arc::new(IndexState {
-            basename: Arc::new(std::sync::RwLock::new(None)),
-            reader: Arc::new(std::sync::RwLock::new(None)),
-            package_db: Arc::new(std::sync::RwLock::new(None)),
-            database_dir: Arc::new(std::sync::RwLock::new(None)),
+            index: Arc::new(std::sync::RwLock::new(None)),
             start_time: Instant::now(),
             requests_total: AtomicU64::new(0),
+            admin_token: None,
             reload: reload_tx,
         })
+    }
+
+    fn state_with_token(token: Option<&str>) -> Arc<IndexState> {
+        let (reload_tx, _reload_rx) = tokio::sync::mpsc::channel(1);
+        Arc::new(IndexState {
+            index: Arc::new(std::sync::RwLock::new(None)),
+            start_time: Instant::now(),
+            requests_total: AtomicU64::new(0),
+            admin_token: token.map(String::from),
+            reload: reload_tx,
+        })
+    }
+
+    fn reload_app(state: Arc<IndexState>, addr: SocketAddr) -> Router {
+        Router::new()
+            .route(
+                "/reload",
+                post(reload_handler)
+                    .route_layer(axum::middleware::from_fn_with_state(
+                        Arc::clone(&state),
+                        admin_auth_middleware,
+                    )),
+            )
+            .layer(axum::extract::connect_info::MockConnectInfo(addr))
+            .with_state(state)
     }
 
     #[tokio::test]
@@ -1149,5 +1267,79 @@ mod tests {
         assert!(!response.0.ready);
         assert!(!response.0.index_loaded);
         assert!(!response.0.package_db_loaded);
+    }
+
+    #[tokio::test]
+    async fn reload_rejects_missing_or_wrong_token() {
+        let state = state_with_token(Some("secret"));
+        let mut app = reload_app(state, SocketAddr::from(([127, 0, 0, 1], 1234)));
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/reload")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::<axum::extract::Request>::oneshot(&mut app, request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/reload")
+            .header(axum::http::header::AUTHORIZATION, "Bearer wrong")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::<axum::extract::Request>::oneshot(&mut app, request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/reload")
+            .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::<axum::extract::Request>::oneshot(&mut app, request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn reload_requires_loopback_without_token() {
+        let state = state_with_token(None);
+
+        let mut app = reload_app(state.clone(), SocketAddr::from(([127, 0, 0, 1], 1234)));
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/reload")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::<axum::extract::Request>::oneshot(&mut app, request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let mut app = reload_app(state, SocketAddr::from(([192, 168, 1, 1], 1234)));
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/reload")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::<axum::extract::Request>::oneshot(&mut app, request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn constant_time_bearer_eq_is_strict() {
+        assert!(constant_time_bearer_eq("secret", "secret"));
+        assert!(!constant_time_bearer_eq("wrong", "secret"));
+        assert!(!constant_time_bearer_eq("sec", "secret"));
+        assert!(!constant_time_bearer_eq("secret-long", "secret"));
+        assert!(!constant_time_bearer_eq("", "secret"));
     }
 }
