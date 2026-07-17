@@ -3,8 +3,10 @@
 use std::sync::Arc;
 
 use crate::basename_index::BasenameIndex;
+use crate::database::Reader;
 use crate::errors::Result;
 use crate::prebuilt::{self, PrebuiltConfig};
+use indexmap::IndexSet;
 
 #[cfg(feature = "daemon")]
 use axum::{Router, extract::State, routing::get};
@@ -12,7 +14,10 @@ use axum::{Router, extract::State, routing::get};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "daemon")]
-type IndexState = Arc<std::sync::RwLock<Option<Arc<BasenameIndex>>>>;
+struct IndexState {
+    basename: Arc<std::sync::RwLock<Option<Arc<BasenameIndex>>>>,
+    reader: Arc<std::sync::RwLock<Option<Arc<Reader>>>>,
+}
 
 /// Configuration for a prebuilt-index daemon.
 #[derive(Debug, Clone)]
@@ -49,7 +54,10 @@ pub async fn run(config: &DaemonConfig) -> Result<()> {
     }
 
     let cache_dir = config.prebuilt.cache_dir.clone();
-    let index_state: IndexState = Arc::new(std::sync::RwLock::new(None));
+    let index_state = Arc::new(IndexState {
+        basename: Arc::new(std::sync::RwLock::new(None)),
+        reader: Arc::new(std::sync::RwLock::new(None)),
+    });
 
     let http_handle = start_http_server(&config.http_addr, Arc::clone(&index_state));
 
@@ -68,7 +76,10 @@ pub async fn run(config: &DaemonConfig) -> Result<()> {
 }
 
 #[cfg(feature = "daemon")]
-fn start_http_server(addr: &str, index_state: IndexState) -> tokio::task::JoinHandle<Result<()>> {
+fn start_http_server(
+    addr: &str,
+    index_state: Arc<IndexState>,
+) -> tokio::task::JoinHandle<Result<()>> {
     let http_addr = addr.to_string();
     tokio::spawn(async move { run_http_server(&http_addr, index_state).await })
 }
@@ -163,9 +174,24 @@ fn load_and_store_index(cache_dir: &std::path::Path, index_state: &IndexState) {
     let Ok(index) = prebuilt::open_current_basename_index(cache_dir) else {
         return;
     };
-    if let Ok(mut state) = index_state.write() {
+    if let Ok(mut state) = index_state.basename.write() {
         *state = Some(Arc::new(index));
-        tracing::info!("prebuilt index refreshed and loaded");
+    }
+
+    load_reader(cache_dir, index_state);
+    tracing::info!("prebuilt index refreshed and loaded");
+}
+
+#[cfg(feature = "daemon")]
+fn load_reader(cache_dir: &std::path::Path, index_state: &IndexState) {
+    let current = cache_dir.join("current");
+    let files_path = current.join("files");
+    let Ok(reader) = Reader::open(&files_path) else {
+        tracing::warn!("failed to open database reader for prebuilt index");
+        return;
+    };
+    if let Ok(mut state) = index_state.reader.write() {
+        *state = Some(Arc::new(reader));
     }
 }
 
@@ -216,9 +242,10 @@ async fn download_and_update(config: &PrebuiltConfig, cache_dir: &std::path::Pat
 
 /// Run the HTTP server for basename lookups.
 #[cfg(feature = "daemon")]
-async fn run_http_server(addr: &str, index_state: IndexState) -> Result<()> {
+async fn run_http_server(addr: &str, index_state: Arc<IndexState>) -> Result<()> {
     let app = Router::new()
         .route("/locate", get(locate_handler))
+        .route("/nix-locate", get(nix_locate_handler))
         .with_state(index_state);
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -237,11 +264,11 @@ async fn run_http_server(addr: &str, index_state: IndexState) -> Result<()> {
 /// HTTP handler for `/locate?basename=<name>`.
 #[cfg(feature = "daemon")]
 async fn locate_handler(
-    State(index_state): State<IndexState>,
+    State(index_state): State<Arc<IndexState>>,
     axum::extract::Query(params): axum::extract::Query<LocateParams>,
 ) -> axum::Json<LocateResponse> {
     let index = {
-        let Ok(guard) = index_state.read() else {
+        let Ok(guard) = index_state.basename.read() else {
             return axum::Json(LocateResponse {
                 packages: Vec::new(),
             });
@@ -273,4 +300,205 @@ struct LocateParams {
 #[derive(Serialize)]
 struct LocateResponse {
     packages: Vec<String>,
+}
+
+/// HTTP handler for `/nix-locate` with nix-index-compatible parameters.
+#[cfg(feature = "daemon")]
+#[allow(clippy::too_many_lines)]
+async fn nix_locate_handler(
+    State(index_state): State<Arc<IndexState>>,
+    axum::extract::Query(params): axum::extract::Query<NixLocateParams>,
+) -> axum::Json<NixLocateResponse> {
+    let reader = {
+        let Ok(guard) = index_state.reader.read() else {
+            return axum::Json(NixLocateResponse {
+                matches: Vec::new(),
+            });
+        };
+        guard.as_ref().map(Arc::clone)
+    };
+
+    let basename_index = {
+        let Ok(guard) = index_state.basename.read() else {
+            return axum::Json(NixLocateResponse {
+                matches: Vec::new(),
+            });
+        };
+        guard.as_ref().map(Arc::clone)
+    };
+
+    let (Some(reader), Some(basename_index)) = (reader, basename_index) else {
+        return axum::Json(NixLocateResponse {
+            matches: Vec::new(),
+        });
+    };
+
+    // Build the path regex with anchors based on at_root/whole_name.
+    let start_anchor = if params.at_root { "^" } else { "" };
+    let end_anchor = if params.whole_name { "$" } else { "" };
+    let pattern_body = if params.regex {
+        params.pattern.clone()
+    } else {
+        regex::escape(&params.pattern)
+    };
+    let pattern = format!("{start_anchor}{pattern_body}{end_anchor}");
+
+    // Compile regex and package regex if provided.
+    let Ok(path_re) = regex::bytes::Regex::new(&pattern) else {
+        return axum::Json(NixLocateResponse {
+            matches: Vec::new(),
+        });
+    };
+
+    let package_re = params
+        .package
+        .as_ref()
+        .and_then(|p| regex::bytes::Regex::new(p).ok());
+
+    // Try exact_basename fast path via BasenameIndex.
+    let exact_basename_ordinals =
+        if !params.regex && params.whole_name && !params.pattern.is_empty() {
+            let base = crate::basename_index::basename_of(params.pattern.as_bytes());
+            if params.pattern.contains('/') && !base.is_empty() {
+                match basename_index.lookup_basename_ordinals(base) {
+                    Ok(ordinals) if !ordinals.is_empty() => Some(ordinals.into_iter().collect()),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+    // CPU-bound search: use spawn_blocking to avoid blocking the tokio runtime.
+    let reader_clone = Arc::clone(&reader);
+    let hash = params.hash.clone();
+    let Ok(Ok(matches)) = tokio::task::spawn_blocking(move || {
+        reader_clone
+            .search_entries(
+                &path_re,
+                package_re.as_ref(),
+                hash.as_deref(),
+                None,
+                exact_basename_ordinals.as_ref(),
+            )
+            .map_err(|e| format!("{:?}", e))
+    })
+    .await
+    else {
+        return axum::Json(NixLocateResponse {
+            matches: Vec::new(),
+        });
+    };
+
+    // Convert results to JSON response.
+    let json_matches: Vec<NixLocateMatch> = matches
+        .into_iter()
+        .map(|(store_path, entry)| {
+            let node = match entry.node {
+                crate::files::FileNode::Regular { executable, size } => {
+                    let typ = if executable { "x" } else { "r" };
+                    NixLocateNode::Regular {
+                        r#type: typ.to_string(),
+                        size,
+                    }
+                }
+                crate::files::FileNode::Directory { size, .. } => NixLocateNode::Directory {
+                    r#type: "d".to_string(),
+                    size,
+                },
+                crate::files::FileNode::Symlink { target } => NixLocateNode::Symlink {
+                    r#type: "s".to_string(),
+                    target: String::from_utf8_lossy(&target).to_string(),
+                },
+            };
+            NixLocateMatch {
+                attr: store_path.origin().attr.clone(),
+                output: store_path.origin().output.clone(),
+                name: store_path.name().to_string(),
+                hash: store_path.hash().to_string(),
+                path: String::from_utf8_lossy(&entry.path).to_string(),
+                node,
+            }
+        })
+        .collect();
+
+    // Filter to minimal output if requested.
+    let json_matches = if params.minimal {
+        // In minimal mode, we only need unique attr.output pairs.
+        let mut seen = IndexSet::new();
+        json_matches
+            .into_iter()
+            .filter_map(|m| {
+                let key = format!("{}.{}", m.attr, m.output);
+                if seen.insert(key) {
+                    Some(NixLocateMatch {
+                        attr: m.attr,
+                        output: m.output,
+                        name: String::new(),
+                        hash: String::new(),
+                        path: String::new(),
+                        node: NixLocateNode::Regular {
+                            r#type: String::new(),
+                            size: 0,
+                        },
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    } else {
+        json_matches
+    };
+
+    axum::Json(NixLocateResponse {
+        matches: json_matches,
+    })
+}
+
+#[cfg(feature = "daemon")]
+#[derive(Deserialize)]
+struct NixLocateParams {
+    pattern: String,
+    #[serde(default)]
+    regex: bool,
+    #[serde(default)]
+    package: Option<String>,
+    #[serde(default)]
+    hash: Option<String>,
+    #[serde(default)]
+    at_root: bool,
+    #[serde(default)]
+    whole_name: bool,
+    #[serde(default)]
+    minimal: bool,
+}
+
+#[cfg(feature = "daemon")]
+#[derive(Serialize)]
+struct NixLocateResponse {
+    matches: Vec<NixLocateMatch>,
+}
+
+#[cfg(feature = "daemon")]
+#[derive(Serialize)]
+struct NixLocateMatch {
+    attr: String,
+    output: String,
+    name: String,
+    hash: String,
+    path: String,
+    #[serde(flatten)]
+    node: NixLocateNode,
+}
+
+#[cfg(feature = "daemon")]
+#[derive(Serialize)]
+#[serde(untagged)]
+enum NixLocateNode {
+    Regular { r#type: String, size: u64 },
+    Directory { r#type: String, size: u64 },
+    Symlink { r#type: String, target: String },
 }
