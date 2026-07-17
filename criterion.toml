@@ -1,0 +1,16 @@
+[benchmarks]
+# Threshold for detecting performance regressions (5%)
+threshold = 0.05
+
+# Noise threshold to ignore small fluctuations
+noise_threshold = 0.02
+
+# Warm-up time before measurements
+warm_up_time = 1.0
+
+# Measurement time per sample
+measurement_time = 2.0
+
+# Number of samples to collect
+sample_size = 100
+
