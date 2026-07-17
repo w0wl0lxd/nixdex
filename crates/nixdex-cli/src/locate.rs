@@ -192,22 +192,19 @@ fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
     // Determine if we can use the path index for rooted/prefix queries
     let (exact_path, path_prefix) =
         if !matches.regex && matches.at_root && !matches.pattern.is_empty() {
-            let pattern_bytes = matches.pattern.as_bytes();
-            if pattern_bytes.starts_with(b"/") {
-                // For --at-root with a full path like "/bin/ls", try exact path lookup
-                if matches.whole_name {
-                    // Pattern is anchored at end too, so it's an exact full path
-                    (Some(matches.pattern.clone()), None)
-                } else {
-                    // Pattern starts with "/" but may be a prefix; use prefix lookup
-                    (None, Some(matches.pattern.clone()))
-                }
-            } else if matches.pattern.contains('/') {
-                // Pattern contains "/" but doesn't start with it; treat as prefix
-                (None, Some(format!("/{}", matches.pattern)))
+            // Normalize the pattern to ensure it starts with "/" for path index lookups
+            let normalized = if matches.pattern.starts_with('/') {
+                matches.pattern.clone()
             } else {
-                // No "/" in pattern, can't use path index
-                (None, None)
+                format!("/{}", matches.pattern)
+            };
+
+            if matches.whole_name {
+                // Pattern is anchored at end too, so it's an exact full path
+                (Some(normalized), None)
+            } else {
+                // Pattern may be a prefix; use prefix lookup
+                (None, Some(normalized))
             }
         } else {
             (None, None)

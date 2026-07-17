@@ -41,8 +41,9 @@ struct IndexState {
     database_dir: Arc<std::sync::RwLock<Option<PathBuf>>>,
     start_time: Instant,
     requests_total: AtomicU64,
-    /// Channel used by HTTP `/reload` to request an immediate index refresh.
-    reload: tokio::sync::mpsc::UnboundedSender<()>,
+    /// Bounded one-slot channel used by HTTP `/reload` to request an immediate index refresh.
+    /// Pending requests cannot grow beyond one; new requests replace pending ones.
+    reload: tokio::sync::mpsc::Sender<()>,
 }
 
 /// Configuration for a prebuilt-index daemon.
@@ -91,7 +92,7 @@ enum SignalAction {
 #[cfg(feature = "daemon")]
 #[allow(clippy::cognitive_complexity)]
 pub async fn run(config: &DaemonConfig) -> Result<()> {
-    let (reload_tx, mut reload_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel(1);
     let index_state = Arc::new(IndexState {
         basename: Arc::new(std::sync::RwLock::new(None)),
         reader: Arc::new(std::sync::RwLock::new(None)),
@@ -201,7 +202,7 @@ async fn run_daemon_loop(
     cache_dir: &std::path::Path,
     index_state: &IndexState,
     interval: &mut tokio::time::Interval,
-    reload_rx: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+    reload_rx: &mut tokio::sync::mpsc::Receiver<()>,
     http_handle: tokio::task::JoinHandle<Result<()>>,
 ) -> Result<()> {
     loop {
@@ -507,9 +508,8 @@ async fn nix_locate_handler(
         ));
     }
 
-    if let Some(limit) = params.limit
-        && limit > MAX_RESULT_LIMIT
-    {
+    let limit = params.limit.unwrap_or(MAX_RESULT_LIMIT);
+    if limit > MAX_RESULT_LIMIT {
         return Err(json_error(
             axum::http::StatusCode::BAD_REQUEST,
             format!("limit must be at most {MAX_RESULT_LIMIT}"),
@@ -609,7 +609,7 @@ async fn nix_locate_handler(
                 only_toplevel: !params.all,
             },
             json: false,
-            limit: None,
+            limit: Some(limit),
             count: false,
             sort,
             min_size: params.min_size,
@@ -660,10 +660,10 @@ async fn nix_locate_handler(
             NixLocateMatch {
                 attr: store_path.origin().attr.clone(),
                 output: store_path.origin().output.clone(),
-                name: store_path.name().to_string(),
-                hash: store_path.hash().to_string(),
-                path: String::from_utf8_lossy(&entry.path).to_string(),
-                node,
+                name: Some(store_path.name().to_string()),
+                hash: Some(store_path.hash().to_string()),
+                path: Some(String::from_utf8_lossy(&entry.path).to_string()),
+                node: Some(node),
             }
         })
         .collect();
@@ -679,13 +679,10 @@ async fn nix_locate_handler(
                     Some(NixLocateMatch {
                         attr: m.attr,
                         output: m.output,
-                        name: String::new(),
-                        hash: String::new(),
-                        path: String::new(),
-                        node: NixLocateNode::Regular {
-                            r#type: String::new(),
-                            size: 0,
-                        },
+                        name: None,
+                        hash: None,
+                        path: None,
+                        node: None,
                     })
                 } else {
                     None
@@ -701,9 +698,7 @@ async fn nix_locate_handler(
         }));
     }
 
-    if let Some(limit) = params.limit {
-        json_matches.truncate(limit);
-    }
+    json_matches.truncate(limit);
 
     Ok(axum::Json(NixLocateResponse {
         count: None,
@@ -812,11 +807,14 @@ struct NixLocateResponse {
 struct NixLocateMatch {
     attr: String,
     output: String,
-    name: String,
-    hash: String,
-    path: String,
-    #[serde(flatten)]
-    node: NixLocateNode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node: Option<NixLocateNode>,
 }
 
 #[cfg(feature = "daemon")]
@@ -928,7 +926,7 @@ struct ReloadResponse {
 #[cfg(feature = "daemon")]
 async fn reload_handler(State(index_state): State<Arc<IndexState>>) -> axum::Json<ReloadResponse> {
     index_state.requests_total.fetch_add(1, Ordering::Relaxed);
-    let reloaded = index_state.reload.send(()).is_ok();
+    let reloaded = index_state.reload.try_send(()).is_ok();
     axum::Json(ReloadResponse { reloaded })
 }
 
@@ -1024,9 +1022,8 @@ async fn search_handler(
         ));
     }
 
-    if let Some(limit) = params.limit
-        && limit > MAX_RESULT_LIMIT
-    {
+    let limit = params.limit.unwrap_or(MAX_RESULT_LIMIT);
+    if limit > MAX_RESULT_LIMIT {
         return Err(json_error(
             axum::http::StatusCode::BAD_REQUEST,
             format!("limit must be at most {MAX_RESULT_LIMIT}"),
@@ -1058,7 +1055,7 @@ async fn search_handler(
             field,
             params.case_sensitive,
             sort,
-            params.limit,
+            Some(limit),
         )
         .map_err(|err| json_error(axum::http::StatusCode::BAD_REQUEST, err.to_string()))?
     } else {
@@ -1069,7 +1066,7 @@ async fn search_handler(
             params.case_sensitive,
             params.exact,
             sort,
-            params.limit,
+            Some(limit),
         )
         .map_err(|err| json_error(axum::http::StatusCode::BAD_REQUEST, err.to_string()))?
     };
@@ -1119,7 +1116,7 @@ mod tests {
     use std::sync::atomic::AtomicU64;
 
     fn empty_state() -> Arc<IndexState> {
-        let (reload_tx, _reload_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reload_tx, _reload_rx) = tokio::sync::mpsc::channel(1);
         Arc::new(IndexState {
             basename: Arc::new(std::sync::RwLock::new(None)),
             reader: Arc::new(std::sync::RwLock::new(None)),

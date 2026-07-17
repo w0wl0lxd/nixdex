@@ -222,6 +222,10 @@ fn command_not_found_suggests_provider() {
         dir.path().to_str().unwrap(),
         "ls",
     ]);
+    assert_eq!(
+        output.status.code(), Some(127),
+        "expected exit status 127 for command-not-found"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("coreutils"),

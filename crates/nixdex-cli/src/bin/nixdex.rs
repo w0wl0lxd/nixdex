@@ -13,22 +13,35 @@ use tracing_subscriber::EnvFilter;
 use nixdex_cli::{index, locate};
 use nixdex_core::package_search::{SearchDb, SearchField, SearchSort};
 
-/// Check whether `comma` (the `,` command) is available on `$PATH`.
+/// Detect which comma command is available on `$PATH` ("," or "comma").
+/// Returns the detected command token, or `None` if neither is available.
 #[cfg(unix)]
-fn comma_available() -> bool {
+fn comma_available() -> Option<&'static str> {
     use std::os::unix::fs::PermissionsExt;
-    std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path).any(|dir| {
-            let candidate = dir.join(",");
-            candidate.is_file()
-                && std::fs::metadata(&candidate).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path).find_map(|dir| {
+            // Prefer "," over "comma" when both are available
+            let comma_candidate = dir.join(",");
+            if comma_candidate.is_file()
+                && std::fs::metadata(&comma_candidate).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+            {
+                return Some(",");
+            }
+            let comma_name_candidate = dir.join("comma");
+            if comma_name_candidate.is_file()
+                && std::fs::metadata(&comma_name_candidate)
+                    .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+            {
+                return Some("comma");
+            }
+            None
         })
     })
 }
 
 #[cfg(not(unix))]
-fn comma_available() -> bool {
-    false
+fn comma_available() -> Option<&'static str> {
+    None
 }
 
 /// Resolve the default nix-index database directory.
@@ -225,7 +238,7 @@ struct UpdateOpts {
     release_url: String,
 
     /// Architecture identifier (e.g., x86_64-linux).
-    #[arg(long, default_value = "x86_64-linux")]
+    #[arg(long, default_value_t = nixdex_core::prebuilt::default_architecture())]
     architecture: String,
 
     /// Download the `-small` prebuilt variant.
@@ -287,7 +300,7 @@ struct DaemonOpts {
     release_url: String,
 
     /// Architecture identifier (e.g., x86_64-linux).
-    #[arg(long, default_value = "x86_64-linux")]
+    #[arg(long, default_value_t = nixdex_core::prebuilt::default_architecture())]
     architecture: String,
 
     /// Use the -small variant of the prebuilt index.
@@ -299,7 +312,7 @@ struct DaemonOpts {
     cache_dir: Option<PathBuf>,
 
     /// Refresh interval in seconds.
-    #[arg(long, default_value = "3600")]
+    #[arg(long, default_value = "3600", value_parser = clap::value_parser!(u64).range(1..))]
     interval: u64,
 
     /// HTTP server listen address.
@@ -510,11 +523,11 @@ fn run_which(opts: WhichOpts) -> color_eyre::Result<()> {
     }
 
     if opts.all {
-        for provider in providers {
-            println!("{provider}");
+        for provider in &providers {
+            println!("{}", format_which_attr(provider));
         }
     } else {
-        println!("{first}");
+        println!("{}", format_which_attr(first));
     }
     Ok(())
 }
@@ -560,7 +573,7 @@ fn run_generate_sidecars(opts: GenerateSidecarsOpts) -> color_eyre::Result<()> {
 fn find_command_providers(
     cmd: &str,
     reader: &nixdex_core::database::Reader,
-) -> color_eyre::Result<Vec<String>> {
+) -> color_eyre::Result<Vec<nixdex_core::StorePath>> {
     let full_path = if cmd.starts_with('/') {
         cmd.to_string()
     } else {
@@ -573,19 +586,19 @@ fn find_command_providers(
         .search_entries(&re, None, None, None, None)
         .map_err(|err| color_eyre::eyre::eyre!("search failed: {err}"))?;
 
-    let mut providers: Vec<String> = results
+    let mut providers: Vec<nixdex_core::StorePath> = results
         .into_iter()
         .filter(|(_, entry)| {
             entry.node.is_executable()
                 || matches!(entry.node, nixdex_core::files::FileNode::Symlink { .. })
         })
-        .map(|(store_path, _)| format_which_attr(&store_path))
+        .map(|(store_path, _)| store_path)
         .collect();
 
-    // Prefer top-level packages over parenthesized (non-toplevel) matches.
-    providers.sort_by(|a, b| match (a.starts_with('('), b.starts_with('(')) {
-        (false, true) => std::cmp::Ordering::Less,
-        (true, false) => std::cmp::Ordering::Greater,
+    // Prefer top-level packages over non-toplevel matches.
+    providers.sort_by(|a, b| match (a.origin().toplevel, b.origin().toplevel) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
         _ => a.cmp(b),
     });
     providers.dedup();
@@ -624,17 +637,41 @@ fn run_command_not_found(opts: CommandNotFoundOpts) -> color_eyre::Result<()> {
         .and_then(|s| s.to_str())
         .map_or(opts.cmd.as_str(), |s| s);
 
+    // Helper to get the attribute string for execution (only for top-level providers)
+    let provider_attr = |sp: &nixdex_core::StorePath| -> color_eyre::Result<String> {
+        if !sp.origin().toplevel {
+            color_eyre::eyre::bail!(
+                "cannot execute non-top-level provider '{}'",
+                format_which_attr(sp)
+            );
+        }
+        Ok(format!("{}.{}", sp.origin().attr, sp.origin().output))
+    };
+
     match providers.as_slice() {
         [] => {
             eprintln!("{}: command not found", opts.cmd);
             std::process::exit(127);
         }
         [single] if interactive => {
-            interactive_run(&[String::from(single.as_str())], exec_cmd, &opts.args)
+            let attr = provider_attr(single)?;
+            interactive_run(&[attr], exec_cmd, &opts.args)
         }
-        _ if interactive => interactive_run(&providers, exec_cmd, &opts.args),
-        [single] if auto_install => auto_install_and_exec(single, exec_cmd, &opts.args),
-        [single] if auto_run => auto_run_command(single, exec_cmd, &opts.args),
+        _ if interactive => {
+            let attrs: color_eyre::Result<Vec<String>> = providers
+                .iter()
+                .map(provider_attr)
+                .collect();
+            interactive_run(&attrs?, exec_cmd, &opts.args)
+        }
+        [single] if auto_install => {
+            let attr = provider_attr(single)?;
+            auto_install_and_exec(&attr, exec_cmd, &opts.args)
+        }
+        [single] if auto_run => {
+            let attr = provider_attr(single)?;
+            auto_run_command(&attr, exec_cmd, &opts.args)
+        }
         [single] if opts.json => {
             let line =
                 sonic_rs::to_string(single).wrap_err("failed to serialize command provider")?;
@@ -642,12 +679,13 @@ fn run_command_not_found(opts: CommandNotFoundOpts) -> color_eyre::Result<()> {
             Ok(())
         }
         [single] => {
+            let display = format_which_attr(single);
             eprintln!(
                 "The program '{}' is currently not installed. It is provided by the package '{}'.",
-                opts.cmd, single
+                opts.cmd, display
             );
-            if comma {
-                eprintln!("  Run it without installing: , {}", opts.cmd);
+            if let Some(cmd) = comma {
+                eprintln!("  Run it without installing: {cmd} {}", opts.cmd);
             }
             std::process::exit(127);
         }
@@ -657,7 +695,7 @@ fn run_command_not_found(opts: CommandNotFoundOpts) -> color_eyre::Result<()> {
                 opts.cmd
             );
             for provider in &providers {
-                eprintln!("  {provider}");
+                eprintln!("  {}", format_which_attr(provider));
             }
             std::process::exit(127);
         }
@@ -672,10 +710,10 @@ fn run_command_not_found(opts: CommandNotFoundOpts) -> color_eyre::Result<()> {
                 opts.cmd
             );
             for provider in &providers {
-                eprintln!("  {provider}");
+                eprintln!("  {}", format_which_attr(provider));
             }
-            if comma {
-                eprintln!("  Run one without installing: , {}", opts.cmd);
+            if let Some(cmd) = comma {
+                eprintln!("  Run one without installing: {cmd} {}", opts.cmd);
             }
             std::process::exit(127);
         }
