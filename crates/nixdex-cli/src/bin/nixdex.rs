@@ -266,6 +266,10 @@ struct CommandNotFoundOpts {
     #[arg(long)]
     auto_run: bool,
 
+    /// Interactively prompt for a provider and run the command once without installing.
+    #[arg(short = 'i', long)]
+    interactive: bool,
+
     /// Output the suggestion as JSON.
     #[arg(long)]
     json: bool,
@@ -592,9 +596,18 @@ fn run_command_not_found(opts: CommandNotFoundOpts) -> color_eyre::Result<()> {
     let auto_install =
         opts.auto_install || std::env::var("NIX_AUTO_INSTALL").is_ok_and(|v| !v.is_empty());
     let auto_run = opts.auto_run || std::env::var("NIX_AUTO_RUN").is_ok_and(|v| !v.is_empty());
+    let interactive =
+        opts.interactive || std::env::var("NIX_AUTO_RUN_INTERACTIVE").is_ok_and(|v| !v.is_empty());
 
-    if auto_install && auto_run {
-        color_eyre::eyre::bail!("--auto-install and --auto-run are mutually exclusive");
+    if [auto_install, auto_run, interactive]
+        .iter()
+        .filter(|&&v| v)
+        .count()
+        > 1
+    {
+        color_eyre::eyre::bail!(
+            "--auto-install, --auto-run, and --interactive are mutually exclusive"
+        );
     }
 
     let files = opts.database.join("files");
@@ -616,6 +629,10 @@ fn run_command_not_found(opts: CommandNotFoundOpts) -> color_eyre::Result<()> {
             eprintln!("{}: command not found", opts.cmd);
             std::process::exit(127);
         }
+        [single] if interactive => {
+            interactive_run(&[String::from(single.as_str())], exec_cmd, &opts.args)
+        }
+        _ if interactive => interactive_run(&providers, exec_cmd, &opts.args),
         [single] if auto_install => auto_install_and_exec(single, exec_cmd, &opts.args),
         [single] if auto_run => auto_run_command(single, exec_cmd, &opts.args),
         [single] if opts.json => {
@@ -714,6 +731,57 @@ fn auto_run_command(provider: &str, cmd: &str, args: &[String]) -> color_eyre::R
         std::process::exit(code);
     }
     std::process::exit(127);
+}
+
+fn interactive_run(providers: &[String], cmd: &str, args: &[String]) -> color_eyre::Result<()> {
+    use std::io::Write;
+
+    let provider = match providers {
+        [single] => {
+            eprint!("The program '{cmd}' is provided by the package '{single}'. Run it? [Y/n]: ");
+            std::io::stderr().flush()?;
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let answer = input.trim().to_lowercase();
+            if answer.is_empty() || answer == "y" || answer == "yes" {
+                single.as_str()
+            } else {
+                std::process::exit(127);
+            }
+        }
+        _ => {
+            eprintln!("The program '{cmd}' is provided by several packages:");
+            for (i, provider) in providers.iter().enumerate() {
+                eprintln!("  {}. {provider}", i + 1);
+            }
+            eprint!("([Y]es | [number] | [n]one): ");
+            std::io::stderr().flush()?;
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let answer = input.trim().to_lowercase();
+            if answer.is_empty() || answer == "y" || answer == "yes" {
+                providers
+                    .first()
+                    .map(String::as_str)
+                    .ok_or_else(|| color_eyre::eyre::eyre!("no providers to run"))?
+            } else if answer == "n" || answer == "none" {
+                std::process::exit(127);
+            } else if let Ok(index) = answer.parse::<usize>() {
+                providers.get(index.saturating_sub(1)).map_or_else(
+                    || {
+                        eprintln!("invalid selection");
+                        std::process::exit(127)
+                    },
+                    String::as_str,
+                )
+            } else {
+                eprintln!("invalid selection");
+                std::process::exit(127);
+            }
+        }
+    };
+
+    auto_run_command(provider, cmd, args)
 }
 
 fn exec_command(cmd: &str, args: &[String]) -> color_eyre::Result<()> {
