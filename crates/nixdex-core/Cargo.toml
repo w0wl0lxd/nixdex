@@ -43,6 +43,7 @@ mmap-guard = "0.2.2"
 fastrand = "2"
 axum = { version = "0.8", features = ["json"], optional = true }
 sha2 = "0.10"
+redb = "4.1"
 
 [dev-dependencies]
 tempfile = "3"
