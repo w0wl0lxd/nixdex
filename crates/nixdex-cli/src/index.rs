@@ -8,6 +8,22 @@ use clap::Parser;
 use color_eyre::eyre::WrapErr;
 use tracing_subscriber::EnvFilter;
 
+/// Maximum number of concurrent HTTP requests the indexer may make.
+const MAX_JOBS: usize = 1000;
+
+/// Parse and validate the `--requests` value.
+fn parse_jobs(s: &str) -> Result<usize, String> {
+    let n: usize = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a valid integer"))?;
+    if n == 0 || n > MAX_JOBS {
+        return Err(format!(
+            "--requests must be between 1 and {MAX_JOBS}, got {n}"
+        ));
+    }
+    Ok(n)
+}
+
 /// Resolve the default nix-index database directory.
 fn default_db_dir() -> &'static str {
     static CACHE: OnceLock<String> = OnceLock::new();
@@ -26,7 +42,7 @@ fn default_db_dir() -> &'static str {
 #[command(name = "nix-index", author, about, version)]
 pub struct Args {
     /// Make REQUESTS HTTP requests in parallel.
-    #[arg(short = 'r', long = "requests", default_value = "100")]
+    #[arg(short = 'r', long = "requests", default_value = "100", value_parser = parse_jobs)]
     pub jobs: usize,
 
     /// Directory where the index is stored.
@@ -214,4 +230,30 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
         .await
         .wrap_err("nix-index failed")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_jobs_accepts_valid_values() {
+        assert_eq!(parse_jobs("1").unwrap(), 1);
+        assert_eq!(parse_jobs("100").unwrap(), 100);
+        assert_eq!(parse_jobs("1000").unwrap(), 1000);
+    }
+
+    #[test]
+    fn parse_jobs_rejects_zero_and_huge_values() {
+        assert!(parse_jobs("0").is_err());
+        assert!(parse_jobs("1001").is_err());
+        assert!(parse_jobs("not-a-number").is_err());
+    }
+
+    #[test]
+    fn args_parsing_rejects_invalid_requests() {
+        let result =
+            Args::try_parse_from(["nix-index", "--requests", "0", "-d", "/tmp/nix-index-test"]);
+        assert!(result.is_err());
+    }
 }

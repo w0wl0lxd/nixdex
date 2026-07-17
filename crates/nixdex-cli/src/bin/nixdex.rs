@@ -537,7 +537,12 @@ fn find_command_providers(
         .map(|(store_path, _)| format_which_attr(&store_path))
         .collect();
 
-    providers.sort();
+    // Prefer top-level packages over parenthesized (non-toplevel) matches.
+    providers.sort_by(|a, b| match (a.starts_with('('), b.starts_with('(')) {
+        (false, true) => std::cmp::Ordering::Less,
+        (true, false) => std::cmp::Ordering::Greater,
+        _ => a.cmp(b),
+    });
     providers.dedup();
     Ok(providers)
 }

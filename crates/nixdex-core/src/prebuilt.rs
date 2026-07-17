@@ -7,9 +7,22 @@ use std::time::Duration;
 use reqwest::header;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
+use tracing::warn;
 
 use crate::basename_index::BasenameIndex;
 use crate::database::{FILE_MAGIC, generate_sidecars};
+
+/// Decode an HTTP header value to a `String`, logging invalid UTF-8 instead of
+/// silently discarding the header.
+fn header_to_string(value: &reqwest::header::HeaderValue, name: &str) -> Option<String> {
+    match value.to_str() {
+        Ok(s) => Some(s.to_string()),
+        Err(err) => {
+            warn!(header = %name, error = %err, "ignoring header with invalid UTF-8");
+            None
+        }
+    }
+}
 
 /// Errors that can occur during prebuilt index management.
 #[derive(Error, Debug)]
@@ -111,14 +124,12 @@ pub async fn check_update(config: &PrebuiltConfig) -> Result<Option<String>> {
     let etag = response
         .headers()
         .get(header::ETAG)
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
+        .and_then(|v| header_to_string(v, "ETag"));
 
     let last_modified = response
         .headers()
         .get(header::LAST_MODIFIED)
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
+        .and_then(|v| header_to_string(v, "Last-Modified"));
 
     Ok(etag.or(last_modified))
 }
@@ -235,13 +246,15 @@ pub async fn download_and_validate(config: &PrebuiltConfig) -> Result<PathBuf> {
     }
 
     let headers = response.headers();
-    let etag = headers.get(header::ETAG).and_then(|v| v.to_str().ok());
+    let etag = headers
+        .get(header::ETAG)
+        .and_then(|v| header_to_string(v, "ETag"));
     let last_modified = headers
         .get(header::LAST_MODIFIED)
-        .and_then(|v| v.to_str().ok());
+        .and_then(|v| header_to_string(v, "Last-Modified"));
     let etag = match etag.or(last_modified) {
         Some(e) => e,
-        None => "unknown",
+        None => "unknown".to_string(),
     };
 
     let target_dir = config.cache_dir.join(etag);

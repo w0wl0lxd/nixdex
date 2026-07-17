@@ -18,7 +18,7 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use memchr;
 use mmap_guard;
 use rayon::prelude::*;
-use regex::bytes::Regex;
+use regex::bytes::{Regex, RegexBuilder};
 use serde::Serialize;
 use sonic_rs;
 use thiserror::Error;
@@ -43,6 +43,12 @@ const DEFAULT_WRITE_VERSION: u64 = 2;
 
 /// Magic bytes identifying a nix-index / nixdex database file.
 pub const FILE_MAGIC: &[u8] = b"NIXI";
+
+/// Maximum length (in bytes) of a user-supplied search regex.
+const MAX_PATTERN_BYTES: usize = 1024;
+
+/// Maximum memory (in bytes) allowed for regex compilation (NFA/DFA).
+const REGEX_SIZE_LIMIT: usize = 1_000_000;
 
 /// Magic of the trailing zstd skippable frame used by version 2 seek tables.
 const SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
@@ -1637,6 +1643,20 @@ fn print_match_text(
 /// the shared engine used by both the CLI `nix-locate` and the daemon's
 /// `/nix-locate` endpoint.
 ///
+/// Compile a user-supplied regex with defensive size/length limits.
+fn compile_search_regex(pattern: &str, kind: &str) -> crate::Result<Regex> {
+    if pattern.len() > MAX_PATTERN_BYTES {
+        return Err(crate::Error::Parse(format!(
+            "{kind} regex exceeds maximum length of {MAX_PATTERN_BYTES} bytes"
+        )));
+    }
+    RegexBuilder::new(pattern)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .dfa_size_limit(REGEX_SIZE_LIMIT)
+        .build()
+        .map_err(|err| crate::Error::Parse(format!("invalid {kind} regex '{pattern}': {err}")))
+}
+
 /// # Errors
 ///
 /// Returns an error if the database cannot be read or the pattern is invalid.
@@ -1645,13 +1665,9 @@ pub fn search_results(
 ) -> crate::Result<Vec<(crate::StorePath, crate::files::FileTreeEntry)>> {
     let index_file = options.database.join("files");
 
-    let path_pattern = Regex::new(&options.pattern).map_err(|err| {
-        crate::Error::Parse(format!("invalid path pattern '{}': {err}", options.pattern))
-    })?;
+    let path_pattern = compile_search_regex(&options.pattern, "path")?;
     let package_re = match &options.package_pattern {
-        Some(pat) => Some(Regex::new(pat).map_err(|err| {
-            crate::Error::Parse(format!("invalid package pattern '{pat}': {err}"))
-        })?),
+        Some(pat) => Some(compile_search_regex(pat, "package")?),
         None => None,
     };
 
@@ -2066,6 +2082,18 @@ mod tests {
         assert_eq!(format_grouped(1234), "1,234");
         assert_eq!(format_grouped(16_524), "16,524");
         assert_eq!(format_grouped(1_000_000), "1,000,000");
+    }
+
+    #[test]
+    fn compile_search_regex_rejects_oversized_patterns() {
+        let long = "a".repeat(MAX_PATTERN_BYTES + 1);
+        assert!(compile_search_regex(&long, "path").is_err());
+    }
+
+    #[test]
+    fn compile_search_regex_accepts_valid_patterns() {
+        let re = compile_search_regex(r"bin/hello", "path").unwrap();
+        assert!(re.is_match(b"/bin/hello"));
     }
 
     #[test]
