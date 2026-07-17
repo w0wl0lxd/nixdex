@@ -33,9 +33,38 @@ pub enum Color {
     Auto,
 }
 
+const LONG_USAGE: &str = r"How to use
+==========
+
+In the simplest case, just run `nix-locate part/of/file/path` to search for all packages that contain
+a file matching that path:
+
+    $ nix-locate 'bin/firefox'
+    ...all packages containing a file named 'bin/firefox'
+
+Before using this tool, you first need to generate a nix-index database.
+Use the `nix-index` tool to do that.
+
+Limitations
+===========
+
+* This tool can only find packages which are built by hydra, because only those packages
+  will have file listings that are indexed by nix-index.
+
+* We can't know the precise attribute path for every package, so if you see the syntax `(attr)`
+  in the output, that means that `attr` is not the target package but that it
+  depends (perhaps indirectly) on the package that contains the searched file. Example:
+
+      $ nix-locate 'bin/xmonad'
+      (xmonad-with-packages.out)      0 s /nix/store/nl581g5kv3m2xnmmfgb678n91d7ll4vv-ghc-8.0.2-with-packages/bin/xmonad
+
+  This means that we don't know what nixpkgs attribute produces /nix/store/nl581g5kv3m2xnmmfgb678n91d7ll4vv-ghc-8.0.2-with-packages,
+  but we know that `xmonad-with-packages.out` requires it.
+";
+
 /// Quickly finds the derivation providing a certain file.
 #[derive(Debug, Parser)]
-#[command(name = "nix-locate", author, about, version)]
+#[command(name = "nix-locate", author, about, version, after_long_help = LONG_USAGE)]
 pub struct Opts {
     /// Pattern for which to search.
     #[arg(value_name = "PATTERN")]
@@ -63,7 +92,10 @@ pub struct Opts {
 
     /// Only print matches for files that have this type.
     ///
-    /// Options: `(r)egular`, `e(x)ecutable`, `(d)irectory`, `(s)ymlink`.
+    /// If the option is given multiple times, a file will be printed if it has
+    /// any of the given types.
+    ///
+    /// Options: `(r)egular file`, `e(x)ecutable`, `(d)irectory`, `(s)ymlink`.
     #[arg(short, long = "type", value_parser = clap::value_parser!(FileType))]
     pub r#type: Option<Vec<FileType>>,
 

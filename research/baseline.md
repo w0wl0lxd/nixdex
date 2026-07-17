@@ -264,6 +264,39 @@ $ nix-locate --db nix-index-db-small bin/firefox
 
 These numbers are for a 10 KB database; startup dominates. A full nixpkgs database would be much larger and I/O-bound during the zstd/frcode decode.
 
+## nixdex-specific extensions
+
+This section documents flags and behaviours that nixdex adds over upstream `nix-index`.
+
+### `nixdex index` extensions
+
+- `--select <EXPR>` — passed through to `nix-eval-jobs --select`. Must be a Nix function accepting the package set, for example `p: { inherit (p) hello coreutils; }`.
+- `--exclude-prefix <PREFIX>` — skip paths starting with prefix; may be given multiple times.
+- `--small` — build a small database containing only `/bin/` entries (equivalent to `--filter-prefix /bin/`).
+- `--no-check-cache-status` — disable `nix-eval-jobs --check-cache-status` to avoid blocking eval workers on narinfo lookups.
+- `--no-main-program` — do not synthesize `/bin/<mainProgram>` listings from `meta.mainProgram`.
+- `--download-prebuilt` — download a prebuilt `files` database from the `nix-index-database` release assets instead of evaluating nixpkgs locally.
+- `--prebuilt-url`, `--prebuilt-arch`, `--prebuilt-small` — control prebuilt download source and variant.
+- `--path-cache`, `--path-cache-file`, `--cache-key`, `--path-cache-ttl`, `--force` — manage the `paths.cache` development cache.
+- `--only-eval` — only evaluate nixpkgs; do not fetch listings or write the `files` database.
+- `--format-version 1|2` — on-disk database format. Default is `2`, a nixdex extension; `1` is fully upstream-compatible.
+
+### `nix-locate` extensions
+
+- `--json` — output one JSON object per line.
+- `--sort`, `--min-size`, `--max-size`, `--exclude-fhs`, `--limit` — additional output controls.
+- `--color always|never|auto` — colour output policy.
+- `--all` and `--minimal` behave as in upstream, but `(attr)` output is sorted so top-level packages are preferred when no `--all` is given.
+
+### Environment variables
+
+- `NIX_INDEX_DATABASE` — directory used by both upstream and nixdex for the `files` index and sidecars.
+- `NIXDEX_DATABASE` — optional override used by `command-not-found` integration to point at a dedicated, often `/bin/`-filtered database, while leaving `NIX_INDEX_DATABASE` for general `nix-locate` queries. The shell integration scripts (`command-not-found.sh`, `command-not-found.fish`, `command-not-found.nu`) prefer `NIXDEX_DATABASE` and fall back to `NIX_INDEX_DATABASE`.
+
+### Database format compatibility
+
+nixdex can read both v1 (upstream) and v2 (nixdex extension) `files` databases. `nixdex index` writes v2 by default; use `--format-version 1` to produce a database readable by upstream `nix-index`.
+
 ## Blockers / notes
 
 1. **System `sqlite3` missing.** A plain `cargo build` in `.upstream/nix-index` fails to link because `rusqlite` needs a system `sqlite3`. This was fixed by building inside `nix-shell -p sqlite pkg-config`.
