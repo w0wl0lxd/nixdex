@@ -17,6 +17,7 @@ pub mod package_search;
 pub mod path_cache;
 pub mod path_index;
 pub mod prebuilt;
+pub mod redb_index;
 pub mod store_path;
 
 pub use cache_dir::{nix_index_dir, nixdex_dir};
