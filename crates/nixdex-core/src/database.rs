@@ -651,6 +651,13 @@ impl Reader {
         self.version
     }
 
+    /// Return the number of packages in the database, if known from the on-disk
+    /// frame map. Returns `None` for databases without a frame map.
+    #[must_use]
+    pub fn package_count(&self) -> Option<usize> {
+        self.frame_map.as_ref().map(std::vec::Vec::len)
+    }
+
     /// Scan every frame in parallel, yielding `(StorePath, FileTreeEntry)` matches.
     ///
     /// Each frame is a complete frcode package stream, so decompression and
@@ -1763,10 +1770,12 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
         .filter(|p| !p.as_os_str().is_empty())
         .ok_or(Error::Corrupt("database path has no parent directory"))?;
 
-    // Scan all frames to extract package paths and build the basename index.
+    // Scan all frames to extract package paths and build secondary indexes.
     let mut builder = BasenameIndexBuilder::new();
+    let mut path_builder = PathIndexBuilder::new();
     let mut all_package_labels: Vec<String> = Vec::new();
     let mut all_package_meta: Vec<PackageMeta> = Vec::new();
+    let mut all_package_attrs: Vec<(String, String, String)> = Vec::new();
 
     for (offset, len) in &reader.frames {
         let start = *offset;
@@ -1786,15 +1795,20 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
         scan_frame_for_packages(
             &raw,
             &mut builder,
+            &mut path_builder,
             &mut all_package_labels,
             &mut all_package_meta,
+            &mut all_package_attrs,
         )?;
     }
 
-    // Write basename sidecars.
+    // Write basename and path sidecars.
     builder
         .write_sidecars(db_dir)
         .map_err(Error::SecondaryIndex)?;
+    path_builder
+        .write_sidecars(db_dir)
+        .map_err(Error::PathIndex)?;
 
     // Write frame_map sidecar if we have v2 frame data.
     if let (Some(frame_map), Some(_frame_starts)) = (&reader.frame_map, &reader.frame_starts) {
@@ -1804,6 +1818,9 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
     // Synthesize a packages.json sidecar from package footers so that
     // package metadata search works for prebuilt file-only indexes.
     write_packages_json(db_dir, &all_package_meta)?;
+
+    // Write attrs sidecar so prebuilt indexes can be reused for incremental builds.
+    write_attrs_sidecar(db_dir, &all_package_attrs)?;
 
     tracing::info!(
         db_path = %db_path.display(),
@@ -1833,8 +1850,10 @@ fn write_packages_json(db_dir: &Path, packages: &[PackageMeta]) -> Result<()> {
 fn scan_frame_for_packages(
     raw: &[u8],
     builder: &mut BasenameIndexBuilder,
+    path_builder: &mut PathIndexBuilder,
     all_package_labels: &mut Vec<String>,
     all_package_meta: &mut Vec<PackageMeta>,
+    all_package_attrs: &mut Vec<(String, String, String)>,
 ) -> Result<()> {
     let mut decoder = frcode::Decoder::new(std::io::Cursor::new(raw));
     let mut current_paths: Vec<Vec<u8>> = Vec::new();
@@ -1860,18 +1879,25 @@ fn scan_frame_for_packages(
                         sonic_rs::from_slice(json).map_err(|_| Error::StorePathParse {
                             path: json.to_vec(),
                         })?;
-                    let label = format!("{}.{}", pkg.origin().attr, pkg.origin().output);
+                    let attr = pkg.origin().attr.clone();
+                    let output = pkg.origin().output.clone();
+                    let label = format!("{}.{}", attr, output);
                     all_package_labels.push(label.clone());
                     all_package_meta.push(PackageMeta {
-                        attr: pkg.origin().attr.clone(),
+                        attr: attr.clone(),
                         name: pkg.name().to_string(),
                         description: None,
                         main_program: None,
                     });
-                    builder
-                        .record_package(label, current_paths.clone())
+                    all_package_attrs.push((attr, output, pkg.hash().to_string()));
+
+                    let paths = std::mem::take(&mut current_paths);
+                    let ordinal = builder
+                        .record_package(label, paths.clone())
                         .map_err(Error::SecondaryIndex)?;
-                    current_paths.clear();
+                    path_builder
+                        .record_package(ordinal, paths)
+                        .map_err(Error::PathIndex)?;
                 }
             } else {
                 // File entry: extract path.

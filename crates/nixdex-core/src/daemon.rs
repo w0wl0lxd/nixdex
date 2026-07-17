@@ -618,6 +618,7 @@ struct HealthResponse {
     status: &'static str,
     index_loaded: bool,
     package_db_loaded: bool,
+    package_count: Option<usize>,
     version: &'static str,
     uptime_seconds: u64,
 }
@@ -628,11 +629,18 @@ async fn health_handler(State(index_state): State<Arc<IndexState>>) -> axum::Jso
     index_state.requests_total.fetch_add(1, Ordering::Relaxed);
     let index_loaded = matches!(index_state.basename.read(), Ok(g) if g.is_some());
     let package_db_loaded = matches!(index_state.package_db.read(), Ok(g) if g.is_some());
+    let package_count = index_state
+        .reader
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().map(|r| r.package_count()))
+        .flatten();
 
     axum::Json(HealthResponse {
         status: "ok",
         index_loaded,
         package_db_loaded,
+        package_count,
         version: env!("CARGO_PKG_VERSION"),
         uptime_seconds: index_state.start_time.elapsed().as_secs(),
     })
