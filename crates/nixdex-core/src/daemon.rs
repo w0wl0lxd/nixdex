@@ -923,12 +923,32 @@ struct SearchParams {
     fuzzy: bool,
     #[serde(default)]
     field: String,
+    #[serde(default, rename = "sort")]
+    sort: String,
     #[serde(default)]
     limit: Option<usize>,
     #[serde(default)]
     count: bool,
     #[serde(default)]
     name_only: bool,
+}
+
+/// Parse the `field` and `sort` query parameters for `/search`.
+#[cfg(feature = "daemon")]
+fn parse_search_query(
+    params: &SearchParams,
+) -> std::result::Result<
+    (
+        crate::package_search::SearchField,
+        crate::package_search::SearchSort,
+    ),
+    (axum::http::StatusCode, axum::Json<ErrorResponse>),
+> {
+    let field = crate::package_search::SearchField::from_str(&params.field)
+        .map_err(|err| json_error(axum::http::StatusCode::BAD_REQUEST, err.to_string()))?;
+    let sort = crate::package_search::SearchSort::from_str(&params.sort)
+        .map_err(|err| json_error(axum::http::StatusCode::BAD_REQUEST, err.to_string()))?;
+    Ok((field, sort))
 }
 
 /// HTTP handler for `/search`.
@@ -975,43 +995,28 @@ async fn search_handler(
         ));
     };
 
-    let field = match crate::package_search::SearchField::from_str(&params.field) {
-        Ok(f) => f,
-        Err(err) => {
-            return Err(json_error(
-                axum::http::StatusCode::BAD_REQUEST,
-                err.to_string(),
-            ));
-        }
-    };
+    let (field, sort) = parse_search_query(&params)?;
 
     let matched = if params.fuzzy {
-        match db.search_fuzzy(&params.pattern, field, params.case_sensitive, params.limit) {
-            Ok(m) => m,
-            Err(err) => {
-                return Err(json_error(
-                    axum::http::StatusCode::BAD_REQUEST,
-                    err.to_string(),
-                ));
-            }
-        }
+        db.search_fuzzy(
+            &params.pattern,
+            field,
+            params.case_sensitive,
+            sort,
+            params.limit,
+        )
+        .map_err(|err| json_error(axum::http::StatusCode::BAD_REQUEST, err.to_string()))?
     } else {
-        match db.search(
+        db.search(
             &params.pattern,
             params.regex,
             field,
             params.case_sensitive,
             params.exact,
+            sort,
             params.limit,
-        ) {
-            Ok(m) => m,
-            Err(err) => {
-                return Err(json_error(
-                    axum::http::StatusCode::BAD_REQUEST,
-                    err.to_string(),
-                ));
-            }
-        }
+        )
+        .map_err(|err| json_error(axum::http::StatusCode::BAD_REQUEST, err.to_string()))?
     };
 
     if params.count {
