@@ -46,6 +46,15 @@ changelog:
 changelog-check:
     python3 scripts/changelog.py check --base origin/main
 
+rail-plan:
+    cargo rail plan --merge-base --explain
+
+rail-run PROFILE='local':
+    cargo rail run --merge-base --profile '{{PROFILE}}'
+
+rail-validate:
+    cargo rail config validate
+
 validate: secrets fmt check clippy test changelog-check
 
 benchmark:

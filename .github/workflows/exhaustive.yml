@@ -1,0 +1,44 @@
+name: exhaustive
+
+on:
+  pull_request:
+    branches: [main, master]
+    types: [labeled, opened, synchronize, reopened]
+  push:
+    branches: [main, master]
+  schedule:
+    - cron: '0 0 * * 4'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deny-audit:
+    name: deny + audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'exhaustive')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.18,cargo-audit@0.21
+      - run: cargo deny check
+      - run: cargo audit
+
+  machete:
+    name: unused dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'exhaustive')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete@0.8
+      - run: cargo machete
