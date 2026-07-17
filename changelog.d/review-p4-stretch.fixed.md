@@ -1,0 +1,4 @@
+- Add size validation to attrs sidecar reader to reject oversized files before allocation
+- Fix path ordinal resolution to return empty bitmap instead of None for empty lookups
+- Optimize path index prefix lookup to stop early when keys no longer match prefix
+- Fix prebuilt cache key to use SHA256 digest instead of raw ETag/Last-Modified header values

@@ -7,9 +7,22 @@ use std::time::Duration;
 use reqwest::header;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
+use tracing::warn;
 
 use crate::basename_index::BasenameIndex;
 use crate::database::{FILE_MAGIC, generate_sidecars};
+
+/// Decode an HTTP header value to a `String`, logging invalid UTF-8 instead of
+/// silently discarding the header.
+fn header_to_string(value: &reqwest::header::HeaderValue, name: &str) -> Option<String> {
+    match value.to_str() {
+        Ok(s) => Some(s.to_string()),
+        Err(err) => {
+            warn!(header = %name, error = %err, "ignoring header with invalid UTF-8");
+            None
+        }
+    }
+}
 
 /// Errors that can occur during prebuilt index management.
 #[derive(Error, Debug)]
@@ -30,6 +43,10 @@ pub enum Error {
     /// Basename secondary index error.
     #[error("basename index error: {0}")]
     BasenameIndex(#[from] crate::basename_index::Error),
+
+    /// Database sidecar generation failed.
+    #[error("database error: {0}")]
+    Database(#[from] crate::database::Error),
 }
 
 /// Convenience alias.
@@ -107,14 +124,12 @@ pub async fn check_update(config: &PrebuiltConfig) -> Result<Option<String>> {
     let etag = response
         .headers()
         .get(header::ETAG)
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
+        .and_then(|v| header_to_string(v, "ETag"));
 
     let last_modified = response
         .headers()
         .get(header::LAST_MODIFIED)
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
+        .and_then(|v| header_to_string(v, "Last-Modified"));
 
     Ok(etag.or(last_modified))
 }
@@ -193,16 +208,12 @@ pub async fn download_to(config: &PrebuiltConfig, dest: &Path) -> Result<()> {
     validate_nixi(&temp_path)?;
     tokio::fs::rename(&temp_path, dest).await?;
 
-    // Generate nixdex sidecars for fast basename lookups.
+    // Generate nixdex sidecars for fast basename and package search lookups.
     // This is CPU-bound, so we use spawn_blocking to avoid blocking the async runtime.
     let dest_clone = dest.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        if let Err(err) = generate_sidecars(&dest_clone) {
-            tracing::warn!(error = %err, "failed to generate sidecars for prebuilt index");
-        }
-    })
-    .await
-    .map_err(|err| Error::Io(std::io::Error::other(err.to_string())))?;
+    tokio::task::spawn_blocking(move || generate_sidecars(&dest_clone))
+        .await
+        .map_err(|err| Error::Io(std::io::Error::other(err.to_string())))??;
 
     Ok(())
 }
@@ -235,16 +246,24 @@ pub async fn download_and_validate(config: &PrebuiltConfig) -> Result<PathBuf> {
     }
 
     let headers = response.headers();
-    let etag = headers.get(header::ETAG).and_then(|v| v.to_str().ok());
+    let etag = headers
+        .get(header::ETAG)
+        .and_then(|v| header_to_string(v, "ETag"));
     let last_modified = headers
         .get(header::LAST_MODIFIED)
-        .and_then(|v| v.to_str().ok());
-    let etag = match etag.or(last_modified) {
-        Some(e) => e,
-        None => "unknown",
+        .and_then(|v| header_to_string(v, "Last-Modified"));
+    let cache_key = match etag.or(last_modified) {
+        Some(e) => {
+            // Derive a fixed-length safe digest from the header value.
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(e.as_bytes());
+            format!("{:x}", hasher.finalize())
+        }
+        None => "unknown".to_string(),
     };
 
-    let target_dir = config.cache_dir.join(etag);
+    let target_dir = config.cache_dir.join(cache_key);
     download_to(config, &target_dir.join("files")).await?;
     Ok(target_dir)
 }
