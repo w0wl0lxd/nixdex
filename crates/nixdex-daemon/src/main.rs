@@ -19,7 +19,7 @@ struct Args {
     release_url: String,
 
     /// Architecture identifier (e.g., x86_64-linux).
-    #[arg(long, default_value = "x86_64-linux")]
+    #[arg(long, default_value_t = nixdex_core::prebuilt::default_architecture())]
     architecture: String,
 
     /// Use the -small variant of the prebuilt index.
@@ -31,7 +31,7 @@ struct Args {
     cache_dir: Option<PathBuf>,
 
     /// Refresh interval in seconds.
-    #[arg(long, default_value = "3600")]
+    #[arg(long, default_value = "3600", value_parser = clap::value_parser!(u64).range(1..))]
     interval: u64,
 
     /// HTTP server listen address.
