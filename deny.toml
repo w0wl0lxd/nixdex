@@ -3,7 +3,7 @@
 
 [graph]
 targets = []
-all-features = false
+all-features = true
 no-default-features = false
 
 [advisories]

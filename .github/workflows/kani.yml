@@ -1,0 +1,34 @@
+name: kani
+
+on:
+  pull_request:
+    branches: [main, master]
+    paths:
+      - 'crates/nixdex-core/src/**'
+  push:
+    branches: [main, master]
+  schedule:
+    - cron: '0 0 * * 2'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  kani:
+    name: kani formal verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier
+          cargo kani setup
+      - name: Run Kani on nixdex-core
+        run: cargo kani -p nixdex-core --harness basename_index::kani_proofs::check_read_u32_le_no_panic
