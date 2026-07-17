@@ -614,14 +614,17 @@ fn auto_install_and_exec(provider: &str, cmd: &str, args: &[String]) -> color_ey
 
     let install_status = if uses_nix_profile {
         std::process::Command::new("nix")
-            .args(["profile", "install", &format!("nixpkgs#{provider}")])
+            .args(["profile", "add", &format!("nixpkgs#{provider}")])
             .status()
-            .wrap_err_with(|| format!("failed to run 'nix profile install nixpkgs#{provider}'"))?
+            .wrap_err_with(|| format!("failed to run 'nix profile add nixpkgs#{provider}'"))?
     } else {
+        // nix-env attribute paths do not accept output qualifiers like `.out`,
+        // so strip the trailing output component for the legacy installer.
+        let nix_env_attr = provider.rsplit_once('.').map_or(provider, |(attr, _)| attr);
         std::process::Command::new("nix-env")
-            .args(["-iA", &format!("nixpkgs.{provider}")])
+            .args(["-iA", &format!("nixpkgs.{nix_env_attr}")])
             .status()
-            .wrap_err_with(|| format!("failed to run 'nix-env -iA nixpkgs.{provider}'"))?
+            .wrap_err_with(|| format!("failed to run 'nix-env -iA nixpkgs.{nix_env_attr}'"))?
     };
 
     if !install_status.success() {
@@ -633,9 +636,9 @@ fn auto_install_and_exec(provider: &str, cmd: &str, args: &[String]) -> color_ey
 
 fn auto_run_command(provider: &str, cmd: &str, args: &[String]) -> color_eyre::Result<()> {
     let mut command_args = vec![
-        String::from("run"),
+        String::from("shell"),
         format!("nixpkgs#{provider}"),
-        String::from("-c"),
+        String::from("--command"),
         cmd.to_string(),
     ];
     command_args.extend_from_slice(args);
@@ -643,7 +646,9 @@ fn auto_run_command(provider: &str, cmd: &str, args: &[String]) -> color_eyre::R
     let status = std::process::Command::new("nix")
         .args(&command_args)
         .status()
-        .wrap_err_with(|| format!("failed to run 'nix run nixpkgs#{provider}'"))?;
+        .wrap_err_with(|| {
+            format!("failed to run 'nix shell nixpkgs#{provider} --command {cmd}'")
+        })?;
 
     if let Some(code) = status.code() {
         std::process::exit(code);
