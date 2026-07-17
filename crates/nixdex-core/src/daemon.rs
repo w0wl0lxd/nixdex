@@ -11,7 +11,11 @@ use indexmap::IndexSet;
 
 #[cfg(feature = "daemon")]
 use axum::{
-    Router, extract::State, http::header::CONTENT_TYPE, response::IntoResponse, routing::get,
+    Router,
+    extract::State,
+    http::header::CONTENT_TYPE,
+    response::IntoResponse,
+    routing::{get, post},
 };
 #[cfg(feature = "daemon")]
 use serde::{Deserialize, Serialize};
@@ -27,8 +31,12 @@ struct IndexState {
     basename: Arc<std::sync::RwLock<Option<Arc<BasenameIndex>>>>,
     reader: Arc<std::sync::RwLock<Option<Arc<Reader>>>>,
     package_db: Arc<std::sync::RwLock<Option<Arc<crate::package_search::SearchDb>>>>,
+    /// Directory that currently holds the loaded `files` database and sidecars.
+    database_dir: Arc<std::sync::RwLock<Option<PathBuf>>>,
     start_time: Instant,
     requests_total: AtomicU64,
+    /// Channel used by HTTP `/reload` to request an immediate index refresh.
+    reload: tokio::sync::mpsc::UnboundedSender<()>,
 }
 
 /// Configuration for a prebuilt-index daemon.
@@ -40,6 +48,8 @@ pub struct DaemonConfig {
     pub http_addr: String,
     /// Optional local database directory to serve instead of downloading a prebuilt index.
     pub local_database: Option<PathBuf>,
+    /// How often to reload the local database when running in local mode.
+    pub local_refresh_interval: std::time::Duration,
 }
 
 impl Default for DaemonConfig {
@@ -48,36 +58,84 @@ impl Default for DaemonConfig {
             prebuilt: PrebuiltConfig::default(),
             http_addr: "127.0.0.1:3750".to_string(),
             local_database: None,
+            local_refresh_interval: std::time::Duration::from_secs(3600),
         }
     }
 }
 
+/// Action emitted by the daemon signal handler.
+#[cfg(feature = "daemon")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalAction {
+    /// Shut down the daemon.
+    Shutdown,
+    /// Force an immediate index reload.
+    Reload,
+}
+
 /// Run the daemon loop, polling for prebuilt index updates and serving HTTP requests.
 ///
-/// Listens for `SIGTERM` and `SIGINT`. A refresh that fails is logged and the
-/// loop continues.
+/// Listens for `SIGTERM`, `SIGINT`, and `SIGHUP`. A `SIGHUP` or `POST /reload`
+/// triggers an immediate refresh. A refresh that fails is logged and the loop
+/// continues.
 ///
 /// # Errors
 ///
 /// Returns an error when signal setup or HTTP server binding fails.
 #[cfg(feature = "daemon")]
+#[allow(clippy::cognitive_complexity)]
 pub async fn run(config: &DaemonConfig) -> Result<()> {
+    let (reload_tx, mut reload_rx) = tokio::sync::mpsc::unbounded_channel();
     let index_state = Arc::new(IndexState {
         basename: Arc::new(std::sync::RwLock::new(None)),
         reader: Arc::new(std::sync::RwLock::new(None)),
         package_db: Arc::new(std::sync::RwLock::new(None)),
+        database_dir: Arc::new(std::sync::RwLock::new(None)),
         start_time: Instant::now(),
         requests_total: AtomicU64::new(0),
+        reload: reload_tx,
     });
 
     let http_handle = start_http_server(&config.http_addr, Arc::clone(&index_state));
 
     if let Some(local) = &config.local_database {
-        load_and_store_index(local, &index_state);
-        log_daemon_start_local(config, local);
-        let result = wait_signal().await;
-        http_handle.abort();
-        return result;
+        if config.local_refresh_interval.is_zero() {
+            return Err(crate::Error::Io(std::io::Error::other(
+                "local refresh interval must be non-zero",
+            )));
+        }
+
+        let mut local_interval = tokio::time::interval(config.local_refresh_interval);
+        local_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            load_and_store_index(local, &index_state);
+            log_daemon_start_local(config, local);
+            tokio::select! {
+                _ = local_interval.tick() => {
+                    tracing::info!("local refresh interval elapsed; reloading index");
+                }
+                result = wait_signal() => {
+                    match result {
+                        Ok(SignalAction::Reload) => {
+                            tracing::info!("received reload signal; reloading local index");
+                        }
+                        Ok(SignalAction::Shutdown) => {
+                            http_handle.abort();
+                            return Ok(());
+                        }
+                        Err(err) => {
+                            tracing::error!(error = %err, "signal handler failed");
+                            http_handle.abort();
+                            return Err(err);
+                        }
+                    }
+                }
+                Some(()) = reload_rx.recv() => {
+                    tracing::info!("received /reload request; reloading local index");
+                }
+            }
+        }
     }
 
     if config.prebuilt.refresh_interval.is_zero() {
@@ -96,6 +154,7 @@ pub async fn run(config: &DaemonConfig) -> Result<()> {
         &cache_dir,
         &index_state,
         &mut interval,
+        &mut reload_rx,
         http_handle,
     )
     .await
@@ -130,11 +189,13 @@ fn log_daemon_start(config: &DaemonConfig, cache_dir: &std::path::Path) {
 }
 
 #[cfg(feature = "daemon")]
+#[allow(clippy::cognitive_complexity)]
 async fn run_daemon_loop(
     prebuilt_config: &PrebuiltConfig,
     cache_dir: &std::path::Path,
     index_state: &IndexState,
     interval: &mut tokio::time::Interval,
+    reload_rx: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
     http_handle: tokio::task::JoinHandle<Result<()>>,
 ) -> Result<()> {
     loop {
@@ -143,11 +204,25 @@ async fn run_daemon_loop(
                 handle_refresh_tick(prebuilt_config, cache_dir, index_state).await;
             }
             result = wait_signal() => {
-                if let Err(err) = result {
-                    tracing::error!(error = %err, "signal handler failed");
+                match result {
+                    Ok(SignalAction::Reload) => {
+                        tracing::info!("received reload signal; refreshing prebuilt index");
+                        handle_refresh_tick(prebuilt_config, cache_dir, index_state).await;
+                    }
+                    Ok(SignalAction::Shutdown) => {
+                        http_handle.abort();
+                        break;
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, "signal handler failed");
+                        http_handle.abort();
+                        return Err(err);
+                    }
                 }
-                http_handle.abort();
-                break;
+            }
+            Some(()) = reload_rx.recv() => {
+                tracing::info!("received /reload request; refreshing prebuilt index");
+                handle_refresh_tick(prebuilt_config, cache_dir, index_state).await;
             }
         }
     }
@@ -156,7 +231,7 @@ async fn run_daemon_loop(
 }
 
 #[cfg(feature = "daemon")]
-async fn wait_signal() -> Result<()> {
+async fn wait_signal() -> Result<SignalAction> {
     #[cfg(unix)]
     {
         wait_unix_signal().await
@@ -168,24 +243,34 @@ async fn wait_signal() -> Result<()> {
 }
 
 // The 15-point cognitive-complexity budget is too small for a `tokio::select!`
-// over two signal handlers; splitting this further would hurt readability.
+// over three signal handlers; splitting this further would hurt readability.
 #[allow(clippy::cognitive_complexity)]
 #[cfg(unix)]
-async fn wait_unix_signal() -> Result<()> {
+async fn wait_unix_signal() -> Result<SignalAction> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     tokio::select! {
-        _ = sigterm.recv() => tracing::info!("received SIGTERM, shutting down"),
-        _ = sigint.recv() => tracing::info!("received SIGINT, shutting down"),
+        _ = sigterm.recv() => {
+            tracing::info!("received SIGTERM, shutting down");
+            Ok(SignalAction::Shutdown)
+        }
+        _ = sigint.recv() => {
+            tracing::info!("received SIGINT, shutting down");
+            Ok(SignalAction::Shutdown)
+        }
+        _ = sighup.recv() => {
+            tracing::info!("received SIGHUP, reloading index");
+            Ok(SignalAction::Reload)
+        }
     }
-    Ok(())
 }
 
 #[cfg(not(unix))]
-async fn wait_ctrl_c() -> Result<()> {
+async fn wait_ctrl_c() -> Result<SignalAction> {
     tokio::signal::ctrl_c().await.map_err(crate::Error::Io)?;
     tracing::info!("received Ctrl+C, shutting down");
-    Ok(())
+    Ok(SignalAction::Shutdown)
 }
 
 #[cfg(feature = "daemon")]
@@ -211,6 +296,10 @@ fn load_and_store_index(cache_dir: &std::path::Path, index_state: &IndexState) {
     } else {
         cache_dir.join("current")
     };
+
+    if let Ok(mut state) = index_state.database_dir.write() {
+        *state = Some(index_dir.clone());
+    }
 
     if !ensure_sidecars(&index_dir) {
         return;
@@ -327,6 +416,7 @@ async fn run_http_server(addr: &str, index_state: Arc<IndexState>) -> Result<()>
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
+        .route("/reload", post(reload_handler))
         .route("/locate", get(locate_handler))
         .route("/nix-locate", get(nix_locate_handler))
         .route("/search", get(search_handler))
@@ -388,38 +478,26 @@ struct LocateResponse {
 }
 
 /// HTTP handler for `/nix-locate` with nix-index-compatible parameters.
+///
+/// Supports the same filtering/sorting options as the CLI `nix-locate`,
+/// including `type`, `min_size`, `max_size`, `exclude_fhs`, and `sort`.
 #[cfg(feature = "daemon")]
 #[allow(clippy::too_many_lines)]
 async fn nix_locate_handler(
     State(index_state): State<Arc<IndexState>>,
     axum::extract::Query(params): axum::extract::Query<NixLocateParams>,
-) -> axum::Json<NixLocateResponse> {
+) -> std::result::Result<axum::Json<NixLocateResponse>, axum::http::StatusCode> {
     index_state.requests_total.fetch_add(1, Ordering::Relaxed);
-    let reader = {
-        let Ok(guard) = index_state.reader.read() else {
-            return axum::Json(NixLocateResponse {
-                count: None,
-                matches: Vec::new(),
-            });
-        };
-        guard.as_ref().map(Arc::clone)
-    };
 
-    let basename_index = {
-        let Ok(guard) = index_state.basename.read() else {
-            return axum::Json(NixLocateResponse {
-                count: None,
-                matches: Vec::new(),
-            });
-        };
-        guard.as_ref().map(Arc::clone)
-    };
-
-    let (Some(reader), Some(basename_index)) = (reader, basename_index) else {
-        return axum::Json(NixLocateResponse {
-            count: None,
-            matches: Vec::new(),
-        });
+    let database_dir = {
+        let guard = index_state
+            .database_dir
+            .read()
+            .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+        guard
+            .as_ref()
+            .cloned()
+            .ok_or(axum::http::StatusCode::SERVICE_UNAVAILABLE)?
     };
 
     // Build the path regex with anchors based on at_root/whole_name.
@@ -432,59 +510,95 @@ async fn nix_locate_handler(
     };
     let pattern = format!("{start_anchor}{pattern_body}{end_anchor}");
 
-    // Compile regex and package regex if provided.
-    let Ok(path_re) = regex::bytes::Regex::new(&pattern) else {
-        return axum::Json(NixLocateResponse {
-            count: None,
-            matches: Vec::new(),
-        });
-    };
-
-    let package_re = params
-        .package
-        .as_ref()
-        .and_then(|p| regex::bytes::Regex::new(p).ok());
-
-    // Try exact_basename fast path via BasenameIndex.
-    let exact_basename_ordinals =
-        if !params.regex && params.whole_name && !params.pattern.is_empty() {
-            let base = crate::basename_index::basename_of(params.pattern.as_bytes());
-            if params.pattern.contains('/') && !base.is_empty() {
-                match basename_index.lookup_basename_ordinals(base) {
-                    Ok(ordinals) if !ordinals.is_empty() => Some(ordinals.into_iter().collect()),
-                    _ => None,
-                }
-            } else {
-                None
-            }
+    // Determine whether the secondary indexes can answer this query exactly.
+    let exact_basename = if !params.regex && params.whole_name && !params.pattern.is_empty() {
+        let base = crate::basename_index::basename_of(params.pattern.as_bytes());
+        if params.pattern.contains('/') && !base.is_empty() {
+            Some(String::from_utf8_lossy(base).into_owned())
         } else {
             None
-        };
+        }
+    } else {
+        None
+    };
+
+    let (exact_path, path_prefix) = if !params.regex && params.at_root && !params.pattern.is_empty()
+    {
+        let pattern_bytes = params.pattern.as_bytes();
+        if pattern_bytes.starts_with(b"/") {
+            if params.whole_name {
+                (Some(params.pattern.clone()), None)
+            } else {
+                (None, Some(params.pattern.clone()))
+            }
+        } else if params.pattern.contains('/') {
+            (None, Some(format!("/{}", params.pattern)))
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
+    let package_pattern = params.package.clone();
 
     // CPU-bound search: use spawn_blocking to avoid blocking the tokio runtime.
-    let reader_clone = Arc::clone(&reader);
-    let hash = params.hash.clone();
-    let Ok(Ok(matches)) = tokio::task::spawn_blocking(move || {
-        reader_clone
-            .search_entries(
-                &path_re,
-                package_re.as_ref(),
-                hash.as_deref(),
-                None,
-                exact_basename_ordinals.as_ref(),
-            )
-            .map_err(|e| format!("{:?}", e))
-    })
-    .await
-    else {
-        return axum::Json(NixLocateResponse {
-            count: None,
-            matches: Vec::new(),
-        });
+    let search_task = tokio::task::spawn_blocking(move || {
+        let file_type: Vec<crate::FileType> = if params.file_type.is_empty() {
+            crate::ALL_FILE_TYPES.to_vec()
+        } else {
+            let mut types = Vec::with_capacity(params.file_type.len());
+            for s in &params.file_type {
+                match crate::FileType::from_str(s) {
+                    Ok(ft) => types.push(ft),
+                    Err(_) => return Err("bad_request: invalid file type".to_string()),
+                }
+            }
+            types
+        };
+
+        let sort = match &params.sort {
+            Some(s) => crate::database::SearchSort::from_str(s)
+                .map_err(|_| "bad_request: invalid sort order".to_string())?,
+            None => crate::database::SearchSort::None,
+        };
+
+        let options = crate::database::SearchOptions {
+            database: database_dir,
+            pattern,
+            hash: params.hash,
+            package_pattern,
+            exact_basename,
+            exact_path,
+            path_prefix,
+            file_type: &file_type,
+            mode: crate::database::SearchMode::Full {
+                color: false,
+                group: false,
+                only_toplevel: false,
+            },
+            json: false,
+            limit: None,
+            count: false,
+            sort,
+            min_size: params.min_size,
+            max_size: params.max_size,
+            exclude_fhs: params.exclude_fhs,
+        };
+
+        crate::search_database_results(&options).map_err(|e| format!("search error: {e:?}"))
+    });
+
+    let results = match search_task.await {
+        Ok(Ok(results)) => results,
+        Ok(Err(err)) if err.starts_with("bad_request:") => {
+            return Err(axum::http::StatusCode::BAD_REQUEST);
+        }
+        _ => return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
     };
 
     // Convert results to JSON response.
-    let json_matches: Vec<NixLocateMatch> = matches
+    let mut json_matches: Vec<NixLocateMatch> = results
         .into_iter()
         .map(|(store_path, entry)| {
             let node = match entry.node {
@@ -516,10 +630,9 @@ async fn nix_locate_handler(
         .collect();
 
     // Filter to minimal output if requested.
-    let mut json_matches = if params.minimal {
-        // In minimal mode, we only need unique attr.output pairs.
+    if params.minimal {
         let mut seen = IndexSet::new();
-        json_matches
+        json_matches = json_matches
             .into_iter()
             .filter_map(|m| {
                 let key = format!("{}.{}", m.attr, m.output);
@@ -539,26 +652,24 @@ async fn nix_locate_handler(
                     None
                 }
             })
-            .collect()
-    } else {
-        json_matches
-    };
+            .collect();
+    }
 
     if params.count {
-        return axum::Json(NixLocateResponse {
+        return Ok(axum::Json(NixLocateResponse {
             count: Some(json_matches.len()),
             matches: Vec::new(),
-        });
+        }));
     }
 
     if let Some(limit) = params.limit {
         json_matches.truncate(limit);
     }
 
-    axum::Json(NixLocateResponse {
+    Ok(axum::Json(NixLocateResponse {
         count: None,
         matches: json_matches,
-    })
+    }))
 }
 
 #[cfg(feature = "daemon")]
@@ -577,10 +688,20 @@ struct NixLocateParams {
     whole_name: bool,
     #[serde(default)]
     minimal: bool,
+    #[serde(default, rename = "type")]
+    file_type: Vec<String>,
     #[serde(default)]
     limit: Option<usize>,
     #[serde(default)]
     count: bool,
+    #[serde(default)]
+    sort: Option<String>,
+    #[serde(default)]
+    min_size: Option<u64>,
+    #[serde(default)]
+    max_size: Option<u64>,
+    #[serde(default)]
+    exclude_fhs: bool,
 }
 
 #[cfg(feature = "daemon")]
@@ -644,6 +765,21 @@ async fn health_handler(State(index_state): State<Arc<IndexState>>) -> axum::Jso
         version: env!("CARGO_PKG_VERSION"),
         uptime_seconds: index_state.start_time.elapsed().as_secs(),
     })
+}
+
+/// Reload response.
+#[cfg(feature = "daemon")]
+#[derive(Serialize)]
+struct ReloadResponse {
+    reloaded: bool,
+}
+
+/// HTTP handler for `POST /reload`.
+#[cfg(feature = "daemon")]
+async fn reload_handler(State(index_state): State<Arc<IndexState>>) -> axum::Json<ReloadResponse> {
+    index_state.requests_total.fetch_add(1, Ordering::Relaxed);
+    let reloaded = index_state.reload.send(()).is_ok();
+    axum::Json(ReloadResponse { reloaded })
 }
 
 /// Prometheus-style `/metrics` handler.

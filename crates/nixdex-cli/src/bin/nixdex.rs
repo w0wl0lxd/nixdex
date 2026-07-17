@@ -228,9 +228,21 @@ struct CommandNotFoundOpts {
     #[arg(value_name = "COMMAND")]
     cmd: String,
 
+    /// Arguments to pass to the command when --auto-install or --auto-run succeeds.
+    #[arg(value_name = "ARGS", num_args = 0.., allow_hyphen_values = true)]
+    args: Vec<String>,
+
     /// Directory where the index is stored.
     #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
     database: PathBuf,
+
+    /// Automatically install the package and re-execute the command.
+    #[arg(long)]
+    auto_install: bool,
+
+    /// Run the command once from the package without installing.
+    #[arg(long)]
+    auto_run: bool,
 
     /// Output the suggestion as JSON.
     #[arg(long)]
@@ -528,6 +540,14 @@ fn find_command_providers(
 }
 
 fn run_command_not_found(opts: CommandNotFoundOpts) -> color_eyre::Result<()> {
+    let auto_install =
+        opts.auto_install || std::env::var("NIX_AUTO_INSTALL").is_ok_and(|v| !v.is_empty());
+    let auto_run = opts.auto_run || std::env::var("NIX_AUTO_RUN").is_ok_and(|v| !v.is_empty());
+
+    if auto_install && auto_run {
+        color_eyre::eyre::bail!("--auto-install and --auto-run are mutually exclusive");
+    }
+
     let files = opts.database.join("files");
     let reader = nixdex_core::database::Reader::open(&files)
         .wrap_err_with(|| format!("failed to open index at {}", files.display()))?;
@@ -536,16 +556,40 @@ fn run_command_not_found(opts: CommandNotFoundOpts) -> color_eyre::Result<()> {
 
     match providers.as_slice() {
         [] => {
-            color_eyre::eyre::bail!("{}: command not found", opts.cmd);
+            eprintln!("{}: command not found", opts.cmd);
+            std::process::exit(127);
         }
-        [single] if !opts.json => {
+        [single] if auto_install => auto_install_and_exec(single, &opts.cmd, &opts.args),
+        [single] if auto_run => auto_run_command(single, &opts.cmd, &opts.args),
+        [single] if opts.json => {
+            let line =
+                sonic_rs::to_string(single).wrap_err("failed to serialize command provider")?;
+            println!("{line}");
+            Ok(())
+        }
+        [single] => {
             eprintln!(
                 "The program '{}' is currently not installed. It is provided by the package '{}'.",
                 opts.cmd, single
             );
+            std::process::exit(127);
+        }
+        _ if auto_install || auto_run => {
+            eprintln!(
+                "The program '{}' is currently not installed. It is provided by several packages; cannot auto-install/run.",
+                opts.cmd
+            );
+            for provider in &providers {
+                eprintln!("  {provider}");
+            }
+            std::process::exit(127);
+        }
+        _ if opts.json => {
+            let line = sonic_rs::to_string(&providers).wrap_err("failed to serialize providers")?;
+            println!("{line}");
             Ok(())
         }
-        _ if !opts.json => {
+        _ => {
             eprintln!(
                 "The program '{}' is currently not installed. It is provided by the following packages:",
                 opts.cmd
@@ -553,14 +597,67 @@ fn run_command_not_found(opts: CommandNotFoundOpts) -> color_eyre::Result<()> {
             for provider in &providers {
                 eprintln!("  {provider}");
             }
-            Ok(())
-        }
-        _ => {
-            let line = sonic_rs::to_string(&providers).wrap_err("failed to serialize providers")?;
-            println!("{line}");
-            Ok(())
+            std::process::exit(127);
         }
     }
+}
+
+fn auto_install_and_exec(provider: &str, cmd: &str, args: &[String]) -> color_eyre::Result<()> {
+    let uses_nix_profile = std::env::var_os("HOME").is_some_and(|h| {
+        std::path::PathBuf::from(h)
+            .join(".nix-profile/manifest.json")
+            .is_file()
+    });
+
+    let install_status = if uses_nix_profile {
+        std::process::Command::new("nix")
+            .args(["profile", "install", &format!("nixpkgs#{provider}")])
+            .status()
+            .wrap_err_with(|| format!("failed to run 'nix profile install nixpkgs#{provider}'"))?
+    } else {
+        std::process::Command::new("nix-env")
+            .args(["-iA", &format!("nixpkgs.{provider}")])
+            .status()
+            .wrap_err_with(|| format!("failed to run 'nix-env -iA nixpkgs.{provider}'"))?
+    };
+
+    if !install_status.success() {
+        color_eyre::eyre::bail!("failed to install package '{provider}'");
+    }
+
+    exec_command(cmd, args)
+}
+
+fn auto_run_command(provider: &str, cmd: &str, args: &[String]) -> color_eyre::Result<()> {
+    let mut command_args = vec![
+        String::from("run"),
+        format!("nixpkgs#{provider}"),
+        String::from("-c"),
+        cmd.to_string(),
+    ];
+    command_args.extend_from_slice(args);
+
+    let status = std::process::Command::new("nix")
+        .args(&command_args)
+        .status()
+        .wrap_err_with(|| format!("failed to run 'nix run nixpkgs#{provider}'"))?;
+
+    if let Some(code) = status.code() {
+        std::process::exit(code);
+    }
+    std::process::exit(127);
+}
+
+fn exec_command(cmd: &str, args: &[String]) -> color_eyre::Result<()> {
+    let status = std::process::Command::new(cmd)
+        .args(args)
+        .status()
+        .wrap_err_with(|| format!("failed to execute '{cmd}'"))?;
+
+    if let Some(code) = status.code() {
+        std::process::exit(code);
+    }
+    std::process::exit(127);
 }
 
 fn run_completions(opts: CompletionsOpts) {
@@ -583,6 +680,7 @@ async fn run_daemon(opts: DaemonOpts) -> color_eyre::Result<()> {
         },
         http_addr: opts.http_addr,
         local_database: opts.database,
+        local_refresh_interval: std::time::Duration::from_secs(opts.interval),
     };
 
     nixdex_core::daemon::run(&config)
