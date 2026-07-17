@@ -1,5 +1,6 @@
 //! Building a nixdex index from nixpkgs and the binary cache.
 
+use indexmap::IndexMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -12,7 +13,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::CACHE_URL;
-use crate::database::Writer;
+use crate::database::{Writer, read_attrs_sidecar};
 use crate::errors::{Error, Result};
 use crate::hydra::Fetcher;
 use crate::listings;
@@ -21,6 +22,27 @@ use crate::path_cache::PathCache;
 
 /// Name of the package metadata sidecar written alongside `files`.
 const PACKAGES_JSON: &str = "packages.json";
+
+/// Context for the listing write operation.
+struct ListingContext {
+    db_file: PathBuf,
+    writer: Writer,
+    path_cache: Option<Arc<PathCache>>,
+    cache_path: PathBuf,
+    attrs_map: IndexMap<String, String>,
+}
+
+/// Context for the write_listings function.
+struct WriteListingsContext<'a> {
+    writer: &'a mut Writer,
+    fetcher: &'a Fetcher,
+    jobs: usize,
+    path_cache: Option<Arc<PathCache>>,
+    filter_prefix: &'a [u8],
+    db_file: &'a Path,
+    progress: &'a MultiProgress,
+    attrs_map: IndexMap<String, String>,
+}
 
 /// Options controlling an index build.
 #[derive(Debug, Clone)]
@@ -211,7 +233,7 @@ impl IndexBuilder {
     }
 
     /// Prepare the output database directory, `paths.cache`, and `Writer`.
-    fn prepare_database(&self) -> Result<(PathBuf, Writer, Option<Arc<PathCache>>, PathBuf)> {
+    fn prepare_database(&self) -> Result<ListingContext> {
         let opts = &self.options;
 
         std::fs::create_dir_all(&opts.database).map_err(|source| Error::CreateDatabaseDir {
@@ -235,6 +257,8 @@ impl IndexBuilder {
             opts.path_cache_ttl,
         );
 
+        let attrs_map = self.load_attrs_sidecar();
+
         let db_file = opts.database.join("files");
         let writer =
             Writer::create_with_version(&db_file, opts.compression_level, opts.format_version)
@@ -243,7 +267,44 @@ impl IndexBuilder {
                     source: Box::new(source),
                 })?;
 
-        Ok((db_file, writer, path_cache, cache_path))
+        Ok(ListingContext {
+            db_file,
+            writer,
+            path_cache,
+            cache_path,
+            attrs_map,
+        })
+    }
+
+    /// Load the attrs sidecar from the previous build if path_cache is enabled.
+    #[allow(clippy::cognitive_complexity)]
+    fn load_attrs_sidecar(&self) -> IndexMap<String, String> {
+        let opts = &self.options;
+        if !opts.path_cache {
+            return IndexMap::new();
+        }
+
+        match read_attrs_sidecar(&opts.database) {
+            Ok(Some(attrs)) => {
+                let mut map = IndexMap::with_capacity(attrs.len());
+                for (attr, output, hash) in attrs {
+                    map.insert(format!("{}.{}", attr, output), hash);
+                }
+                info!(
+                    count = map.len(),
+                    "loaded attrs sidecar for incremental build"
+                );
+                map
+            }
+            Ok(None) => {
+                info!("attrs sidecar not found; full rebuild");
+                IndexMap::new()
+            }
+            Err(err) => {
+                warn!(error = %err, "failed to read attrs sidecar; full rebuild");
+                IndexMap::new()
+            }
+        }
     }
 
     /// Build a fresh binary-cache fetcher.
@@ -336,7 +397,7 @@ impl IndexBuilder {
             return self.build_eval_only().await;
         }
 
-        let (db_file, mut writer, path_cache, cache_path) = self.prepare_database()?;
+        let mut ctx = self.prepare_database()?;
         let progress = MultiProgress::new();
         let eval_pb = progress.add(ProgressBar::new_spinner());
         eval_pb.set_message("Evaluating nixpkgs...");
@@ -349,14 +410,17 @@ impl IndexBuilder {
             opts.filter_prefix.as_bytes().to_vec()
         };
         let (indexed, failed, fetch_elapsed) = match write_listings(
-            &mut writer,
-            &fetcher,
-            opts.jobs.max(1),
+            WriteListingsContext {
+                writer: &mut ctx.writer,
+                fetcher: &fetcher,
+                jobs: opts.jobs.max(1),
+                path_cache: ctx.path_cache.clone(),
+                filter_prefix: &filter_prefix,
+                db_file: &ctx.db_file,
+                progress: &progress,
+                attrs_map: ctx.attrs_map,
+            },
             stream.packages,
-            path_cache.clone(),
-            &filter_prefix,
-            &db_file,
-            &progress,
         )
         .await
         {
@@ -373,14 +437,15 @@ impl IndexBuilder {
             "Evaluated {eval_count} package(s) in {eval_elapsed:?}"
         ));
 
-        Self::maybe_save_path_cache(opts.path_cache, path_cache.as_ref(), &cache_path);
+        Self::maybe_save_path_cache(opts.path_cache, ctx.path_cache.as_ref(), &ctx.cache_path);
 
-        let size = writer.finish().map_err(|source| Error::WriteDatabase {
-            path: db_file.clone(),
+        let size = ctx.writer.finish().map_err(|source| Error::WriteDatabase {
+            path: ctx.db_file.clone(),
             source: Box::new(source),
         })?;
 
-        let cached = path_cache
+        let cached = ctx
+            .path_cache
             .as_ref()
             .map_or(0, |pc| pc.hits.load(Ordering::Relaxed));
         let bytes_downloaded = fetcher.bytes_downloaded();
@@ -393,7 +458,7 @@ impl IndexBuilder {
             size_bytes = size,
             ?eval_elapsed,
             ?fetch_elapsed,
-            db = %db_file.display(),
+            db = %ctx.db_file.display(),
             "index build complete"
         );
         Ok(())
@@ -483,30 +548,30 @@ fn finish_fetch_progress(
 }
 
 async fn write_listings(
-    writer: &mut Writer,
-    fetcher: &Fetcher,
-    jobs: usize,
+    ctx: WriteListingsContext<'_>,
     package_input: mpsc::Receiver<listings::PackageEntry>,
-    path_cache: Option<Arc<PathCache>>,
-    filter_prefix: &[u8],
-    db_file: &Path,
-    progress: &MultiProgress,
 ) -> Result<(usize, usize, Duration)> {
     // Flush raw packages to a v2 frame once the in-memory chunk reaches 256 MiB.
     const CHUNK_BYTES: u64 = 256 * 1024 * 1024;
 
-    let fetch_pb = progress.add(ProgressBar::new_spinner());
+    let fetch_pb = ctx.progress.add(ProgressBar::new_spinner());
     fetch_pb.set_message("Fetching listings...");
     let fetch_start = quanta::Instant::now();
 
-    let mut listings =
-        listings::fetch_listings(fetcher, jobs, package_input, path_cache, filter_prefix)
-            .await
-            .map_err(|source| {
-                Error::Io(std::io::Error::other(format!(
-                    "failed to start listing fetcher: {source}"
-                )))
-            })?;
+    let mut listings = listings::fetch_listings(
+        ctx.fetcher,
+        ctx.jobs,
+        package_input,
+        ctx.path_cache,
+        ctx.filter_prefix,
+        ctx.attrs_map,
+    )
+    .await
+    .map_err(|source| {
+        Error::Io(std::io::Error::other(format!(
+            "failed to start listing fetcher: {source}"
+        )))
+    })?;
 
     let mut indexed = 0usize;
     let mut failed = 0usize;
@@ -515,17 +580,17 @@ async fn write_listings(
     while let Some(result) = listings.recv().await {
         match result {
             Ok((store_path, tree)) => {
-                let before_len = writer.estimated_size();
-                writer
-                    .add(&store_path, &tree, filter_prefix)
+                let before_len = ctx.writer.estimated_size();
+                ctx.writer
+                    .add(&store_path, &tree, ctx.filter_prefix)
                     .map_err(|source| Error::WriteDatabase {
-                        path: db_file.to_path_buf(),
+                        path: ctx.db_file.to_path_buf(),
                         source: Box::new(source),
                     })?;
-                let after_len = writer.estimated_size();
+                let after_len = ctx.writer.estimated_size();
                 bytes_written += after_len.saturating_sub(before_len);
                 indexed += 1;
-                maybe_flush_chunk(writer, db_file, CHUNK_BYTES)?;
+                maybe_flush_chunk(ctx.writer, ctx.db_file, CHUNK_BYTES)?;
             }
             Err(err) => {
                 warn!(error = %err, "closure fetch yielded an error; skipping");

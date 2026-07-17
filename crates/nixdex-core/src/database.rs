@@ -15,6 +15,7 @@ use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 
 use byteorder::{LittleEndian, WriteBytesExt};
+use memchr;
 use mmap_guard;
 use rayon::prelude::*;
 use regex::bytes::Regex;
@@ -28,6 +29,7 @@ use crate::basename_index::{
 };
 use crate::files::{FileNode, FileTree, FileTreeEntry, FileType};
 use crate::frcode;
+use crate::path_index::{PathIndex, PathIndexBuilder};
 use crate::store_path::StorePath;
 
 /// Database format versions supported by this build.
@@ -53,6 +55,18 @@ const FRAME_MAP_MAGIC: &[u8] = b"NFRM";
 
 /// Frame map sidecar version.
 const FRAME_MAP_VERSION: u32 = 1;
+
+/// Attrs sidecar filename for incremental builds.
+const ATTRS_FILE: &str = "files.attrs";
+
+/// Magic for the attrs sidecar.
+const ATTRS_MAGIC: &[u8] = b"NATR";
+
+/// Attrs sidecar version.
+const ATTRS_VERSION: u32 = 1;
+
+/// Maximum size of the attrs sidecar (defensive cap).
+const MAX_ATTRS_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Defensive cap on the number of v2 frames (seek table entries).
 const MAX_FRAME_COUNT: usize = 1024 * 1024;
@@ -127,6 +141,10 @@ pub enum Error {
     /// Basename secondary index is missing or unreadable.
     #[error("secondary index: {0}")]
     SecondaryIndex(#[from] crate::basename_index::Error),
+
+    /// Path secondary index is missing or unreadable.
+    #[error("path index: {0}")]
+    PathIndex(#[from] crate::path_index::Error),
 }
 
 /// Convenience alias for this module.
@@ -146,6 +164,8 @@ pub struct Writer {
     boundaries: Vec<usize>,
     /// Optional basename index accumulated during `add`.
     basename_index: BasenameIndexBuilder,
+    /// Optional path index accumulated during `add`.
+    path_index: PathIndexBuilder,
     /// Open file handle for streaming frame writes.
     file: Option<File>,
     /// Compressed lengths of frames already written to `file`.
@@ -154,6 +174,8 @@ pub struct Writer {
     frame_map: Vec<u32>,
     /// Whether `finish` has already materialized the on-disk file.
     finished: bool,
+    /// Accumulated (attr, output, hash) triples for the attrs sidecar.
+    attrs: Vec<(String, String, String)>,
 }
 
 impl Drop for Writer {
@@ -202,10 +224,12 @@ impl Writer {
             raw: Vec::new(),
             boundaries: Vec::new(),
             basename_index: BasenameIndexBuilder::new(),
+            path_index: PathIndexBuilder::new(),
             file: Some(file),
             frame_lengths: Vec::new(),
             frame_map: Vec::new(),
             finished: false,
+            attrs: Vec::new(),
         })
     }
 
@@ -225,7 +249,10 @@ impl Writer {
 
         let label = format!("{}.{}", path.origin().attr, path.origin().output);
         let paths: Vec<Vec<u8>> = entries.iter().map(|e| e.path.clone()).collect();
-        self.basename_index.record_package(label, paths)?;
+        let ordinal = self.basename_index.record_package(label, paths.clone())?;
+
+        // Record full paths in the path index using the same ordinal
+        self.path_index.record_package(ordinal, paths)?;
 
         let mut package = Vec::new();
         let json = sonic_rs::to_vec(path).map_err(|err| Error::Json(err.to_string()))?;
@@ -237,6 +264,14 @@ impl Writer {
 
         self.raw.extend_from_slice(&package);
         self.boundaries.push(self.raw.len());
+
+        // Record (attr, output, hash) for the attrs sidecar.
+        self.attrs.push((
+            path.origin().attr.clone(),
+            path.origin().output.clone(),
+            path.hash().to_string(),
+        ));
+
         Ok(())
     }
 
@@ -374,6 +409,8 @@ impl Writer {
                     && !dir.as_os_str().is_empty()
                 {
                     self.basename_index.write_sidecars(dir)?;
+                    write_attrs_sidecar(dir, &self.attrs)?;
+                    self.path_index.write_sidecars(dir)?;
                 }
 
                 return Ok(size);
@@ -419,6 +456,8 @@ impl Writer {
         {
             write_frame_map(dir, &self.frame_map, self.frame_lengths.len())?;
             self.basename_index.write_sidecars(dir)?;
+            write_attrs_sidecar(dir, &self.attrs)?;
+            self.path_index.write_sidecars(dir)?;
         }
 
         Ok(size)
@@ -702,6 +741,52 @@ impl Reader {
             .map(std::string::ToString::to_string)
             .collect())
     }
+
+    /// Full-path lookup via the optional path secondary index.
+    ///
+    /// `path` is treated as a **full path** (e.g., `/bin/ls`). Returns package
+    /// ordinals that contain a file with that exact full path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PathIndex`] when sidecars are missing or corrupt.
+    pub fn query_path_ordinals(&self, path: &[u8]) -> Result<Vec<u32>> {
+        let dir = self
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| {
+                Error::PathIndex(crate::path_index::Error::Missing {
+                    dir: self.path.clone(),
+                    detail: "database path has no parent directory for sidecars".into(),
+                })
+            })?;
+        let index = PathIndex::open(dir)?;
+        Ok(index.lookup_path_ordinals(path)?)
+    }
+
+    /// Prefix lookup via the optional path secondary index.
+    ///
+    /// `prefix` is treated as a path prefix (e.g., `/bin/`). Returns package
+    /// ordinals that contain any file whose path starts with this prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PathIndex`] when sidecars are missing or corrupt.
+    pub fn query_prefix_ordinals(&self, prefix: &[u8]) -> Result<Vec<u32>> {
+        let dir = self
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| {
+                Error::PathIndex(crate::path_index::Error::Missing {
+                    dir: self.path.clone(),
+                    detail: "database path has no parent directory for sidecars".into(),
+                })
+            })?;
+        let index = PathIndex::open(dir)?;
+        Ok(index.lookup_prefix_ordinals(prefix)?)
+    }
 }
 
 fn parse_seek_table(data: &[u8], data_start: usize) -> Result<Vec<(usize, usize)>> {
@@ -873,6 +958,120 @@ fn read_frame_map(db_dir: &Path) -> Result<Vec<u32>> {
     Ok(ordinal_to_frame)
 }
 
+/// Write the attrs sidecar for incremental builds.
+fn write_attrs_sidecar(db_dir: &Path, attrs: &[(String, String, String)]) -> Result<()> {
+    let path = db_dir.join(ATTRS_FILE);
+    let mut file = File::create(&path)?;
+
+    let package_count = attrs.len();
+    file.write_all(ATTRS_MAGIC)?;
+    file.write_u32::<LittleEndian>(ATTRS_VERSION)?;
+    let package_count_u32 =
+        u32::try_from(package_count).map_err(|_| Error::Corrupt("package count overflow"))?;
+    file.write_u32::<LittleEndian>(package_count_u32)?;
+
+    for (attr, output, hash) in attrs {
+        write_length_prefixed_string(&mut file, attr)?;
+        write_length_prefixed_string(&mut file, output)?;
+        write_length_prefixed_string(&mut file, hash)?;
+    }
+
+    file.flush()?;
+    Ok(())
+}
+
+/// Read the attrs sidecar for incremental builds.
+///
+/// Returns `Ok(None)` if the file is missing or has an invalid magic/version.
+pub fn read_attrs_sidecar(db_dir: &Path) -> Result<Option<Vec<(String, String, String)>>> {
+    let path = db_dir.join(ATTRS_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+
+    // Reject oversized sidecar files immediately.
+    if bytes.len() > MAX_ATTRS_BYTES {
+        return Err(Error::Corrupt("attrs sidecar exceeds maximum size"));
+    }
+
+    if bytes.len() < ATTRS_MAGIC.len() + 8 {
+        return Ok(None);
+    }
+
+    let magic = bytes
+        .get(..ATTRS_MAGIC.len())
+        .ok_or(Error::Corrupt("attrs magic missing"))?;
+    if magic != ATTRS_MAGIC {
+        return Ok(None);
+    }
+
+    let version = read_u32_le(&bytes, ATTRS_MAGIC.len())?;
+    if version != ATTRS_VERSION {
+        return Ok(None);
+    }
+
+    let package_count = usize::try_from(read_u32_le(&bytes, ATTRS_MAGIC.len() + 4)?)
+        .map_err(|_| Error::Corrupt("package count overflow"))?;
+
+    // Validate package_count against remaining bytes (minimum 12 bytes per record: 3 * 4-byte length headers).
+    let remaining_bytes = bytes.len().saturating_sub(ATTRS_MAGIC.len() + 8);
+    let min_bytes_per_record = 12; // 3 length-prefixed strings, each with 4-byte header
+    if package_count > 0 && remaining_bytes / package_count < min_bytes_per_record {
+        return Err(Error::Corrupt(
+            "attrs sidecar package count exceeds remaining bytes",
+        ));
+    }
+
+    let mut attrs = Vec::with_capacity(package_count);
+    let mut offset = ATTRS_MAGIC.len() + 8;
+
+    for _ in 0..package_count {
+        let (attr, new_offset) = read_length_prefixed_string(&bytes, offset)?;
+        offset = new_offset;
+        let (output, new_offset) = read_length_prefixed_string(&bytes, offset)?;
+        offset = new_offset;
+        let (hash, new_offset) = read_length_prefixed_string(&bytes, offset)?;
+        offset = new_offset;
+        attrs.push((attr, output, hash));
+    }
+
+    if offset != bytes.len() {
+        return Err(Error::Corrupt("attrs sidecar has trailing data"));
+    }
+
+    Ok(Some(attrs))
+}
+
+/// Write a length-prefixed string (u32 LE length + UTF-8 bytes).
+fn write_length_prefixed_string<W: Write>(writer: &mut W, s: &str) -> Result<()> {
+    let bytes = s.as_bytes();
+    let len = u32::try_from(bytes.len()).map_err(|_| Error::Corrupt("string length overflow"))?;
+    writer.write_u32::<LittleEndian>(len)?;
+    writer.write_all(bytes)?;
+    Ok(())
+}
+
+/// Read a length-prefixed string from bytes at the given offset.
+///
+/// Returns `(string, new_offset)`.
+fn read_length_prefixed_string(bytes: &[u8], offset: usize) -> Result<(String, usize)> {
+    let len = usize::try_from(read_u32_le(bytes, offset)?)
+        .map_err(|_| Error::Corrupt("string length overflow"))?;
+    let string_start = offset + 4;
+    let string_end = string_start
+        .checked_add(len)
+        .ok_or(Error::Corrupt("string end overflow"))?;
+    let string_bytes = bytes
+        .get(string_start..string_end)
+        .ok_or(Error::Corrupt("string slice out of range"))?;
+    let string = std::str::from_utf8(string_bytes)
+        .map_err(|_| Error::Corrupt("string not valid UTF-8"))?
+        .to_string();
+    Ok((string, string_end))
+}
+
 /// Compute frame_starts: for each frame, the first package ordinal in that frame.
 fn compute_frame_starts(frame_map: &[u32], frame_count: usize) -> Vec<u32> {
     let mut frame_starts = vec![u32::MAX; frame_count];
@@ -1038,6 +1237,10 @@ pub struct SearchOptions<'a> {
     pub package_pattern: Option<String>,
     /// Exact basename (final path component) to look up via the FST sidecar.
     pub exact_basename: Option<String>,
+    /// Exact full path to look up via the path index sidecar.
+    pub exact_path: Option<String>,
+    /// Path prefix to look up via the path index sidecar.
+    pub path_prefix: Option<String>,
     /// File-type filter (empty means "all types").
     pub file_type: &'a [FileType],
     /// Output formatting mode.
@@ -1075,6 +1278,74 @@ fn resolve_package_ordinals(
             None
         }
     }
+}
+
+/// Resolve the set of candidate package ordinals from the path secondary index.
+///
+/// Tries exact path lookup first, then prefix lookup. Errors are logged and
+/// treated as a full-scan fallback; `None` is returned when there are no sidecar candidates.
+#[allow(clippy::cognitive_complexity)]
+fn resolve_path_ordinals(
+    index_file: &Path,
+    exact_path: Option<&str>,
+    path_prefix: Option<&str>,
+) -> Option<RoaringBitmap> {
+    let dir = index_file.parent()?;
+    if dir.as_os_str().is_empty() {
+        return None;
+    }
+
+    let index = match PathIndex::open(dir) {
+        Ok(idx) => idx,
+        Err(err) => {
+            if path_sidecars_exist(dir) {
+                tracing::warn!(%err, "path index sidecars unreadable; falling back to full scan");
+            }
+            return None;
+        }
+    };
+
+    // Try exact path lookup first
+    if let Some(path) = exact_path {
+        match index.lookup_path_ordinals(path.as_bytes()) {
+            Ok(ordinals) => {
+                return Some(ordinals.into_iter().collect());
+            }
+            Err(err) => {
+                if path_sidecars_exist(dir) {
+                    tracing::warn!(%err, "path index exact lookup failed; falling back to full scan");
+                }
+                return None;
+            }
+        }
+    }
+
+    // Try prefix lookup
+    if let Some(prefix) = path_prefix {
+        match index.lookup_prefix_ordinals(prefix.as_bytes()) {
+            Ok(ordinals) => {
+                return Some(ordinals.into_iter().collect());
+            }
+            Err(err) => {
+                if path_sidecars_exist(dir) {
+                    tracing::warn!(%err, "path index prefix lookup failed; falling back to full scan");
+                }
+                return None;
+            }
+        }
+    }
+
+    None
+}
+
+/// Check if path index sidecars exist in the directory.
+fn path_sidecars_exist(dir: &Path) -> bool {
+    [
+        crate::path_index::FST_FILE,
+        crate::path_index::POSTINGS_FILE,
+    ]
+    .iter()
+    .any(|name| dir.join(name).is_file())
 }
 
 /// Format the `attr.output` label for a result, wrapping non-toplevels in parentheses.
@@ -1206,7 +1477,28 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
         None => None,
     };
 
-    let package_ordinals = resolve_package_ordinals(&index_file, options.exact_basename.as_deref());
+    // Resolve ordinals from basename index (for exact basename queries)
+    let basename_ordinals =
+        resolve_package_ordinals(&index_file, options.exact_basename.as_deref());
+
+    // Resolve ordinals from path index (for rooted/prefix queries)
+    let path_ordinals = resolve_path_ordinals(
+        &index_file,
+        options.exact_path.as_deref(),
+        options.path_prefix.as_deref(),
+    );
+
+    // Combine ordinals from both sources if both are present
+    let package_ordinals: Option<RoaringBitmap> = match (basename_ordinals, path_ordinals) {
+        (Some(b), Some(p)) => {
+            let combined = b | &p;
+            Some(combined)
+        }
+        (Some(b), None) => Some(b),
+        (None, Some(p)) => Some(p),
+        (None, None) => None,
+    };
+
     if package_ordinals
         .as_ref()
         .is_some_and(RoaringBitmap::is_empty)
@@ -1244,6 +1536,119 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
                 &store_path,
                 &entry,
             );
+        }
+    }
+
+    Ok(())
+}
+
+/// Generate nixdex sidecars for an existing NIXI database.
+///
+/// Reads the `files` database at `db_path`, extracts all package basenames,
+/// and writes the sidecar files (`files.basename.fst`, `files.basename.postings`,
+/// `files.packages.names`, `files.frame_map`) to the same directory.
+///
+/// This enables fast basename lookups via `BasenameIndex` for prebuilt indexes
+/// downloaded from upstream nix-index-database releases.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be read, sidecars cannot be written,
+/// or the database is corrupt.
+pub fn generate_sidecars(db_path: &Path) -> Result<()> {
+    let reader = Reader::open(db_path)?;
+    let db_dir = db_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or(Error::Corrupt("database path has no parent directory"))?;
+
+    // Scan all frames to extract package paths and build the basename index.
+    let mut builder = BasenameIndexBuilder::new();
+    let mut all_package_labels: Vec<String> = Vec::new();
+
+    for (offset, len) in &reader.frames {
+        let start = *offset;
+        let end = start + len;
+        let compressed = reader
+            .data
+            .get(start..end)
+            .ok_or(Error::Corrupt("frame slice out of range"))?;
+
+        let raw = if compressed.is_empty() {
+            Vec::new()
+        } else {
+            crate::bounded_zstd_decode(compressed, crate::MAX_ZSTD_FRAME_BYTES)
+                .map_err(Error::Io)?
+        };
+
+        scan_frame_for_packages(&raw, &mut builder, &mut all_package_labels)?;
+    }
+
+    // Write basename sidecars.
+    builder
+        .write_sidecars(db_dir)
+        .map_err(Error::SecondaryIndex)?;
+
+    // Write frame_map sidecar if we have v2 frame data.
+    if let (Some(frame_map), Some(_frame_starts)) = (&reader.frame_map, &reader.frame_starts) {
+        write_frame_map(db_dir, frame_map, reader.frames.len())?;
+    }
+
+    tracing::info!(
+        db_path = %db_path.display(),
+        packages = all_package_labels.len(),
+        "generated nixdex sidecars"
+    );
+
+    Ok(())
+}
+
+/// Scan a single frame's frcode data to extract package paths.
+fn scan_frame_for_packages(
+    raw: &[u8],
+    builder: &mut BasenameIndexBuilder,
+    all_package_labels: &mut Vec<String>,
+) -> Result<()> {
+    let mut decoder = frcode::Decoder::new(std::io::Cursor::new(raw));
+    let mut current_paths: Vec<Vec<u8>> = Vec::new();
+
+    loop {
+        let block = decoder.decode()?;
+        if block.is_empty() {
+            break;
+        }
+
+        for line in block.split(|c| *c == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+
+            if line.starts_with(b"p\0") {
+                // Package footer: record accumulated paths and reset.
+                if !current_paths.is_empty() {
+                    let json = line.get(2..).ok_or_else(|| Error::StorePathParse {
+                        path: line.to_vec(),
+                    })?;
+                    let pkg: StorePath =
+                        sonic_rs::from_slice(json).map_err(|_| Error::StorePathParse {
+                            path: json.to_vec(),
+                        })?;
+                    let label = format!("{}.{}", pkg.origin().attr, pkg.origin().output);
+                    all_package_labels.push(label.clone());
+                    builder
+                        .record_package(label, current_paths.clone())
+                        .map_err(Error::SecondaryIndex)?;
+                    current_paths.clear();
+                }
+            } else {
+                // File entry: extract path.
+                let sep = memchr::memchr(b'\0', line).ok_or_else(|| Error::EntryParse {
+                    entry: line.to_vec(),
+                })?;
+                if let Some(path) = line.get(sep + 1..) {
+                    current_paths.push(path.to_vec());
+                }
+            }
         }
     }
 
@@ -1338,6 +1743,8 @@ mod tests {
             hash: None,
             package_pattern: None,
             exact_basename: None,
+            exact_path: None,
+            path_prefix: None,
             file_type: &[],
             mode: SearchMode::Minimal,
         };
@@ -1424,6 +1831,69 @@ mod tests {
 
         let none = reader.query_fst("missing-binary").expect("missing");
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn writer_builds_path_index_queryable_by_full_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+
+        let hello = sample_store_path();
+        let hello_tree = sample_tree();
+        let coreutils = StorePath::new(
+            "/nix/store".into(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            "coreutils-9.11".into(),
+            Origin {
+                attr: "coreutils".into(),
+                output: "out".into(),
+                toplevel: true,
+                system: Some("x86_64-linux".into()),
+            },
+        );
+        let coreutils_tree = FileTree::directory(vec![(
+            Bytes::from_static(b"bin"),
+            FileTree::directory(vec![
+                (Bytes::from_static(b"ls"), FileTree::regular(0, true)),
+                (Bytes::from_static(b"cat"), FileTree::regular(0, true)),
+            ]),
+        )]);
+
+        {
+            let mut writer = Writer::create(&db_path, 3).expect("create");
+            writer.add(&hello, &hello_tree, b"").expect("add hello");
+            writer
+                .add(&coreutils, &coreutils_tree, b"")
+                .expect("add coreutils");
+            writer.finish().expect("finish");
+        }
+
+        assert!(dir.path().join("files.path.fst").is_file());
+        assert!(dir.path().join("files.path.postings").is_file());
+
+        let reader = Reader::open(&db_path).expect("reader");
+
+        // Test exact path lookup
+        let mut ls_ordinals = reader
+            .query_path_ordinals(b"/bin/ls")
+            .expect("query /bin/ls");
+        ls_ordinals.sort();
+        assert_eq!(ls_ordinals, vec![1]); // coreutils only
+
+        let hello_ordinals = reader
+            .query_path_ordinals(b"/bin/hello")
+            .expect("query /bin/hello");
+        assert_eq!(hello_ordinals, vec![0]); // hello only
+
+        // Test prefix lookup
+        let mut bin_ordinals = reader
+            .query_prefix_ordinals(b"/bin/")
+            .expect("query /bin/ prefix");
+        bin_ordinals.sort();
+        assert_eq!(bin_ordinals, vec![0, 1]); // both have files under /bin
+
+        let missing = reader.query_path_ordinals(b"/bin/nope").expect("missing");
+        assert!(missing.is_empty());
     }
 
     #[test]
