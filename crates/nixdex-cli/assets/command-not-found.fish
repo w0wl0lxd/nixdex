@@ -19,9 +19,9 @@ function __fish_command_not_found_handler --on-event fish_command_not_found
     end
 
     if test -n "$db"
-        @out@/bin/nixdex command-not-found --db "$db" $argv[1]
+        @out@/bin/nixdex command-not-found --db "$db" $argv
     else
-        @out@/bin/nixdex command-not-found $argv[1]
+        @out@/bin/nixdex command-not-found $argv
     end
     return $status
 end
