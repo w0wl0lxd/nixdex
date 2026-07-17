@@ -52,6 +52,22 @@ impl FromStr for SearchField {
     }
 }
 
+#[cfg(feature = "cli")]
+impl clap::ValueEnum for SearchField {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Self::Attr, Self::Description, Self::MainProgram, Self::Both]
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(match self {
+            Self::Attr => clap::builder::PossibleValue::new("attr"),
+            Self::Description => clap::builder::PossibleValue::new("description"),
+            Self::MainProgram => clap::builder::PossibleValue::new("main-program"),
+            Self::Both => clap::builder::PossibleValue::new("both"),
+        })
+    }
+}
+
 /// In-memory package metadata search index.
 ///
 /// Backed by the `packages.json` NDJSON sidecar produced during `nix-index`.
