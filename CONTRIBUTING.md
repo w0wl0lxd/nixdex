@@ -130,10 +130,33 @@ Scaffold templates may still embed `AGENTS.md` / `CLAUDE.md` **inside** template
 trees (e.g. `research/ (local dumps gitignored)`) — those are product output,
 not repo agent config.
 
+## Changelog
+
+Every PR that changes user-facing behavior, public API, build, CI, or
+dependencies must add a fragment under `changelog.d/` unless it is explicitly
+exempt (docs-only, comment-only, generated-code-only, or history-only).
+
+Fragment format:
+
+- File name: `<identifier>.<section>.md`
+- `<section>` is one of: `added`, `changed`, `deprecated`, `removed`, `fixed`, `security`
+- Content: one or more bullet lines starting with `- `
+
+Example: `changelog.d/cli-locate-sort.added.md`
+
+```markdown
+- `nix-locate` supports `--sort name` to order results by package name.
+```
+
+Run `just changelog` to regenerate `CHANGELOG.md` from fragments.
+Run `just changelog-check` to validate fragments and confirm one was added on
+the current branch.
+
 ## Verification before opening a PR
 
 ```bash
 just setup-hooks   # once
 just secrets
-just validate      # fmt + check + clippy + test
+just changelog
+just validate      # fmt + check + clippy + test + changelog-check
 ```

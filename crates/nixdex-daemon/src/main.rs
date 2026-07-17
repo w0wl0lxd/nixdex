@@ -19,7 +19,7 @@ struct Args {
     release_url: String,
 
     /// Architecture identifier (e.g., x86_64-linux).
-    #[arg(long, default_value = "x86_64-linux")]
+    #[arg(long, default_value_t = nixdex_core::prebuilt::default_architecture())]
     architecture: String,
 
     /// Use the -small variant of the prebuilt index.
@@ -31,12 +31,19 @@ struct Args {
     cache_dir: Option<PathBuf>,
 
     /// Refresh interval in seconds.
-    #[arg(long, default_value = "3600")]
+    #[arg(long, default_value = "3600", value_parser = clap::value_parser!(u64).range(1..))]
     interval: u64,
 
     /// HTTP server listen address.
     #[arg(long, default_value = "127.0.0.1:3750")]
     http_addr: String,
+
+    /// Serve an existing local index directory instead of downloading a prebuilt index.
+    ///
+    /// The directory must contain a NIXI `files` database. Sidecar files
+    /// (`files.basename.*`, `packages.json`) are loaded if present.
+    #[arg(long)]
+    database: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -63,6 +70,8 @@ async fn main() -> color_eyre::Result<()> {
     let config = nixdex_core::daemon::DaemonConfig {
         prebuilt: prebuilt_config,
         http_addr: args.http_addr,
+        local_database: args.database,
+        local_refresh_interval: Duration::from_secs(args.interval),
     };
 
     match nixdex_core::daemon::run(&config).await {

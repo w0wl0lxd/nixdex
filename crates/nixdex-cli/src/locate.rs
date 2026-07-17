@@ -2,13 +2,14 @@
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::OnceLock;
 
 use clap::Parser;
 use color_eyre::eyre::WrapErr;
 use tracing_subscriber::EnvFilter;
 
-use nixdex_core::database::{SearchMode, SearchOptions};
+use nixdex_core::database::{SearchMode, SearchOptions, SearchSort};
 use nixdex_core::{ALL_FILE_TYPES, FileType};
 
 /// Resolve the default nix-index database directory.
@@ -32,9 +33,38 @@ pub enum Color {
     Auto,
 }
 
+const LONG_USAGE: &str = r"How to use
+==========
+
+In the simplest case, just run `nix-locate part/of/file/path` to search for all packages that contain
+a file matching that path:
+
+    $ nix-locate 'bin/firefox'
+    ...all packages containing a file named 'bin/firefox'
+
+Before using this tool, you first need to generate a nix-index database.
+Use the `nix-index` tool to do that.
+
+Limitations
+===========
+
+* This tool can only find packages which are built by hydra, because only those packages
+  will have file listings that are indexed by nix-index.
+
+* We can't know the precise attribute path for every package, so if you see the syntax `(attr)`
+  in the output, that means that `attr` is not the target package but that it
+  depends (perhaps indirectly) on the package that contains the searched file. Example:
+
+      $ nix-locate 'bin/xmonad'
+      (xmonad-with-packages.out)      0 s /nix/store/nl581g5kv3m2xnmmfgb678n91d7ll4vv-ghc-8.0.2-with-packages/bin/xmonad
+
+  This means that we don't know what nixpkgs attribute produces /nix/store/nl581g5kv3m2xnmmfgb678n91d7ll4vv-ghc-8.0.2-with-packages,
+  but we know that `xmonad-with-packages.out` requires it.
+";
+
 /// Quickly finds the derivation providing a certain file.
 #[derive(Debug, Parser)]
-#[command(name = "nix-locate", author, about, version)]
+#[command(name = "nix-locate", author, about, version, after_long_help = LONG_USAGE)]
 pub struct Opts {
     /// Pattern for which to search.
     #[arg(value_name = "PATTERN")]
@@ -62,7 +92,10 @@ pub struct Opts {
 
     /// Only print matches for files that have this type.
     ///
-    /// Options: `(r)egular`, `e(x)ecutable`, `(d)irectory`, `(s)ymlink`.
+    /// If the option is given multiple times, a file will be printed if it has
+    /// any of the given types.
+    ///
+    /// Options: `(r)egular file`, `e(x)ecutable`, `(d)irectory`, `(s)ymlink`.
     #[arg(short, long = "type", value_parser = clap::value_parser!(FileType))]
     pub r#type: Option<Vec<FileType>>,
 
@@ -85,6 +118,35 @@ pub struct Opts {
     /// Only print attribute names of found files or directories.
     #[arg(long)]
     pub minimal: bool,
+
+    /// Output results as one JSON object per line instead of the default
+    /// human-readable format.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Maximum number of results to print.
+    #[arg(short, long)]
+    pub limit: Option<usize>,
+
+    /// Print the number of matches instead of the matches themselves.
+    #[arg(long)]
+    pub count: bool,
+
+    /// Sort results: `size`, `size-asc`, `size-desc`, or `attr`/`attr-asc`.
+    #[arg(long)]
+    pub sort: Option<String>,
+
+    /// Only print files with size >= MIN_SIZE bytes.
+    #[arg(long)]
+    pub min_size: Option<u64>,
+
+    /// Only print files with size <= MAX_SIZE bytes.
+    #[arg(long)]
+    pub max_size: Option<u64>,
+
+    /// Exclude results from FHS-style packages (`-fhs` / `-usr-target`).
+    #[arg(long)]
+    pub exclude_fhs: bool,
 }
 
 /// Processed form of the CLI options ready for the core search API.
@@ -98,9 +160,16 @@ struct ProcessedArgs {
     path_prefix: Option<String>,
     file_type: Vec<FileType>,
     mode: SearchMode,
+    json: bool,
+    limit: Option<usize>,
+    count: bool,
+    sort: nixdex_core::database::SearchSort,
+    min_size: Option<u64>,
+    max_size: Option<u64>,
+    exclude_fhs: bool,
 }
 
-fn process_args(matches: Opts) -> ProcessedArgs {
+fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
     let start_anchor = if matches.at_root { "^" } else { "" };
     let end_anchor = if matches.whole_name { "$" } else { "" };
     let as_regex = matches.regex;
@@ -123,22 +192,19 @@ fn process_args(matches: Opts) -> ProcessedArgs {
     // Determine if we can use the path index for rooted/prefix queries
     let (exact_path, path_prefix) =
         if !matches.regex && matches.at_root && !matches.pattern.is_empty() {
-            let pattern_bytes = matches.pattern.as_bytes();
-            if pattern_bytes.starts_with(b"/") {
-                // For --at-root with a full path like "/bin/ls", try exact path lookup
-                if matches.whole_name {
-                    // Pattern is anchored at end too, so it's an exact full path
-                    (Some(matches.pattern.clone()), None)
-                } else {
-                    // Pattern starts with "/" but may be a prefix; use prefix lookup
-                    (None, Some(matches.pattern.clone()))
-                }
-            } else if matches.pattern.contains('/') {
-                // Pattern contains "/" but doesn't start with it; treat as prefix
-                (None, Some(format!("/{}", matches.pattern)))
+            // Normalize the pattern to ensure it starts with "/" for path index lookups
+            let normalized = if matches.pattern.starts_with('/') {
+                matches.pattern.clone()
             } else {
-                // No "/" in pattern, can't use path index
-                (None, None)
+                format!("/{}", matches.pattern)
+            };
+
+            if matches.whole_name {
+                // Pattern is anchored at end too, so it's an exact full path
+                (Some(normalized), None)
+            } else {
+                // Pattern may be a prefix; use prefix lookup
+                (None, Some(normalized))
             }
         } else {
             (None, None)
@@ -181,7 +247,13 @@ fn process_args(matches: Opts) -> ProcessedArgs {
         }
     };
 
-    ProcessedArgs {
+    let sort = match matches.sort {
+        Some(s) => SearchSort::from_str(&s)
+            .map_err(|err| color_eyre::eyre::eyre!("invalid --sort value '{s}': {err}"))?,
+        None => SearchSort::None,
+    };
+
+    Ok(ProcessedArgs {
         database: matches.database,
         pattern,
         hash: matches.hash,
@@ -191,7 +263,14 @@ fn process_args(matches: Opts) -> ProcessedArgs {
         path_prefix,
         file_type,
         mode,
-    }
+        json: matches.json,
+        limit: matches.limit,
+        count: matches.count,
+        sort,
+        min_size: matches.min_size,
+        max_size: matches.max_size,
+        exclude_fhs: matches.exclude_fhs,
+    })
 }
 
 /// Run a file lookup against the nixdex database.
@@ -201,7 +280,7 @@ pub fn run(matches: Opts) -> color_eyre::Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .try_init();
 
-    let args = process_args(matches);
+    let args = process_args(matches)?;
 
     let options = SearchOptions {
         database: args.database,
@@ -213,6 +292,13 @@ pub fn run(matches: Opts) -> color_eyre::Result<()> {
         path_prefix: args.path_prefix,
         file_type: &args.file_type,
         mode: args.mode,
+        json: args.json,
+        limit: args.limit,
+        count: args.count,
+        sort: args.sort,
+        min_size: args.min_size,
+        max_size: args.max_size,
+        exclude_fhs: args.exclude_fhs,
     };
 
     nixdex_core::search_database(&options).wrap_err("nix-locate failed")?;
