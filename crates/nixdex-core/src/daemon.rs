@@ -9,6 +9,12 @@ use crate::errors::Result;
 use crate::prebuilt::{self, PrebuiltConfig};
 use indexmap::IndexSet;
 
+/// Maximum length (in bytes) of an HTTP query pattern.
+const MAX_PATTERN_BYTES: usize = 1024;
+
+/// Maximum number of results returned by daemon endpoints.
+const MAX_RESULT_LIMIT: usize = 10_000;
+
 #[cfg(feature = "daemon")]
 use axum::{
     Router,
@@ -486,18 +492,41 @@ struct LocateResponse {
 async fn nix_locate_handler(
     State(index_state): State<Arc<IndexState>>,
     axum::extract::Query(params): axum::extract::Query<NixLocateParams>,
-) -> std::result::Result<axum::Json<NixLocateResponse>, axum::http::StatusCode> {
+) -> std::result::Result<
+    axum::Json<NixLocateResponse>,
+    (axum::http::StatusCode, axum::Json<ErrorResponse>),
+> {
     index_state.requests_total.fetch_add(1, Ordering::Relaxed);
 
+    if params.pattern.len() > MAX_PATTERN_BYTES {
+        return Err(json_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("pattern exceeds maximum length of {MAX_PATTERN_BYTES} bytes"),
+        ));
+    }
+
+    if let Some(limit) = params.limit
+        && limit > MAX_RESULT_LIMIT
+    {
+        return Err(json_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("limit must be at most {MAX_RESULT_LIMIT}"),
+        ));
+    }
+
     let database_dir = {
-        let guard = index_state
-            .database_dir
-            .read()
-            .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-        guard
-            .as_ref()
-            .cloned()
-            .ok_or(axum::http::StatusCode::SERVICE_UNAVAILABLE)?
+        let guard = index_state.database_dir.read().map_err(|_| {
+            json_error(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to read database state",
+            )
+        })?;
+        guard.as_ref().cloned().ok_or_else(|| {
+            json_error(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "no database loaded",
+            )
+        })?
     };
 
     // Build the path regex with anchors based on at_root/whole_name.
@@ -575,7 +604,7 @@ async fn nix_locate_handler(
             mode: crate::database::SearchMode::Full {
                 color: false,
                 group: false,
-                only_toplevel: false,
+                only_toplevel: !params.all,
             },
             json: false,
             limit: None,
@@ -595,9 +624,14 @@ async fn nix_locate_handler(
     let results = match search_task.await {
         Ok(Ok(results)) => results,
         Ok(Err(err)) if err.starts_with("bad_request:") => {
-            return Err(axum::http::StatusCode::BAD_REQUEST);
+            return Err(json_error(axum::http::StatusCode::BAD_REQUEST, err));
         }
-        _ => return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
+        _ => {
+            return Err(json_error(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "search failed",
+            ));
+        }
     };
 
     // Convert results to JSON response.
@@ -730,6 +764,8 @@ struct NixLocateParams {
     #[serde(default, rename = "type", deserialize_with = "deserialize_file_types")]
     file_type: Vec<String>,
     #[serde(default)]
+    all: bool,
+    #[serde(default)]
     limit: Option<usize>,
     #[serde(default)]
     count: bool,
@@ -741,6 +777,25 @@ struct NixLocateParams {
     max_size: Option<u64>,
     #[serde(default)]
     exclude_fhs: bool,
+}
+
+#[cfg(feature = "daemon")]
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+#[cfg(feature = "daemon")]
+fn json_error(
+    status: axum::http::StatusCode,
+    message: impl Into<String>,
+) -> (axum::http::StatusCode, axum::Json<ErrorResponse>) {
+    (
+        status,
+        axum::Json(ErrorResponse {
+            error: message.into(),
+        }),
+    )
 }
 
 #[cfg(feature = "daemon")]
@@ -789,12 +844,13 @@ async fn health_handler(State(index_state): State<Arc<IndexState>>) -> axum::Jso
     index_state.requests_total.fetch_add(1, Ordering::Relaxed);
     let index_loaded = matches!(index_state.basename.read(), Ok(g) if g.is_some());
     let package_db_loaded = matches!(index_state.package_db.read(), Ok(g) if g.is_some());
-    let package_count = index_state
-        .reader
-        .read()
-        .ok()
-        .and_then(|g| g.as_ref().map(|r| r.package_count()))
-        .flatten();
+    let package_count = match index_state.reader.read() {
+        Ok(g) => g.as_ref().and_then(|r| r.package_count()),
+        Err(err) => {
+            tracing::warn!(error = %err, "reader lock poisoned in health check");
+            None
+        }
+    };
 
     axum::Json(HealthResponse {
         status: "ok",
@@ -880,44 +936,63 @@ struct SearchParams {
 async fn search_handler(
     State(index_state): State<Arc<IndexState>>,
     axum::extract::Query(params): axum::extract::Query<SearchParams>,
-) -> axum::Json<SearchResponse> {
+) -> std::result::Result<
+    axum::Json<SearchResponse>,
+    (axum::http::StatusCode, axum::Json<ErrorResponse>),
+> {
     index_state.requests_total.fetch_add(1, Ordering::Relaxed);
+
+    if params.pattern.len() > MAX_PATTERN_BYTES {
+        return Err(json_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("pattern exceeds maximum length of {MAX_PATTERN_BYTES} bytes"),
+        ));
+    }
+
+    if let Some(limit) = params.limit
+        && limit > MAX_RESULT_LIMIT
+    {
+        return Err(json_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("limit must be at most {MAX_RESULT_LIMIT}"),
+        ));
+    }
+
     let db = {
         let Ok(guard) = index_state.package_db.read() else {
-            return axum::Json(SearchResponse {
-                count: None,
-                names: None,
-                results: Vec::new(),
-            });
+            return Err(json_error(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to read package database state",
+            ));
         };
         guard.as_ref().map(Arc::clone)
     };
 
     let Some(db) = db else {
-        return axum::Json(SearchResponse {
-            count: None,
-            names: None,
-            results: Vec::new(),
-        });
+        return Err(json_error(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "no package database loaded",
+        ));
     };
 
-    let Ok(field) = crate::package_search::SearchField::from_str(&params.field) else {
-        return axum::Json(SearchResponse {
-            count: None,
-            names: None,
-            results: Vec::new(),
-        });
+    let field = match crate::package_search::SearchField::from_str(&params.field) {
+        Ok(f) => f,
+        Err(err) => {
+            return Err(json_error(
+                axum::http::StatusCode::BAD_REQUEST,
+                err.to_string(),
+            ));
+        }
     };
 
     let matched = if params.fuzzy {
         match db.search_fuzzy(&params.pattern, field, params.case_sensitive, params.limit) {
             Ok(m) => m,
-            Err(_) => {
-                return axum::Json(SearchResponse {
-                    count: None,
-                    names: None,
-                    results: Vec::new(),
-                });
+            Err(err) => {
+                return Err(json_error(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    err.to_string(),
+                ));
             }
         }
     } else {
@@ -930,22 +1005,21 @@ async fn search_handler(
             params.limit,
         ) {
             Ok(m) => m,
-            Err(_) => {
-                return axum::Json(SearchResponse {
-                    count: None,
-                    names: None,
-                    results: Vec::new(),
-                });
+            Err(err) => {
+                return Err(json_error(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    err.to_string(),
+                ));
             }
         }
     };
 
     if params.count {
-        return axum::Json(SearchResponse {
+        return Ok(axum::Json(SearchResponse {
             count: Some(matched.len()),
             names: None,
             results: Vec::new(),
-        });
+        }));
     }
 
     if params.name_only {
@@ -953,20 +1027,20 @@ async fn search_handler(
             .into_iter()
             .map(|record| record.attr.clone())
             .collect();
-        return axum::Json(SearchResponse {
+        return Ok(axum::Json(SearchResponse {
             count: None,
             names: Some(names),
             results: Vec::new(),
-        });
+        }));
     }
 
     let results = matched.into_iter().cloned().collect();
 
-    axum::Json(SearchResponse {
+    Ok(axum::Json(SearchResponse {
         count: None,
         names: None,
         results,
-    })
+    }))
 }
 
 /// Response for `/search`.
