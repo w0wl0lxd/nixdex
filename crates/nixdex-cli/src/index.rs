@@ -45,6 +45,14 @@ pub struct Args {
     #[arg(short = 'r', long = "requests", default_value = "100", value_parser = parse_jobs)]
     pub jobs: usize,
 
+    /// HTTP request timeout in seconds.
+    #[arg(long, default_value = "30", value_parser = clap::value_parser!(u64).range(1..))]
+    pub timeout: u64,
+
+    /// Number of retries for transient HTTP failures.
+    #[arg(long, default_value = "4", value_parser = clap::value_parser!(u32).range(0..=20))]
+    pub retries: u32,
+
     /// Directory where the index is stored.
     #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
     pub database: PathBuf,
@@ -224,6 +232,8 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
 
     let options = nixdex_core::index::UpdateOptions {
         jobs: args.jobs,
+        timeout: args.timeout,
+        retries: args.retries,
         database: args.database,
         nixpkgs: args.nixpkgs,
         system: args.system,

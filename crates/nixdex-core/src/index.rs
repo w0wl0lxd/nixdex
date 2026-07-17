@@ -50,6 +50,10 @@ struct WriteListingsContext<'a> {
 pub struct UpdateOptions {
     /// Number of concurrent HTTP requests.
     pub jobs: usize,
+    /// Per-request HTTP timeout in seconds.
+    pub timeout: u64,
+    /// Maximum number of retries for transient HTTP failures.
+    pub retries: u32,
     /// Directory where the index database is stored.
     pub database: PathBuf,
     /// nixpkgs path/expression (for example `<nixpkgs>`).
@@ -102,6 +106,8 @@ impl Default for UpdateOptions {
     fn default() -> Self {
         Self {
             jobs: 100,
+            timeout: 30,
+            retries: 4,
             database: PathBuf::from("/tmp/nix-index"),
             nixpkgs: String::from("<nixpkgs>"),
             system: None,
@@ -324,11 +330,16 @@ impl IndexBuilder {
 
     /// Build a fresh binary-cache fetcher.
     fn new_fetcher(&self) -> Result<Fetcher> {
-        Fetcher::new(&self.options.cache_url).map_err(|err| {
-            Error::Io(std::io::Error::other(format!(
-                "failed to create binary-cache client: {err}"
-            )))
-        })
+        use std::time::Duration;
+        Fetcher::builder(&self.options.cache_url)
+            .timeout(Duration::from_secs(self.options.timeout))
+            .max_attempts(self.options.retries.saturating_add(1))
+            .build()
+            .map_err(|err| {
+                Error::Io(std::io::Error::other(format!(
+                    "failed to create binary-cache client: {err}"
+                )))
+            })
     }
 
     /// Await the eval stream task and translate errors into the workspace type.
@@ -671,6 +682,8 @@ mod tests {
             .expect("write fixture");
         let opts = UpdateOptions {
             jobs: 4,
+            timeout: 30,
+            retries: 4,
             database: dir.path().to_path_buf(),
             nixpkgs: nixpkgs_file.to_string_lossy().into_owned(),
             system: None,
