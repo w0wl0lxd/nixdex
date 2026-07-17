@@ -530,7 +530,10 @@ fn find_command_providers(
 
     let mut providers: Vec<String> = results
         .into_iter()
-        .filter(|(_, entry)| entry.node.is_executable())
+        .filter(|(_, entry)| {
+            entry.node.is_executable()
+                || matches!(entry.node, nixdex_core::files::FileNode::Symlink { .. })
+        })
         .map(|(store_path, _)| format_which_attr(&store_path))
         .collect();
 
