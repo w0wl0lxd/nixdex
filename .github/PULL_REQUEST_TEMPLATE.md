@@ -21,6 +21,7 @@
 - [ ] `cargo check --all-features`
 - [ ] `cargo clippy --all-features -- -D warnings`
 - [ ] `cargo nextest run --workspace --no-fail-fast`
+- [ ] Added a `changelog.d/<identifier>.<section>.md` fragment (or marked exempt)
 
 ## Notes
 

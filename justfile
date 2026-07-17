@@ -40,7 +40,13 @@ secrets:
       exit 1
     fi
 
-validate: secrets fmt check clippy test
+changelog:
+    python3 scripts/changelog.py collect
+
+changelog-check:
+    python3 scripts/changelog.py check --base origin/main
+
+validate: secrets fmt check clippy test changelog-check
 
 benchmark:
     cargo bench --bench search
