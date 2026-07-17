@@ -6,9 +6,10 @@ use std::process::Stdio;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::process::{ChildStderr, Command};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use crate::listings::PackageEntry;
 use crate::store_path::{Origin, StorePath};
@@ -430,10 +431,14 @@ pub async fn run_eval_jobs(options: &EvalJobsOptions<'_>) -> Result<EvalJobsStre
         .stdout
         .take()
         .ok_or_else(|| Error::Evaluation("nix-eval-jobs produced no stdout pipe".to_string()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| Error::Evaluation("nix-eval-jobs produced no stderr pipe".to_string()))?;
 
     let (tx, rx) = mpsc::channel(1024);
 
-    let handle = tokio::spawn(async move {
+    let stdout_handle = tokio::spawn(async move {
         let reader = BufReader::new(stdout);
         let mut lines = reader.lines();
         let mut records = 0usize;
@@ -466,7 +471,47 @@ pub async fn run_eval_jobs(options: &EvalJobsOptions<'_>) -> Result<EvalJobsStre
         Ok(())
     });
 
+    let stderr_handle = spawn_stderr_reader(stderr);
+    let handle =
+        tokio::spawn(async move { combine_eval_results(stdout_handle, stderr_handle).await });
+
     Ok(EvalJobsStream { rx, handle })
+}
+
+/// Spawn a task that drains the `nix-eval-jobs` stderr pipe into a string.
+fn spawn_stderr_reader(stderr: ChildStderr) -> JoinHandle<String> {
+    tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let mut reader = BufReader::new(stderr);
+        let _ = AsyncReadExt::read_to_end(&mut reader, &mut buf).await;
+        String::from_utf8_lossy(&buf).into_owned()
+    })
+}
+
+/// Combine the stdout reader result with captured stderr for clearer errors.
+async fn combine_eval_results(
+    stdout_handle: JoinHandle<Result<()>>,
+    stderr_handle: JoinHandle<String>,
+) -> Result<()> {
+    let (stdout_result, stderr_result) = tokio::join!(stdout_handle, stderr_handle);
+    let stderr_text = match stderr_result {
+        Ok(text) => text,
+        Err(err) => format!("stderr reader task panicked: {err}"),
+    };
+    match stdout_result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => {
+            let suffix = if stderr_text.trim().is_empty() {
+                String::new()
+            } else {
+                format!("\nnix-eval-jobs stderr:\n{stderr_text}")
+            };
+            Err(Error::Evaluation(format!("{err}{suffix}")))
+        }
+        Err(err) => Err(Error::Evaluation(format!(
+            "eval reader task panicked: {err}"
+        ))),
+    }
 }
 
 /// Await an eval-reader [`tokio::task::JoinHandle`] and map a panic into an

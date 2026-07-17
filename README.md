@@ -3,6 +3,10 @@
 Modern Rust rewrite of [`nix-index`](https://github.com/nix-community/nix-index):
 fast package file indexing and `nix-locate`-compatible search.
 
+`nix-locate` output and the v1 database format are fully upstream-compatible.
+`nixdex index` defaults to database format v2, a nixdex extension; use
+`--format-version 1` to produce a database readable by upstream `nix-index`.
+
 ## Workspace
 
 | Crate | Role |
