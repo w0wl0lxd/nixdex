@@ -100,6 +100,14 @@ pub struct Args {
     #[arg(long)]
     pub exclude_prefix: Vec<String>,
 
+    /// Disable nixpkgs overlays when evaluating the package set.
+    ///
+    /// This is equivalent to passing `--arg overlays '[]'` to `nix-env` and
+    /// avoids evaluating packages added or modified by user overlays, which are
+    /// unlikely to be cached on the official binary cache.
+    #[arg(long)]
+    pub no_overlays: bool,
+
     /// Build a small database containing only files under `/bin/`.
     ///
     /// This is equivalent to `--filter-prefix /bin/` and is much faster to build
@@ -226,6 +234,7 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
         path_cache_file: args.path_cache_file,
         path_cache_ttl: args.path_cache_ttl,
         main_program: !args.no_main_program,
+        no_overlays: args.no_overlays,
         extra_scopes: args.extra_scopes,
         only_eval: args.only_eval,
         cache_url: args.cache_url,
