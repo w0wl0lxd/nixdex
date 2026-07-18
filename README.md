@@ -29,8 +29,6 @@ cargo run --bin nix-index -- --help
 just validate      # fmt + check + clippy + nextest
 ```
 
-Research notes live under `research/` (local; large DB dumps are gitignored).
-
 ## Contributing
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for Conventional Commits, no-AI-attribution
