@@ -202,25 +202,31 @@ impl Drop for Writer {
 impl Writer {
     /// Creates a new database at the given path with the specified zstd compression level.
     ///
-    /// Writes version 2 by default. Use
-    /// [`create_with_version`](Self::create_with_version) to request version 1.
+    /// Writes version 2 by default and does not build the optional `redb` exact-path
+    /// sidecar. Use [`create_with_version`](Self::create_with_version) to request a
+    /// different version or enable the `redb` sidecar.
     ///
     /// # Errors
     ///
     /// Returns an error if the version is unsupported.
     pub fn create<P: AsRef<Path>>(path: P, level: i32) -> Result<Self> {
-        Self::create_with_version(path, level, DEFAULT_WRITE_VERSION)
+        Self::create_with_version(path, level, DEFAULT_WRITE_VERSION, false)
     }
 
-    /// Creates a new database at the given path with the specified zstd compression level
-    /// and on-disk format version.
+    /// Creates a new database at the given path with the specified zstd compression level,
+    /// on-disk format version, and optional `redb` exact-path sidecar.
     ///
     /// `version` must be `1` or `2`.
     ///
     /// # Errors
     ///
     /// Returns an error if the version is unsupported.
-    pub fn create_with_version<P: AsRef<Path>>(path: P, level: i32, version: u64) -> Result<Self> {
+    pub fn create_with_version<P: AsRef<Path>>(
+        path: P,
+        level: i32,
+        version: u64,
+        enable_redb: bool,
+    ) -> Result<Self> {
         if !SUPPORTED_VERSIONS.contains(&version) {
             return Err(Error::UnsupportedVersion { found: version });
         }
@@ -229,12 +235,15 @@ impl Writer {
         file.write_all(FILE_MAGIC)?;
         file.write_u64::<LittleEndian>(version)?;
 
-        let redb = path
-            .parent()
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .map(redb_index::Writer::create)
-            .transpose()
-            .map_err(|err| Error::Io(std::io::Error::other(err.to_string())))?;
+        let redb = if enable_redb {
+            path.parent()
+                .filter(|dir| !dir.as_os_str().is_empty())
+                .map(redb_index::Writer::create)
+                .transpose()
+                .map_err(|err| Error::Io(std::io::Error::other(err.to_string())))?
+        } else {
+            None
+        };
 
         Ok(Self {
             path,
@@ -411,17 +420,19 @@ impl Writer {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let compressed_frames: Vec<Vec<u8>> = slices
-            .par_iter()
-            .map(|&slice| zstd::encode_all(slice, self.level))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
         let file = self
             .file
             .as_mut()
             .ok_or_else(|| Error::Io(std::io::Error::other("database file not open")))?;
 
-        for frame in compressed_frames {
+        // Compress the slices sequentially with a single zstd context.
+        // Each slice is already a whole frcode frame, and `zstd::bulk`
+        // knows the exact source size. This avoids the per-frame `Encoder`
+        // allocations and the multi-worker `CCtx` memory explosion that
+        // makes high compression levels (e.g. 22) allocate ~1 GiB per core.
+        let mut compressor = zstd::bulk::Compressor::new(self.level)?;
+        for &slice in &slices {
+            let frame = compressor.compress(slice)?;
             let len_u32 = u32::try_from(frame.len())
                 .map_err(|_| Error::Corrupt("compressed frame length overflow"))?;
             file.write_all(&frame)?;
@@ -437,10 +448,6 @@ impl Writer {
         }
         self.finished = true;
 
-        let parallelism = std::thread::available_parallelism()
-            .map_or(1, std::num::NonZeroUsize::get)
-            .max(1);
-
         match self.version {
             1 => {
                 let mut file = self
@@ -448,12 +455,10 @@ impl Writer {
                     .take()
                     .ok_or_else(|| Error::Io(std::io::Error::other("database file not open")))?;
                 let raw = std::mem::take(&mut self.raw);
-                let mut encoder = zstd::Encoder::new(Vec::new(), self.level)?;
-                let n_workers = u32::try_from(parallelism)
-                    .map_err(|_| Error::Corrupt("parallelism overflow"))?;
-                encoder.multithread(n_workers)?;
-                encoder.write_all(&raw)?;
-                let compressed = encoder.finish()?;
+                // Single-threaded bulk compression with the exact source size
+                // known up front. See `flush_chunk` for the rationale.
+                let mut compressor = zstd::bulk::Compressor::new(self.level)?;
+                let compressed = compressor.compress(&raw)?;
                 file.write_all(&compressed)?;
 
                 file.flush()?;
@@ -2348,7 +2353,7 @@ mod tests {
         let tree = sample_tree();
 
         {
-            let mut writer = Writer::create_with_version(&db_path, 3, 2).expect("create v2");
+            let mut writer = Writer::create_with_version(&db_path, 3, 2, false).expect("create v2");
             writer.add(&path, &tree, b"").expect("add");
             let size = writer.finish().expect("finish");
             assert!(size > 0);
@@ -2399,7 +2404,7 @@ mod tests {
         )]);
 
         {
-            let mut writer = Writer::create_with_version(&db_path, 1, 2).expect("create v2");
+            let mut writer = Writer::create_with_version(&db_path, 1, 2, false).expect("create v2");
             writer.add(&hello, &hello_tree, b"").expect("add hello");
             writer
                 .add(&coreutils, &coreutils_tree, b"")
@@ -2466,7 +2471,7 @@ mod tests {
         )]);
 
         {
-            let mut writer = Writer::create_with_version(&db_path, 1, 2).expect("create v2");
+            let mut writer = Writer::create_with_version(&db_path, 1, 2, false).expect("create v2");
             writer.add(&hello, &hello_tree, b"").expect("add hello");
             writer
                 .add(&coreutils, &coreutils_tree, b"")
@@ -2502,7 +2507,7 @@ mod tests {
         let tree = sample_tree();
 
         {
-            let mut writer = Writer::create_with_version(&db_path, 1, 2).expect("create v2");
+            let mut writer = Writer::create_with_version(&db_path, 1, 2, false).expect("create v2");
             writer.add(&path, &tree, b"").expect("add");
             writer.finish().expect("finish");
         }

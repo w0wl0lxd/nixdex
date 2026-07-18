@@ -96,6 +96,13 @@ pub struct Args {
     #[arg(long, default_value = "2", value_parser = clap::value_parser!(u64).range(1..=2))]
     pub format_version: u64,
 
+    /// Build the optional `redb` exact-path sidecar.
+    ///
+    /// This sidecar speeds up `nix-locate --at-root` and exact full-path queries,
+    /// but it can be much larger than the main `files` database.
+    #[arg(long)]
+    pub redb: bool,
+
     /// Show a stack trace in the case of a Nix evaluation error.
     #[arg(long)]
     pub show_trace: bool,
@@ -260,6 +267,7 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
         check_cache_status: !args.no_check_cache_status,
         compression_level: args.compression_level,
         format_version: args.format_version,
+        enable_redb: args.redb,
         show_trace: args.show_trace,
         filter_prefix,
         small: args.small,
