@@ -218,6 +218,23 @@ impl FileNode<()> {
 }
 
 impl FileTreeEntry {
+    /// Returns `true` if the entry can be safely encoded into an frcode
+    /// stream. Paths and symlink targets must not contain NUL or newline,
+    /// both of which are reserved by the frcode format.
+    #[must_use]
+    pub fn is_encodable(&self) -> bool {
+        let forbidden = |b: &u8| *b == b'\0' || *b == b'\n';
+        if self.path.iter().any(forbidden) {
+            return false;
+        }
+        if let FileNode::Symlink { target } = &self.node
+            && target.iter().any(forbidden)
+        {
+            return false;
+        }
+        true
+    }
+
     /// Encode the entry into an frcode stream (`metadata\\0path\\n`).
     ///
     /// # Errors
@@ -664,5 +681,34 @@ mod tests {
         let invalid = b"invalid\x00/bin/ls";
         let result = FileTreeEntry::decode(invalid);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn is_encodable_rejects_nul_or_newline() {
+        let good = FileTreeEntry {
+            path: b"/bin/ls".to_vec(),
+            node: FileNode::Regular {
+                size: 1,
+                executable: true,
+            },
+        };
+        assert!(good.is_encodable());
+
+        let bad_path = FileTreeEntry {
+            path: b"/bin/b\nad".to_vec(),
+            node: FileNode::Regular {
+                size: 1,
+                executable: true,
+            },
+        };
+        assert!(!bad_path.is_encodable());
+
+        let bad_target = FileTreeEntry {
+            path: b"/bin/link".to_vec(),
+            node: FileNode::Symlink {
+                target: Bytes::from_static(b"/etc/passwd\n"),
+            },
+        };
+        assert!(!bad_target.is_encodable());
     }
 }

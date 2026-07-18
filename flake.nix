@@ -84,6 +84,9 @@
                 $out/etc/profile.d/command-not-found.fish \
                 --replace-fail "@out@" "$out"
               chmod 444 $out/etc/profile.d/command-not-found.fish
+
+              mkdir -p $out/share/man/man1
+              $out/bin/nixdex generate-man $out/share/man/man1
             '';
           }
         );
