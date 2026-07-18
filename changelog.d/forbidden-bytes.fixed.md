@@ -1,0 +1,1 @@
+- Skip file entries whose paths or symlink targets contain NUL or newline instead of failing to encode the entire package.

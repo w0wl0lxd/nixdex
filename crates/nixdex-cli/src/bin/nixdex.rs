@@ -87,6 +87,9 @@ enum Cmd {
     Stats(StatsOpts),
     /// Generate shell completions.
     Completions(CompletionsOpts),
+    /// Generate manual pages (hidden; used by packaging).
+    #[command(hide = true)]
+    GenerateMan(GenerateManOpts),
     /// Generate shell completion files (hidden; used by packaging).
     #[command(hide = true)]
     GenerateCompletions(GenerateCompletionsOpts),
@@ -203,6 +206,15 @@ struct CompletionsOpts {
     /// Shell for which to generate completions.
     #[arg(value_enum)]
     shell: Shell,
+}
+
+/// Generate manual pages for nixdex, nix-index, and nix-locate.
+#[derive(Debug, Parser)]
+#[command(author, about, version)]
+struct GenerateManOpts {
+    /// Directory to write the generated `*.1` files to.
+    #[arg(value_name = "DIR")]
+    out_dir: PathBuf,
 }
 
 /// Generate shell completion files for nixdex, nix-index, and nix-locate.
@@ -879,6 +891,31 @@ fn run_completions(opts: CompletionsOpts) {
     generate(opts.shell, &mut cmd, name, &mut std::io::stdout());
 }
 
+fn run_generate_man(opts: GenerateManOpts) -> color_eyre::Result<()> {
+    std::fs::create_dir_all(&opts.out_dir)
+        .wrap_err_with(|| format!("failed to create {}", opts.out_dir.display()))?;
+
+    let nixdex_cmd = Opts::command();
+    let nixdex_name = nixdex_cmd.get_name().to_string();
+    let pages = [
+        (nixdex_name, nixdex_cmd),
+        (String::from("nix-index"), index::Args::command()),
+        (String::from("nix-locate"), locate::Opts::command()),
+    ];
+
+    for (name, cmd) in pages {
+        let path = opts.out_dir.join(format!("{name}.1"));
+        let file = std::fs::File::create(&path)
+            .wrap_err_with(|| format!("failed to create {}", path.display()))?;
+        let mut buf = std::io::BufWriter::new(file);
+        clap_mangen::Man::new(cmd)
+            .render(&mut buf)
+            .wrap_err_with(|| format!("failed to render man page for {name}"))?;
+    }
+
+    Ok(())
+}
+
 fn run_generate_completions(opts: GenerateCompletionsOpts) -> color_eyre::Result<()> {
     std::fs::create_dir_all(&opts.out_dir)
         .wrap_err_with(|| format!("failed to create {}", opts.out_dir.display()))?;
@@ -952,6 +989,7 @@ async fn main() -> color_eyre::Result<()> {
             run_completions(opts);
             Ok(())
         }
+        Cmd::GenerateMan(opts) => run_generate_man(opts),
         Cmd::GenerateCompletions(opts) => run_generate_completions(opts),
         Cmd::Index(index_opts) => index::run(index_opts).await,
         Cmd::Locate(locate_opts) => locate::run(locate_opts),

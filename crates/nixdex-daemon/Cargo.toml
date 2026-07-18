@@ -5,8 +5,8 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description.workspace = true
-publish = false
+description = "Optional background daemon for nixdex prebuilt indexes and HTTP lookups"
+publish = true
 
 [dependencies]
 clap = { workspace = true }
