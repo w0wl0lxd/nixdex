@@ -90,6 +90,8 @@ pub struct UpdateOptions {
     pub main_program: bool,
     /// Disable nixpkgs overlays during evaluation.
     pub no_overlays: bool,
+    /// Allow unfree packages during nixpkgs evaluation.
+    pub allow_unfree: bool,
     /// Do not recurse into runtime references when fetching `.ls` listings.
     pub no_closure: bool,
     /// Extra attribute scopes to walk during evaluation.
@@ -126,6 +128,7 @@ impl Default for UpdateOptions {
             path_cache_ttl: None,
             main_program: true,
             no_overlays: false,
+            allow_unfree: false,
             no_closure: false,
             extra_scopes: vec![
                 String::from("haskellPackages"),
@@ -223,6 +226,7 @@ impl IndexBuilder {
         let no_instantiate = opts.no_instantiate;
         let check_cache_status = opts.check_cache_status;
         let no_overlays = opts.no_overlays;
+        let allow_unfree = opts.allow_unfree;
 
         let meta_handle = self.spawn_meta_writer(meta_rx);
         let handle = tokio::spawn(async move {
@@ -239,6 +243,7 @@ impl IndexBuilder {
                 meta: true,
                 scope: None,
                 no_overlays,
+                allow_unfree,
             };
             let count =
                 nixpkgs::stream_package_entries(base, &extra_scopes, main_program, pkg_tx, meta_tx)
@@ -702,6 +707,7 @@ mod tests {
             path_cache_ttl: None,
             main_program: true,
             no_overlays: false,
+            allow_unfree: false,
             no_closure: false,
             extra_scopes: vec![],
             only_eval: false,

@@ -1,0 +1,1 @@
+- Add relevance-based default sorting for `nix-locate` results, prioritizing exact basename matches, top-level packages, executables, and shorter attribute paths.

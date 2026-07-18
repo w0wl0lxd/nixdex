@@ -90,6 +90,8 @@ pub struct EvalJobsOptions<'a> {
     pub scope: Option<&'a str>,
     /// Whether to disable nixpkgs overlays (`overlays = []`).
     pub no_overlays: bool,
+    /// Whether to allow unfree packages (`allowUnfree = true;`).
+    pub allow_unfree: bool,
 }
 
 /// A subset of the `meta` attrset emitted by `nix-eval-jobs --meta`.
@@ -325,10 +327,18 @@ pub fn eval_expr_for_nixpkgs(
     value: &str,
     scope: Option<&str>,
     no_overlays: bool,
+    allow_unfree: bool,
 ) -> Result<String> {
     if let Some(scope) = scope {
         validate_scope(scope)?;
     }
+
+    let mut config_entries = Vec::from(["allowAliases = false;"]);
+    if allow_unfree {
+        config_entries.push("allowUnfree = true;");
+    }
+    let config = config_entries.join(" ");
+    let overlays = if no_overlays { "overlays = []; " } else { "" };
 
     let root = if let Some(inner) = value.strip_prefix('<').and_then(|v| v.strip_suffix('>')) {
         // Only allow simple alphanumeric path lookups, not `<foo/../../../x>`.
@@ -341,8 +351,7 @@ pub fn eval_expr_for_nixpkgs(
                 "invalid path lookup {value:?}"
             )));
         }
-        let overlays = if no_overlays { "overlays = []; " } else { "" };
-        format!("import {value} {{ config = {{ allowAliases = false; }}; {overlays}}}")
+        format!("import {value} {{ config = {{ {config} }}; {overlays}}}")
     } else {
         let path = Path::new(value);
         let abs: PathBuf = path.canonicalize().map_err(|err| {
@@ -356,8 +365,7 @@ pub fn eval_expr_for_nixpkgs(
             // File roots are evaluated as-is (fixtures like research/small.nix).
             format!("import \"{escaped}\"")
         } else if abs.is_dir() {
-            let overlays = if no_overlays { "overlays = []; " } else { "" };
-            format!("import \"{escaped}\" {{ config = {{ allowAliases = false; }}; {overlays}}}")
+            format!("import \"{escaped}\" {{ config = {{ {config} }}; {overlays}}}")
         } else {
             return Err(Error::InvalidArgument(format!(
                 "nixpkgs path is neither a file nor a directory: {}",
@@ -407,7 +415,12 @@ pub async fn run_eval_jobs(options: &EvalJobsOptions<'_>) -> Result<EvalJobsStre
         }
         cmd.arg("--flake").arg(options.nixpkgs);
     } else {
-        let expr = eval_expr_for_nixpkgs(options.nixpkgs, options.scope, options.no_overlays)?;
+        let expr = eval_expr_for_nixpkgs(
+            options.nixpkgs,
+            options.scope,
+            options.no_overlays,
+            options.allow_unfree,
+        )?;
         cmd.arg("--expr").arg(expr);
     }
     if let Some(system) = options.system {
@@ -430,6 +443,7 @@ pub async fn run_eval_jobs(options: &EvalJobsOptions<'_>) -> Result<EvalJobsStre
         cmd.arg("--meta");
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
 
     let mut child = cmd
         .spawn()
@@ -676,6 +690,7 @@ pub async fn stream_package_entries(
             meta: base.meta,
             scope: Some(scope.as_str()),
             no_overlays: base.no_overlays,
+            allow_unfree: base.allow_unfree,
         };
         match stream_options_to_entries(&scope_opts, &tx, meta_ref, main_program).await {
             Ok(n) => count += n,
@@ -724,6 +739,7 @@ pub async fn list_packages_with_scopes(
             meta: base.meta,
             scope: Some(scope.as_str()),
             no_overlays: base.no_overlays,
+            allow_unfree: base.allow_unfree,
         };
         match list_packages_async(&scope_opts).await {
             Ok(more) => {
@@ -760,6 +776,7 @@ pub fn list_packages(
         meta: main_program,
         scope: None,
         no_overlays: false,
+        allow_unfree: false,
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -835,29 +852,39 @@ mod tests {
 
     #[test]
     fn rejects_injection_in_nixpkgs_arg() {
-        assert!(eval_expr_for_nixpkgs(r"$(rm -rf /)", None, false).is_err());
-        assert!(eval_expr_for_nixpkgs(r#"foo"; builtins.trace "x" 1#"#, None, false).is_err());
-        assert!(eval_expr_for_nixpkgs("<nixpkgs/../../etc>", None, false).is_err());
+        assert!(eval_expr_for_nixpkgs(r"$(rm -rf /)", None, false, false).is_err());
+        assert!(
+            eval_expr_for_nixpkgs(r#"foo"; builtins.trace "x" 1#"#, None, false, false).is_err()
+        );
+        assert!(eval_expr_for_nixpkgs("<nixpkgs/../../etc>", None, false, false).is_err());
     }
 
     #[test]
     fn accepts_path_lookup_and_scope() {
-        let expr = eval_expr_for_nixpkgs("<nixpkgs>", Some("haskellPackages"), false).expect("ok");
+        let expr =
+            eval_expr_for_nixpkgs("<nixpkgs>", Some("haskellPackages"), false, false).expect("ok");
         assert!(expr.contains("import <nixpkgs>"));
         assert!(expr.ends_with(".haskellPackages"));
     }
 
     #[test]
     fn rejects_bad_scope() {
-        assert!(eval_expr_for_nixpkgs("<nixpkgs>", Some("foo;bar"), false).is_err());
-        assert!(eval_expr_for_nixpkgs("<nixpkgs>", Some("../x"), false).is_err());
+        assert!(eval_expr_for_nixpkgs("<nixpkgs>", Some("foo;bar"), false, false).is_err());
+        assert!(eval_expr_for_nixpkgs("<nixpkgs>", Some("../x"), false, false).is_err());
     }
 
     #[test]
     fn no_overlays_adds_empty_overlays() {
-        let expr = eval_expr_for_nixpkgs("<nixpkgs>", None, true).expect("ok");
+        let expr = eval_expr_for_nixpkgs("<nixpkgs>", None, true, false).expect("ok");
         assert!(expr.contains("import <nixpkgs>"));
         assert!(expr.contains("overlays = []"));
+    }
+
+    #[test]
+    fn allow_unfree_adds_config_entry() {
+        let expr = eval_expr_for_nixpkgs("<nixpkgs>", None, false, true).expect("ok");
+        assert!(expr.contains("import <nixpkgs>"));
+        assert!(expr.contains("allowUnfree = true;"));
     }
 
     #[test]
@@ -867,7 +894,7 @@ mod tests {
         let path = dir.path().join(file_name);
         std::fs::File::create(&path).expect("create file");
 
-        let expr = eval_expr_for_nixpkgs(path.to_str().expect("utf-8 path"), None, false)
+        let expr = eval_expr_for_nixpkgs(path.to_str().expect("utf-8 path"), None, false, false)
             .expect("build expression");
 
         assert!(expr.starts_with("import \""), "expr: {expr}");

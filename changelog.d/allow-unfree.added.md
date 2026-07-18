@@ -1,0 +1,1 @@
+- Add `--allow-unfree` to `nix-index`/`nixdex index` so unfree packages (e.g. CUDA, firmware) can be included in the index.

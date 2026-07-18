@@ -1,0 +1,1 @@
+- Kill the spawned `nix-eval-jobs` process when `nix-index` is interrupted or its task is dropped.

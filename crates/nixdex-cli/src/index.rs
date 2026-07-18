@@ -116,6 +116,13 @@ pub struct Args {
     #[arg(long)]
     pub no_overlays: bool,
 
+    /// Allow unfree packages during nixpkgs evaluation.
+    ///
+    /// This sets `config.allowUnfree = true` so packages such as CUDA
+    /// tools and unfree firmware are included in the index.
+    #[arg(long)]
+    pub allow_unfree: bool,
+
     /// Do not recurse into runtime references when fetching `.ls` listings.
     ///
     /// This indexes only the store paths that belong directly to each package
@@ -230,6 +237,17 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
         args.filter_prefix
     };
 
+    // On darwin targets, also walk the `darwin` scope to include darwin-specific
+    // command packages (e.g. darwin.traceroute, darwin.xcrun).
+    let mut extra_scopes = args.extra_scopes;
+    let target_system = args
+        .system
+        .clone()
+        .unwrap_or_else(nixdex_core::prebuilt::default_architecture);
+    if target_system.contains("darwin") && !extra_scopes.iter().any(|s| s == "darwin") {
+        extra_scopes.push(String::from("darwin"));
+    }
+
     let options = nixdex_core::index::UpdateOptions {
         jobs: args.jobs,
         timeout: args.timeout,
@@ -252,8 +270,9 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
         path_cache_ttl: args.path_cache_ttl,
         main_program: !args.no_main_program,
         no_overlays: args.no_overlays,
+        allow_unfree: args.allow_unfree,
         no_closure: args.no_closure,
-        extra_scopes: args.extra_scopes,
+        extra_scopes,
         only_eval: args.only_eval,
         cache_url: args.cache_url,
         exclude_prefix: args.exclude_prefix,

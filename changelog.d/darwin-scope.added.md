@@ -1,0 +1,1 @@
+- Automatically include the `darwin` scope when indexing for darwin targets, making darwin-specific command packages discoverable.

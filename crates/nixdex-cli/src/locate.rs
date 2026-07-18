@@ -132,7 +132,8 @@ pub struct Opts {
     #[arg(long)]
     pub count: bool,
 
-    /// Sort results: `size`, `size-asc`, `size-desc`, or `attr`/`attr-asc`.
+    /// Sort results: `relevance` (default), `none`, `size`/`size-asc`,
+    /// `size-desc`, or `attr`/`attr-asc`.
     #[arg(long)]
     pub sort: Option<String>,
 
@@ -167,6 +168,7 @@ struct ProcessedArgs {
     min_size: Option<u64>,
     max_size: Option<u64>,
     exclude_fhs: bool,
+    query_basename: Option<String>,
 }
 
 fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
@@ -210,6 +212,17 @@ fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
             (None, None)
         };
 
+    let query_basename = if !matches.regex && !matches.pattern.is_empty() {
+        let base = nixdex_core::basename_index::basename_of(matches.pattern.as_bytes());
+        if base.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8_lossy(base).into_owned())
+        }
+    } else {
+        None
+    };
+
     let make_pattern = |s: &str, wrap: bool| {
         let body = if as_regex {
             s.to_string()
@@ -250,7 +263,7 @@ fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
     let sort = match matches.sort {
         Some(s) => SearchSort::from_str(&s)
             .map_err(|err| color_eyre::eyre::eyre!("invalid --sort value '{s}': {err}"))?,
-        None => SearchSort::None,
+        None => SearchSort::Relevance,
     };
 
     Ok(ProcessedArgs {
@@ -270,6 +283,7 @@ fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
         min_size: matches.min_size,
         max_size: matches.max_size,
         exclude_fhs: matches.exclude_fhs,
+        query_basename,
     })
 }
 
@@ -299,6 +313,7 @@ pub fn run(matches: Opts) -> color_eyre::Result<()> {
         min_size: args.min_size,
         max_size: args.max_size,
         exclude_fhs: args.exclude_fhs,
+        query_basename: args.query_basename,
     };
 
     nixdex_core::search_database(&options).wrap_err("nix-locate failed")?;

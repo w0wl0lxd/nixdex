@@ -1315,8 +1315,11 @@ pub enum SearchMode {
 /// Sort order for search results.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SearchSort {
-    /// Preserve the order returned by the database reader.
+    /// Rank results by relevance: exact basename matches first, then top-level
+    /// packages, then shorter attribute paths.
     #[default]
+    Relevance,
+    /// Preserve the order returned by the database reader.
     None,
     /// Sort by file size ascending.
     SizeAsc,
@@ -1331,7 +1334,8 @@ impl std::str::FromStr for SearchSort {
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
-            "" | "none" | "relevance" => Ok(Self::None),
+            "" | "relevance" => Ok(Self::Relevance),
+            "none" => Ok(Self::None),
             "size" | "size-asc" => Ok(Self::SizeAsc),
             "size-desc" => Ok(Self::SizeDesc),
             "attr" | "attr-asc" => Ok(Self::AttrAsc),
@@ -1376,6 +1380,8 @@ pub struct SearchOptions<'a> {
     pub max_size: Option<u64>,
     /// Exclude results from FHS-style packages (`-fhs` / `-usr-target`).
     pub exclude_fhs: bool,
+    /// Basename that the user is looking for, used for relevance ranking.
+    pub query_basename: Option<String>,
 }
 
 /// Resolve the set of candidate package ordinals from the basename secondary index.
@@ -1716,6 +1722,24 @@ fn compile_search_regex(pattern: &str, kind: &str) -> crate::Result<Regex> {
         .map_err(|err| crate::Error::Parse(format!("invalid {kind} regex '{pattern}': {err}")))
 }
 
+/// Compute a relevance score tuple for a single search result.
+///
+/// Higher tuples sort first: exact basename match, top-level package,
+/// executable file, shorter attribute path.
+fn relevance_score(
+    store_path: &crate::StorePath,
+    entry: &crate::files::FileTreeEntry,
+    query_basename: Option<&str>,
+) -> (bool, bool, bool, usize) {
+    let base = crate::basename_index::basename_of(&entry.path);
+    let exact = query_basename.is_some_and(|q| q.as_bytes() == base);
+    let toplevel = store_path.origin().toplevel;
+    let executable = entry.node.is_executable();
+    // Shorter attribute paths are preferred; use a descending length surrogate.
+    let attr_len_inv = usize::MAX.saturating_sub(store_path.origin().attr.len());
+    (exact, toplevel, executable, attr_len_inv)
+}
+
 /// # Errors
 ///
 /// Returns an error if the database cannot be read or the pattern is invalid.
@@ -1774,7 +1798,10 @@ pub fn search_results(
                     package_re
                         .as_ref()
                         .is_none_or(|re| re.is_match(store_path.name().as_bytes()))
-                        && options.hash.as_deref().is_none_or(|h| h == store_path.hash())
+                        && options
+                            .hash
+                            .as_deref()
+                            .is_none_or(|h| h == store_path.hash())
                 });
                 hits
             }
@@ -1814,6 +1841,14 @@ pub fn search_results(
         }
         SearchSort::AttrAsc => {
             results.sort_by(|(a, _), (b, _)| a.origin().attr.cmp(&b.origin().attr));
+        }
+        SearchSort::Relevance => {
+            let query = options.query_basename.as_deref();
+            results.sort_by(|(a_store, a_entry), (b_store, b_entry)| {
+                let a = relevance_score(a_store, a_entry, query);
+                let b = relevance_score(b_store, b_entry, query);
+                b.cmp(&a)
+            });
         }
     }
 
@@ -2142,6 +2177,7 @@ mod tests {
             min_size: None,
             max_size: None,
             exclude_fhs: false,
+            query_basename: None,
         };
         search(&options).expect("search ok");
     }
