@@ -87,6 +87,18 @@
 
               mkdir -p $out/share/man/man1
               $out/bin/nixdex generate-man $out/share/man/man1
+
+              if $out/bin/nixdex --version >/dev/null 2>&1; then
+                mkdir -p $out/share/bash-completion/completions
+                mkdir -p $out/share/zsh/site-functions
+                mkdir -p $out/share/fish/vendor_completions.d
+                $out/bin/nixdex generate-completions bash $out/share/bash-completion/completions
+                $out/bin/nixdex generate-completions zsh $out/share/zsh/site-functions
+                $out/bin/nixdex generate-completions fish $out/share/fish/vendor_completions.d
+                for cmd in nixdex nix-index nix-locate; do
+                  mv -f "$out/share/bash-completion/completions/$cmd.bash" "$out/share/bash-completion/completions/$cmd"
+                done
+              fi
             '';
           }
         );

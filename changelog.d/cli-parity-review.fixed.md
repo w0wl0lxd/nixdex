@@ -1,0 +1,4 @@
+- Cache `uses_nix_profile` in the shell wrapper to avoid repeated filesystem checks inside loops.
+- Filter empty `XDG_STATE_HOME`/`HOME` values when locating the `nix profile` manifest.
+- Guard shell-completion generation with a can-run check so cross-compiled builds do not fail.
+- Install Bash completion files under their command names so `bash-completion` loads them on demand.
