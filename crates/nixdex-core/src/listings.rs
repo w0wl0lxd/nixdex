@@ -44,6 +44,16 @@ impl PackageEntry {
 /// Result item produced by [`fetch_listings`].
 pub type ListingItem = (StorePath, FileTree);
 
+/// State stored for each store-path hash in the deduplication map.
+///
+/// Tracks the best `main_program` value seen so far and whether the path
+/// corresponds to a top-level package, which matters for output labeling.
+#[derive(Clone, Debug)]
+struct SeenEntry {
+    main_program: Option<String>,
+    toplevel: bool,
+}
+
 /// Return `true` if `name` is a single, safe filename component.
 fn is_valid_main_program(name: &str) -> bool {
     if name.is_empty() || name == "." || name == ".." {
@@ -226,40 +236,51 @@ async fn fetch_listings_with_source<S: ListingSource>(
     let jobs = jobs.max(1);
     let (out_tx, out_rx) = mpsc::channel::<Result<ListingItem>>(jobs * 2);
     let queue: Arc<Mutex<VecDeque<PackageEntry>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let seen: Arc<SccHashMap<String, Option<String>, ahash::RandomState>> =
+    let seen: Arc<SccHashMap<String, SeenEntry, ahash::RandomState>> =
         Arc::new(SccHashMap::with_hasher(ahash::RandomState::new()));
     let in_flight = Arc::new(AtomicUsize::new(0));
     let notify = Arc::new(Notify::new());
     let input_done = Arc::new(AtomicBool::new(false));
     let semaphore = Arc::new(Semaphore::new(jobs));
 
-    // Feed incoming root entries into the shared queue. Workers also push
-    // newly discovered references into the same queue.
+    // Collect all root entries before any traversal begins. This guarantees
+    // that a top-level package is registered in `seen` before a closure
+    // reference with the same store path can be discovered, so the preferred
+    // top-level label (`coreutils.out`) is emitted instead of a bare closure
+    // label (`.out`) or a missing result.
     let notify_for_feeder = Arc::clone(&notify);
     let queue_for_feeder = Arc::clone(&queue);
     let seen_for_feeder = Arc::clone(&seen);
     let in_flight_for_feeder = Arc::clone(&in_flight);
     let input_done_for_feeder = Arc::clone(&input_done);
     tokio::spawn(async move {
+        let mut roots = Vec::new();
         while let Some(entry) = input.recv().await {
             let hash = entry.path.hash().to_string();
             let is_new = match seen_for_feeder.entry_sync(hash) {
                 SccMapEntry::Occupied(mut occupied) => {
-                    if occupied.get().is_none() && entry.main_program.is_some() {
-                        occupied.insert(entry.main_program.clone());
-                    }
+                    let current = occupied.get().clone();
+                    occupied.insert(SeenEntry {
+                        main_program: current.main_program.or(entry.main_program.clone()),
+                        toplevel: current.toplevel || entry.path.origin().toplevel,
+                    });
                     false
                 }
                 SccMapEntry::Vacant(vacant) => {
-                    vacant.insert_entry(entry.main_program.clone());
+                    vacant.insert_entry(SeenEntry {
+                        main_program: entry.main_program.clone(),
+                        toplevel: entry.path.origin().toplevel,
+                    });
                     true
                 }
             };
             if is_new {
-                in_flight_for_feeder.fetch_add(1, Ordering::SeqCst);
-                queue_for_feeder.lock().await.push_back(entry);
-                notify_for_feeder.notify_one();
+                roots.push(entry);
             }
+        }
+        for entry in roots {
+            in_flight_for_feeder.fetch_add(1, Ordering::SeqCst);
+            queue_for_feeder.lock().await.push_back(entry);
         }
         input_done_for_feeder.store(true, Ordering::SeqCst);
         notify_for_feeder.notify_one();
@@ -317,7 +338,7 @@ async fn process_path<S: ListingSource>(
     source: &S,
     entry: &PackageEntry,
     queue: &Mutex<VecDeque<PackageEntry>>,
-    seen: &SccHashMap<String, Option<String>, ahash::RandomState>,
+    seen: &SccHashMap<String, SeenEntry, ahash::RandomState>,
     in_flight: &AtomicUsize,
     notify: &Notify,
     filter_prefix: Bytes,
@@ -348,7 +369,7 @@ async fn process_path_inner<S: ListingSource>(
     source: &S,
     entry: &PackageEntry,
     queue: &Mutex<VecDeque<PackageEntry>>,
-    seen: &SccHashMap<String, Option<String>, ahash::RandomState>,
+    seen: &SccHashMap<String, SeenEntry, ahash::RandomState>,
     in_flight: &AtomicUsize,
     notify: &Notify,
     filter_prefix: Bytes,
@@ -356,8 +377,10 @@ async fn process_path_inner<S: ListingSource>(
 ) -> Option<ListingItem> {
     let path = &entry.path;
     let main_program_string = entry.main_program.clone().or_else(|| {
-        seen.read_sync(&path.hash().to_string(), |_, mp| mp.clone())
-            .flatten()
+        seen.read_sync(&path.hash().to_string(), |_, state| {
+            state.main_program.clone()
+        })
+        .flatten()
     });
     let main_program = main_program_string
         .as_deref()
@@ -390,7 +413,10 @@ async fn process_path_inner<S: ListingSource>(
             let is_new = match seen.entry_sync(hash) {
                 SccMapEntry::Occupied(_) => false,
                 SccMapEntry::Vacant(vacant) => {
-                    vacant.insert_entry(None);
+                    vacant.insert_entry(SeenEntry {
+                        main_program: None,
+                        toplevel: false,
+                    });
                     true
                 }
             };
