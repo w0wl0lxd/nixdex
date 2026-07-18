@@ -239,9 +239,7 @@ impl Writer {
         // If the redb sidecar is disabled, remove any stale sidecars left over
         // from a previous build so the reader cannot open outdated exact-path
         // indexes.
-        if !enable_redb
-            && let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty())
-        {
+        if !enable_redb && let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             let _ = fs::remove_file(dir.join(redb_index::DEFAULT_FILE));
             let _ = fs::remove_file(dir.join(redb_index::PATH_CACHE_FILE));
         }
