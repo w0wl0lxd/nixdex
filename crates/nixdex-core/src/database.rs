@@ -1774,7 +1774,10 @@ pub fn search_results(
                     package_re
                         .as_ref()
                         .is_none_or(|re| re.is_match(store_path.name().as_bytes()))
-                        && options.hash.as_deref().is_none_or(|h| h == store_path.hash())
+                        && options
+                            .hash
+                            .as_deref()
+                            .is_none_or(|h| h == store_path.hash())
                 });
                 hits
             }
