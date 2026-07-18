@@ -1,0 +1,3 @@
+- Make `scripts/publish-crates.sh` idempotent by checking crates.io before publishing and by re-checking on each retry, allowing reruns to resume after partial failures.
+- Publish dependency crates before the umbrella `nixdex` crate.
+- Add `nixdex-core` as a dependency of the umbrella `nixdex` crate and re-export its public API.
