@@ -323,6 +323,11 @@ struct DaemonOpts {
     /// Serve an existing local index directory instead of downloading a prebuilt index.
     #[arg(long)]
     database: Option<PathBuf>,
+
+    /// Bearer token required for `POST /reload` when not bound to loopback.
+    /// If unset, `/reload` is only accepted from loopback addresses.
+    #[arg(long, env = "NIXDEX_ADMIN_TOKEN")]
+    admin_token: Option<String>,
 }
 
 fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
@@ -855,6 +860,7 @@ async fn run_daemon(opts: DaemonOpts) -> color_eyre::Result<()> {
         http_addr: opts.http_addr,
         local_database: opts.database,
         local_refresh_interval: std::time::Duration::from_secs(opts.interval),
+        admin_token: opts.admin_token,
     };
 
     nixdex_core::daemon::run(&config)
