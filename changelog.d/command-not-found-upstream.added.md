@@ -1,0 +1,3 @@
+- `command-not-found.sh` suggests running a missing command with `comma` when it is on `$PATH`.
+- `command-not-found.sh` supports `NIX_AUTO_RUN_INTERACTIVE` to prompt for a provider before auto-running a missing command.
+- `command-not-found.nu` suggests `comma` for one-time command execution when available.

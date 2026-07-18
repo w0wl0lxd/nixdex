@@ -1774,7 +1774,10 @@ pub fn search_results(
                     package_re
                         .as_ref()
                         .is_none_or(|re| re.is_match(store_path.name().as_bytes()))
-                        && options.hash.as_deref().is_none_or(|h| h == store_path.hash())
+                        && options
+                            .hash
+                            .as_deref()
+                            .is_none_or(|h| h == store_path.hash())
                 });
                 hits
             }
@@ -1838,6 +1841,9 @@ pub fn search_results(
 ///
 /// Returns an error if the database cannot be read or the pattern is invalid.
 pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
+    // Compile the path pattern once with defensive size limits for both the
+    // search and the output pass (highlighting, grouping).
+    let path_pattern = compile_search_regex(&options.pattern, "path")?;
     let results = search_results(options)?;
 
     // Track printed attrs for --minimal de-duplication (ordered set).
@@ -1859,9 +1865,7 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
 
         if print_match(
             options,
-            &Regex::new(&options.pattern).map_err(|err| {
-                crate::Error::Parse(format!("invalid path pattern '{}': {err}", options.pattern))
-            })?,
+            &path_pattern,
             &mut printed_attrs,
             &store_path,
             &entry,
