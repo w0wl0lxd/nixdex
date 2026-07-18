@@ -1,0 +1,1 @@
+- `command-not-found.sh` and `nixdex command-not-found --auto-install` now detect `nix profile` via `$XDG_STATE_HOME/nix/profile/manifest.json` before falling back to `~/.nix-profile/manifest.json`.
