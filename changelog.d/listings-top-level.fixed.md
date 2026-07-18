@@ -1,1 +1,1 @@
-Collect all top-level package entries before traversing closure references in the listing fetcher. This prevents packages like `coreutils` from being indexed under a bare closure label (`.out`) or hidden entirely when they appear as dependencies of earlier packages.
+- Collect all top-level package entries before traversing closure references in the listing fetcher. This prevents packages like `coreutils` from being indexed under a bare closure label (`.out`) or hidden entirely when they appear as dependencies of earlier packages.
