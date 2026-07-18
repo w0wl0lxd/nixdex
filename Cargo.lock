@@ -1429,6 +1429,9 @@ dependencies = [
 [[package]]
 name = "nixdex"
 version = "0.1.0"
+dependencies = [
+ "nixdex-core",
+]
 
 [[package]]
 name = "nixdex-cli"

@@ -7,3 +7,6 @@
 //! - `nixdex-core`: core indexing and search library
 //! - `nixdex-cli`: `nix-index`, `nix-locate`, and `nixdex` command-line tools
 //! - `nixdex-daemon`: optional background HTTP daemon
+
+#[doc(inline)]
+pub use nixdex_core::*;
