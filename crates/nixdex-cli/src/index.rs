@@ -89,6 +89,10 @@ pub struct Args {
     #[arg(short, long = "compression", default_value = "22", value_parser = clap::value_parser!(i32).range(1..=22))]
     pub compression_level: i32,
 
+    /// Maximum uncompressed chunk size to buffer before flushing a v2 frame, in MiB.
+    #[arg(long, default_value = "64", value_parser = clap::value_parser!(u64).range(1..=1024))]
+    pub chunk_size: u64,
+
     /// On-disk database format version (1 or 2).
     ///
     /// nixdex writes format v2 by default, which is a nixdex extension.
@@ -241,6 +245,7 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
         no_instantiate: args.no_instantiate,
         check_cache_status: !args.no_check_cache_status,
         compression_level: args.compression_level,
+        chunk_size: args.chunk_size.saturating_mul(1024).saturating_mul(1024),
         format_version: args.format_version,
         show_trace: args.show_trace,
         filter_prefix,
