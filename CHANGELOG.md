@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Parameterized locate and index Criterion benches by package/file count and added `Reader::open`, `search_entries`, `search_results`, and `generate_sidecars` baselines with element throughput reporting.
 - Added `scripts/benchmark-locate.sh`, `scripts/benchmark-search.sh`, and `scripts/benchmark-index-comparison.sh` to compare `nixdex` against upstream `nix-index`/`nix-locate` via `hyperfine`.
 - Updated `just benchmark` to run all Criterion benches and added `just benchmark-locate`, `just benchmark-search`, and `just benchmark-index-compare` recipes for CLI-level comparisons.
+- Updated `.github/workflows/benchmark.yml` to trigger the fast `searchdb-benchmark` job on `push` to `main`/`master` and on `pull_request` when relevant files change, while keeping the heavy `index-benchmark` job on scheduled and dispatched runs.
 - `command-not-found.sh` suggests running a missing command with `comma` when it is on `$PATH`.
 - `command-not-found.sh` supports `NIX_AUTO_RUN_INTERACTIVE` to prompt for a provider before auto-running a missing command.
 - `command-not-found.nu` suggests `comma` for one-time command execution when available.
