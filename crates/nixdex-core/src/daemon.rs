@@ -25,9 +25,9 @@ use axum::{
     routing::{get, post},
 };
 #[cfg(feature = "daemon")]
-use std::net::SocketAddr;
-#[cfg(feature = "daemon")]
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "daemon")]
+use std::net::SocketAddr;
 #[cfg(feature = "daemon")]
 use std::str::FromStr;
 #[cfg(feature = "daemon")]
@@ -523,11 +523,10 @@ async fn run_http_server(addr: &str, index_state: Arc<IndexState>) -> Result<()>
         .route("/metrics", get(metrics_handler))
         .route(
             "/reload",
-            post(reload_handler)
-                .route_layer(axum::middleware::from_fn_with_state(
-                    Arc::clone(&index_state),
-                    admin_auth_middleware,
-                )),
+            post(reload_handler).route_layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&index_state),
+                admin_auth_middleware,
+            )),
         )
         .route("/locate", get(locate_handler))
         .route("/nix-locate", get(nix_locate_handler))
@@ -540,9 +539,12 @@ async fn run_http_server(addr: &str, index_state: Arc<IndexState>) -> Result<()>
 
     tracing::info!(addr, "HTTP server listening");
 
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .await
-        .map_err(crate::Error::from)?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(crate::Error::from)?;
 
     Ok(())
 }
@@ -560,7 +562,10 @@ async fn locate_handler(
         });
     };
 
-    let packages = match snapshot.basename.lookup_basename(params.basename.as_bytes()) {
+    let packages = match snapshot
+        .basename
+        .lookup_basename(params.basename.as_bytes())
+    {
         Ok(pkgs) => pkgs.into_iter().map(std::string::String::from).collect(),
         Err(_) => Vec::new(),
     };
@@ -1028,10 +1033,7 @@ async fn reload_handler(State(index_state): State<Arc<IndexState>>) -> axum::Jso
 async fn metrics_handler(State(index_state): State<Arc<IndexState>>) -> impl IntoResponse {
     let total = index_state.requests_total.load(Ordering::Relaxed);
     let (index_loaded, package_db_loaded) = match read_snapshot(&index_state) {
-        Some(snapshot) => (
-            u64::from(true),
-            u64::from(snapshot.package_db.is_some()),
-        ),
+        Some(snapshot) => (u64::from(true), u64::from(snapshot.package_db.is_some())),
         None => (0, 0),
     };
     let uptime = index_state.start_time.elapsed().as_secs();
@@ -1242,11 +1244,10 @@ mod tests {
         Router::new()
             .route(
                 "/reload",
-                post(reload_handler)
-                    .route_layer(axum::middleware::from_fn_with_state(
-                        Arc::clone(&state),
-                        admin_auth_middleware,
-                    )),
+                post(reload_handler).route_layer(axum::middleware::from_fn_with_state(
+                    Arc::clone(&state),
+                    admin_auth_middleware,
+                )),
             )
             .layer(axum::extract::connect_info::MockConnectInfo(addr))
             .with_state(state)
