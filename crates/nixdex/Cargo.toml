@@ -9,5 +9,8 @@ description = "Umbrella crate for nixdex — a modern nix-index / nix-locate rew
 rust-version.workspace = true
 publish = true
 
+[dependencies]
+nixdex-core = { workspace = true }
+
 [lints]
 workspace = true
