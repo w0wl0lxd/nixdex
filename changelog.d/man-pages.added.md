@@ -1,0 +1,1 @@
+- Added `nixdex generate-man` and installed man pages for `nixdex`, `nix-index`, and `nix-locate` through `flake.nix`.

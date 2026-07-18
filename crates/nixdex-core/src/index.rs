@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use indicatif::{MultiProgress, ProgressBar};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::mpsc;
@@ -40,7 +40,9 @@ struct WriteListingsContext<'a> {
     filter_prefix: &'a [u8],
     exclude_prefixes: Vec<Vec<u8>>,
     db_file: &'a Path,
-    progress: &'a MultiProgress,
+    fetch_pb: ProgressBar,
+    /// Maximum uncompressed bytes to buffer before flushing a v2 frame.
+    chunk_size: u64,
     attrs_map: IndexMap<String, String>,
     no_closure: bool,
 }
@@ -68,6 +70,8 @@ pub struct UpdateOptions {
     pub check_cache_status: bool,
     /// Zstandard compression level for the on-disk database.
     pub compression_level: i32,
+    /// Maximum uncompressed bytes to buffer before flushing a v2 frame.
+    pub chunk_size: u64,
     /// On-disk database format version (1 or 2).
     pub format_version: u64,
     /// Pass `--show-trace` to Nix evaluation.
@@ -115,6 +119,7 @@ impl Default for UpdateOptions {
             no_instantiate: false,
             check_cache_status: true,
             compression_level: 22,
+            chunk_size: 64 * 1024 * 1024,
             format_version: 2,
             show_trace: false,
             filter_prefix: String::new(),
@@ -209,8 +214,8 @@ impl IndexBuilder {
     }
 
     /// Spawn an async task that evaluates nixpkgs and streams
-    /// [`PackageEntry`] values into a channel.
-    fn spawn_package_eval_stream(&self) -> EvalStream {
+    /// [`PackageEntry`] values into a channel, updating `progress` per entry.
+    fn spawn_package_eval_stream(&self, progress: ProgressBar) -> EvalStream {
         let opts = &self.options;
         let (pkg_tx, pkg_rx) = mpsc::channel(1024);
         let (meta_tx, meta_rx) = mpsc::channel(1024);
@@ -240,9 +245,15 @@ impl IndexBuilder {
                 scope: None,
                 no_overlays,
             };
-            let count =
-                nixpkgs::stream_package_entries(base, &extra_scopes, main_program, pkg_tx, meta_tx)
-                    .await?;
+            let count = nixpkgs::stream_package_entries(
+                base,
+                &extra_scopes,
+                main_program,
+                pkg_tx,
+                meta_tx,
+                &progress,
+            )
+            .await?;
             Ok((count, start.elapsed()))
         });
 
@@ -395,7 +406,10 @@ impl IndexBuilder {
             source,
         })?;
         let eval_start = quanta::Instant::now();
-        let mut stream = self.spawn_package_eval_stream();
+        let eval_pb = eval_spinner();
+        eval_pb.set_message("Evaluating nixpkgs...");
+
+        let mut stream = self.spawn_package_eval_stream(eval_pb);
         while stream.packages.recv().await.is_some() {}
         let (eval_count, eval_elapsed) = Self::await_eval(stream.eval).await?;
         Self::await_meta(stream.meta).await;
@@ -425,10 +439,17 @@ impl IndexBuilder {
 
         let mut ctx = self.prepare_database()?;
         let progress = MultiProgress::new();
-        let eval_pb = progress.add(ProgressBar::new_spinner());
+        let eval_pb = progress.add(eval_spinner());
         eval_pb.set_message("Evaluating nixpkgs...");
+        let fetch_pb = fetch_bar(&progress);
+        fetch_pb.set_message("Fetching listings...");
 
-        let stream = self.spawn_package_eval_stream();
+        let stream = self.spawn_package_eval_stream(eval_pb.clone());
+        // The fetch phase total is not known at evaluation time because the
+        // closure fetcher discovers additional runtime references as it
+        // processes each root, so leave the fetch progress bar indeterminate.
+        let eval_handle = tokio::spawn(Self::await_eval(stream.eval));
+
         let fetcher = self.new_fetcher()?;
         let filter_prefix = if opts.small && opts.filter_prefix.is_empty() {
             b"/bin/".to_vec()
@@ -449,7 +470,8 @@ impl IndexBuilder {
                 filter_prefix: &filter_prefix,
                 exclude_prefixes,
                 db_file: &ctx.db_file,
-                progress: &progress,
+                fetch_pb: fetch_pb.clone(),
+                chunk_size: opts.chunk_size,
                 attrs_map: ctx.attrs_map,
                 no_closure: opts.no_closure,
             },
@@ -459,12 +481,20 @@ impl IndexBuilder {
         {
             Ok(result) => result,
             Err(err) => {
-                stream.eval.abort();
+                eval_handle.abort();
                 return Err(err);
             }
         };
 
-        let (eval_count, eval_elapsed) = Self::await_eval(stream.eval).await?;
+        let (eval_count, eval_elapsed) = match eval_handle.await {
+            Ok(Ok(value)) => value,
+            Ok(Err(err)) => return Err(err),
+            Err(err) => {
+                return Err(Error::Io(std::io::Error::other(format!(
+                    "eval task panicked: {err}"
+                ))));
+            }
+        };
         Self::await_meta(stream.meta).await;
         eval_pb.finish_with_message(format!(
             "Evaluated {eval_count} package(s) in {eval_elapsed:?}"
@@ -546,6 +576,32 @@ fn maybe_flush_chunk(writer: &mut Writer, db_file: &Path, chunk_bytes: u64) -> R
     Ok(())
 }
 
+/// Create a spinner progress bar for the nixpkgs evaluation phase.
+fn eval_spinner() -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} Evaluating nixpkgs... {pos} entries {per_sec} {elapsed_precise}",
+        )
+        .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    pb
+}
+
+/// Create a spinner progress bar for the listing fetch phase and attach it to `multi`.
+/// The total amount of work is not known ahead of time because closure
+/// traversal discovers additional store paths as it runs.
+fn fetch_bar(multi: &MultiProgress) -> ProgressBar {
+    let pb = multi.add(ProgressBar::new_spinner());
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} Fetching listings... {pos} entries {per_sec} {elapsed_precise}",
+        )
+        .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    pb
+}
+
 /// Finalize the listing fetch progress bar and emit the completion log line.
 fn finish_fetch_progress(
     fetch_pb: ProgressBar,
@@ -584,10 +640,7 @@ async fn write_listings(
     ctx: WriteListingsContext<'_>,
     package_input: mpsc::Receiver<listings::PackageEntry>,
 ) -> Result<(usize, usize, Duration)> {
-    // Flush raw packages to a v2 frame once the in-memory chunk reaches 256 MiB.
-    const CHUNK_BYTES: u64 = 256 * 1024 * 1024;
-
-    let fetch_pb = ctx.progress.add(ProgressBar::new_spinner());
+    let fetch_pb = ctx.fetch_pb;
     fetch_pb.set_message("Fetching listings...");
     let fetch_start = quanta::Instant::now();
 
@@ -629,7 +682,7 @@ async fn write_listings(
                 let after_len = ctx.writer.estimated_size();
                 bytes_written += after_len.saturating_sub(before_len);
                 indexed += 1;
-                maybe_flush_chunk(ctx.writer, ctx.db_file, CHUNK_BYTES)?;
+                maybe_flush_chunk(ctx.writer, ctx.db_file, ctx.chunk_size)?;
             }
             Err(err) => {
                 warn!(error = %err, "closure fetch yielded an error; skipping");
@@ -664,6 +717,7 @@ mod tests {
         let opts = UpdateOptions::default();
         assert_eq!(opts.jobs, 100);
         assert_eq!(opts.compression_level, 22);
+        assert_eq!(opts.chunk_size, 64 * 1024 * 1024);
         assert_eq!(opts.format_version, 2);
         assert_eq!(opts.nixpkgs, "<nixpkgs>");
         assert!(!opts.path_cache);
@@ -691,6 +745,7 @@ mod tests {
             no_instantiate: false,
             check_cache_status: true,
             compression_level: 3,
+            chunk_size: 4 * 1024 * 1024,
             format_version: 1,
             show_trace: false,
             filter_prefix: "/bin/".into(),

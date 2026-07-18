@@ -1,0 +1,1 @@
+- `nix-index` now includes the `darwin` package set in the default extra scopes when the target system is Darwin.

@@ -89,6 +89,10 @@ pub struct Args {
     #[arg(short, long = "compression", default_value = "22", value_parser = clap::value_parser!(i32).range(1..=22))]
     pub compression_level: i32,
 
+    /// Maximum uncompressed chunk size to buffer before flushing a v2 frame, in MiB.
+    #[arg(long, default_value = "64", value_parser = clap::value_parser!(u64).range(1..=1024))]
+    pub chunk_size: u64,
+
     /// On-disk database format version (1 or 2).
     ///
     /// nixdex writes format v2 by default, which is a nixdex extension.
@@ -115,13 +119,6 @@ pub struct Args {
     /// unlikely to be cached on the official binary cache.
     #[arg(long)]
     pub no_overlays: bool,
-
-    /// Allow unfree packages during nixpkgs evaluation.
-    ///
-    /// This sets `config.allowUnfree = true` so packages such as CUDA
-    /// tools and unfree firmware are included in the index.
-    #[arg(long)]
-    pub allow_unfree: bool,
 
     /// Do not recurse into runtime references when fetching `.ls` listings.
     ///
@@ -178,7 +175,8 @@ pub struct Args {
     pub extra_scopes: Vec<String>,
 
     /// Base URL of the Nix binary cache to fetch listings from.
-    #[arg(long, default_value_t = String::from(nixdex_core::CACHE_URL))]
+    /// Also accepts `--substituter` for compatibility with upstream nix-index.
+    #[arg(long = "cache-url", visible_alias = "substituter", default_value_t = String::from(nixdex_core::CACHE_URL))]
     pub cache_url: String,
 
     /// Download a prebuilt `files` database instead of evaluating nixpkgs.
@@ -237,14 +235,12 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
         args.filter_prefix
     };
 
-    // On darwin targets, also walk the `darwin` scope to include darwin-specific
-    // command packages (e.g. darwin.traceroute, darwin.xcrun).
+    // Include the darwin package set when targeting Darwin, either by explicit
+    // --system or by defaulting to the host platform.
     let mut extra_scopes = args.extra_scopes;
-    let target_system = args
-        .system
-        .clone()
-        .unwrap_or_else(nixdex_core::prebuilt::default_architecture);
-    if target_system.contains("darwin") && !extra_scopes.iter().any(|s| s == "darwin") {
+    let target_is_darwin = args.system.as_deref().is_some_and(|s| s.contains("darwin"))
+        || (args.system.is_none() && cfg!(target_os = "macos"));
+    if target_is_darwin && !extra_scopes.iter().any(|s| s == "darwin") {
         extra_scopes.push(String::from("darwin"));
     }
 
@@ -259,6 +255,7 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
         no_instantiate: args.no_instantiate,
         check_cache_status: !args.no_check_cache_status,
         compression_level: args.compression_level,
+        chunk_size: args.chunk_size.saturating_mul(1024).saturating_mul(1024),
         format_version: args.format_version,
         show_trace: args.show_trace,
         filter_prefix,
@@ -270,7 +267,6 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
         path_cache_ttl: args.path_cache_ttl,
         main_program: !args.no_main_program,
         no_overlays: args.no_overlays,
-        allow_unfree: args.allow_unfree,
         no_closure: args.no_closure,
         extra_scopes,
         only_eval: args.only_eval,

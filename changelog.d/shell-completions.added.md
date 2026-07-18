@@ -1,0 +1,1 @@
+- Added `nixdex generate-completions` and installed bash, zsh, and fish completion files for `nixdex`, `nix-index`, and `nix-locate` via `flake.nix`.

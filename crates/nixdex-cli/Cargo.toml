@@ -5,8 +5,8 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description.workspace = true
-publish = false
+description = "Command-line tools for nixdex: nix-index, nix-locate, and nixdex"
+publish = true
 default-run = "nix-index"
 
 [dependencies]
@@ -19,6 +19,7 @@ sonic-rs = { workspace = true }
 serde = { workspace = true }
 nixdex-core = { workspace = true, features = ["cli", "daemon"] }
 clap_complete = "4.6.7"
+clap_mangen = "0.2.26"
 
 [dev-dependencies]
 bytes = { workspace = true }

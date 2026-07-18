@@ -1,0 +1,1 @@
+- Added `--chunk-size` to `nix-index` to control uncompressed v2 frame buffering; the default is now 64 MiB to reduce peak memory usage during builds.

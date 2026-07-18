@@ -1,0 +1,1 @@
+- Fixed `nixdex-core` compilation without the `daemon` feature by gating Unix signal helpers behind `#[cfg(feature = "daemon")]`.
