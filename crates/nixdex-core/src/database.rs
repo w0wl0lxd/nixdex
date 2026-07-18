@@ -604,7 +604,7 @@ impl Reader {
             return Err(Error::Corrupt("database file exceeds maximum size"));
         }
 
-        let data = mmap_guard::map_file(&path_buf).map_err(Error::Io)?;
+        let data = mmap_guard::map_file(&path_buf)?;
 
         if data.len() < DATA_START {
             return Err(Error::Corrupt("database file too short for header"));
@@ -1325,7 +1325,7 @@ fn search_frame(
     let raw = if compressed.is_empty() {
         Vec::new()
     } else {
-        crate::bounded_zstd_decode(compressed, crate::MAX_ZSTD_FRAME_BYTES).map_err(Error::Io)?
+        crate::bounded_zstd_decode(compressed, crate::MAX_ZSTD_FRAME_BYTES)?
     };
 
     let mut decoder = frcode::Decoder::new(std::io::Cursor::new(&raw));
@@ -1354,10 +1354,8 @@ fn search_frame_stream(
     package_ordinals: Option<&RoaringBitmap>,
 ) -> Result<Vec<(StorePath, FileTreeEntry)>> {
     let cursor = std::io::Cursor::new(compressed);
-    let mut zstd_decoder = zstd::stream::read::Decoder::new(cursor).map_err(Error::Io)?;
-    zstd_decoder
-        .window_log_max(crate::ZSTD_WINDOW_LOG_MAX)
-        .map_err(Error::Io)?;
+    let mut zstd_decoder = zstd::stream::read::Decoder::new(cursor)?;
+    zstd_decoder.window_log_max(crate::ZSTD_WINDOW_LOG_MAX)?;
     let mut decoder = frcode::Decoder::new(std::io::BufReader::new(zstd_decoder));
     search_frame_decoder(
         &mut decoder,
@@ -2046,8 +2044,7 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
             let raw = if compressed.is_empty() {
                 Vec::new()
             } else {
-                crate::bounded_zstd_decode(compressed, crate::MAX_ZSTD_FRAME_BYTES)
-                    .map_err(Error::Io)?
+                crate::bounded_zstd_decode(compressed, crate::MAX_ZSTD_FRAME_BYTES)?
             };
 
             scan_frame_for_packages(
@@ -2093,15 +2090,15 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
 /// Write a `packages.json` NDJSON sidecar from extracted package metadata.
 fn write_packages_json(db_dir: &Path, packages: &[PackageMeta]) -> Result<()> {
     let path = db_dir.join("packages.json");
-    let file = std::fs::File::create(&path).map_err(Error::Io)?;
+    let file = std::fs::File::create(&path)?;
     let mut writer = std::io::BufWriter::new(file);
 
     for package in packages {
         let line = sonic_rs::to_string(package).map_err(|err| Error::Json(err.to_string()))?;
-        writeln!(writer, "{line}").map_err(Error::Io)?;
+        writeln!(writer, "{line}")?;
     }
 
-    writer.flush().map_err(Error::Io)?;
+    writer.flush()?;
     Ok(())
 }
 
@@ -2205,10 +2202,8 @@ fn scan_frame_stream_for_packages(
     all_package_attrs: &mut Vec<(String, String, String)>,
 ) -> Result<()> {
     let cursor = std::io::Cursor::new(compressed);
-    let mut zstd_decoder = zstd::stream::read::Decoder::new(cursor).map_err(Error::Io)?;
-    zstd_decoder
-        .window_log_max(crate::ZSTD_WINDOW_LOG_MAX)
-        .map_err(Error::Io)?;
+    let mut zstd_decoder = zstd::stream::read::Decoder::new(cursor)?;
+    zstd_decoder.window_log_max(crate::ZSTD_WINDOW_LOG_MAX)?;
     let mut decoder = frcode::Decoder::new(std::io::BufReader::new(zstd_decoder));
     scan_decoder_for_packages(
         &mut decoder,
