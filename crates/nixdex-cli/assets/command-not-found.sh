@@ -15,8 +15,15 @@ comma_cmd() {
 # This checks the XDG-style state directory first, then the classic
 # ~/.nix-profile symlink.
 uses_nix_profile() {
-    local state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
-    [ -e "$state_home/nix/profile/manifest.json" ] || [ -e "$HOME/.nix-profile/manifest.json" ]
+    if [ -z "${__nixdex_uses_profile-}" ]; then
+        local state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
+        if [ -e "$state_home/nix/profile/manifest.json" ] || [ -e "$HOME/.nix-profile/manifest.json" ]; then
+            __nixdex_uses_profile=true
+        else
+            __nixdex_uses_profile=false
+        fi
+    fi
+    [ "$__nixdex_uses_profile" = "true" ]
 }
 
 command_not_found_handle () {

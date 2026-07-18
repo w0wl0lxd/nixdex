@@ -743,14 +743,20 @@ fn run_command_not_found(opts: CommandNotFoundOpts) -> color_eyre::Result<()> {
 
 fn nix_profile_manifest() -> Option<PathBuf> {
     let state_home = std::env::var_os("XDG_STATE_HOME")
+        .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|s| !s.is_empty())
+                .map(|h| PathBuf::from(h).join(".local/state"))
+        })?;
     let xdg = state_home.join("nix/profile/manifest.json");
     if xdg.is_file() {
         return Some(xdg);
     }
-    let classic =
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".nix-profile/manifest.json"))?;
+    let classic = std::env::var_os("HOME")
+        .filter(|s| !s.is_empty())
+        .map(|h| PathBuf::from(h).join(".nix-profile/manifest.json"))?;
     if classic.is_file() {
         return Some(classic);
     }
