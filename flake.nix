@@ -84,6 +84,13 @@
                 $out/etc/profile.d/command-not-found.fish \
                 --replace-fail "@out@" "$out"
               chmod 444 $out/etc/profile.d/command-not-found.fish
+
+              mkdir -p $out/share/bash-completion/completions
+              mkdir -p $out/share/zsh/site-functions
+              mkdir -p $out/share/fish/vendor_completions.d
+              $out/bin/nixdex generate-completions bash $out/share/bash-completion/completions
+              $out/bin/nixdex generate-completions zsh $out/share/zsh/site-functions
+              $out/bin/nixdex generate-completions fish $out/share/fish/vendor_completions.d
             '';
           }
         );

@@ -171,7 +171,8 @@ pub struct Args {
     pub extra_scopes: Vec<String>,
 
     /// Base URL of the Nix binary cache to fetch listings from.
-    #[arg(long, default_value_t = String::from(nixdex_core::CACHE_URL))]
+    /// Also accepts `--substituter` for compatibility with upstream nix-index.
+    #[arg(long = "cache-url", visible_alias = "substituter", default_value_t = String::from(nixdex_core::CACHE_URL))]
     pub cache_url: String,
 
     /// Download a prebuilt `files` database instead of evaluating nixpkgs.
@@ -230,6 +231,15 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
         args.filter_prefix
     };
 
+    // Include the darwin package set when targeting Darwin, either by explicit
+    // --system or by defaulting to the host platform.
+    let mut extra_scopes = args.extra_scopes;
+    let target_is_darwin = args.system.as_deref().is_some_and(|s| s.contains("darwin"))
+        || (args.system.is_none() && cfg!(target_os = "macos"));
+    if target_is_darwin && !extra_scopes.iter().any(|s| s == "darwin") {
+        extra_scopes.push(String::from("darwin"));
+    }
+
     let options = nixdex_core::index::UpdateOptions {
         jobs: args.jobs,
         timeout: args.timeout,
@@ -253,7 +263,7 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
         main_program: !args.no_main_program,
         no_overlays: args.no_overlays,
         no_closure: args.no_closure,
-        extra_scopes: args.extra_scopes,
+        extra_scopes,
         only_eval: args.only_eval,
         cache_url: args.cache_url,
         exclude_prefix: args.exclude_prefix,
