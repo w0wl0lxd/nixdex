@@ -1,0 +1,1 @@
+- `nix-index --cache-url` now accepts `--substituter` as a visible alias for compatibility with upstream nix-index.
