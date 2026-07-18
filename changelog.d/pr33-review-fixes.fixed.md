@@ -1,0 +1,3 @@
+- Address review feedback for PR #33: batch Tokio Mutex acquisitions when feeding root package entries.
+- Parallelize v2 frame compression with a per-task `zstd::bulk::Compressor` instance.
+- Remove stale `files.redb`/`files.pathcache` sidecars when the `--redb` option is disabled.

@@ -11,6 +11,7 @@
 //! (see [`crate::basename_index`]).
 
 use std::fs::{self, File};
+use std::io;
 use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 
@@ -202,25 +203,31 @@ impl Drop for Writer {
 impl Writer {
     /// Creates a new database at the given path with the specified zstd compression level.
     ///
-    /// Writes version 2 by default. Use
-    /// [`create_with_version`](Self::create_with_version) to request version 1.
+    /// Writes version 2 by default and does not build the optional `redb` exact-path
+    /// sidecar. Use [`create_with_version`](Self::create_with_version) to request a
+    /// different version or enable the `redb` sidecar.
     ///
     /// # Errors
     ///
     /// Returns an error if the version is unsupported.
     pub fn create<P: AsRef<Path>>(path: P, level: i32) -> Result<Self> {
-        Self::create_with_version(path, level, DEFAULT_WRITE_VERSION)
+        Self::create_with_version(path, level, DEFAULT_WRITE_VERSION, false)
     }
 
-    /// Creates a new database at the given path with the specified zstd compression level
-    /// and on-disk format version.
+    /// Creates a new database at the given path with the specified zstd compression level,
+    /// on-disk format version, and optional `redb` exact-path sidecar.
     ///
     /// `version` must be `1` or `2`.
     ///
     /// # Errors
     ///
     /// Returns an error if the version is unsupported.
-    pub fn create_with_version<P: AsRef<Path>>(path: P, level: i32, version: u64) -> Result<Self> {
+    pub fn create_with_version<P: AsRef<Path>>(
+        path: P,
+        level: i32,
+        version: u64,
+        enable_redb: bool,
+    ) -> Result<Self> {
         if !SUPPORTED_VERSIONS.contains(&version) {
             return Err(Error::UnsupportedVersion { found: version });
         }
@@ -229,12 +236,23 @@ impl Writer {
         file.write_all(FILE_MAGIC)?;
         file.write_u64::<LittleEndian>(version)?;
 
-        let redb = path
-            .parent()
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .map(redb_index::Writer::create)
-            .transpose()
-            .map_err(|err| Error::Io(std::io::Error::other(err.to_string())))?;
+        // If the redb sidecar is disabled, remove any stale sidecars left over
+        // from a previous build so the reader cannot open outdated exact-path
+        // indexes.
+        if !enable_redb && let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            let _ = fs::remove_file(dir.join(redb_index::DEFAULT_FILE));
+            let _ = fs::remove_file(dir.join(redb_index::PATH_CACHE_FILE));
+        }
+
+        let redb = if enable_redb {
+            path.parent()
+                .filter(|dir| !dir.as_os_str().is_empty())
+                .map(redb_index::Writer::create)
+                .transpose()
+                .map_err(|err| Error::Io(std::io::Error::other(err.to_string())))?
+        } else {
+            None
+        };
 
         Ok(Self {
             path,
@@ -412,17 +430,27 @@ impl Writer {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let compressed_frames: Vec<Vec<u8>> = slices
-            .par_iter()
-            .map(|&slice| zstd::encode_all(slice, self.level))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
         let file = self
             .file
             .as_mut()
             .ok_or_else(|| Error::Io(std::io::Error::other("database file not open")))?;
 
-        for frame in compressed_frames {
+        // Compress the slices in parallel using Rayon, with a single-threaded
+        // `zstd::bulk::Compressor` instantiated inside each task. This keeps the
+        // compression fast while avoiding the per-frame `Encoder` allocations and
+        // the multi-worker `CCtx` memory explosion that makes high compression
+        // levels allocate ~1 GiB per core.
+        let level = self.level;
+        let compressed: Vec<io::Result<Vec<u8>>> = slices
+            .par_iter()
+            .map(|&slice| {
+                let mut compressor = zstd::bulk::Compressor::new(level)?;
+                compressor.compress(slice)
+            })
+            .collect();
+
+        for frame_result in compressed {
+            let frame = frame_result.map_err(Error::Io)?;
             let len_u32 = u32::try_from(frame.len())
                 .map_err(|_| Error::Corrupt("compressed frame length overflow"))?;
             file.write_all(&frame)?;
@@ -438,10 +466,6 @@ impl Writer {
         }
         self.finished = true;
 
-        let parallelism = std::thread::available_parallelism()
-            .map_or(1, std::num::NonZeroUsize::get)
-            .max(1);
-
         match self.version {
             1 => {
                 let mut file = self
@@ -449,12 +473,10 @@ impl Writer {
                     .take()
                     .ok_or_else(|| Error::Io(std::io::Error::other("database file not open")))?;
                 let raw = std::mem::take(&mut self.raw);
-                let mut encoder = zstd::Encoder::new(Vec::new(), self.level)?;
-                let n_workers = u32::try_from(parallelism)
-                    .map_err(|_| Error::Corrupt("parallelism overflow"))?;
-                encoder.multithread(n_workers)?;
-                encoder.write_all(&raw)?;
-                let compressed = encoder.finish()?;
+                // Single-threaded bulk compression with the exact source size
+                // known up front. See `flush_chunk` for the rationale.
+                let mut compressor = zstd::bulk::Compressor::new(self.level)?;
+                let compressed = compressor.compress(&raw)?;
                 file.write_all(&compressed)?;
 
                 file.flush()?;
@@ -605,7 +627,7 @@ impl Reader {
             return Err(Error::Corrupt("database file exceeds maximum size"));
         }
 
-        let data = mmap_guard::map_file(&path_buf).map_err(Error::Io)?;
+        let data = mmap_guard::map_file(&path_buf)?;
 
         if data.len() < DATA_START {
             return Err(Error::Corrupt("database file too short for header"));
@@ -773,6 +795,29 @@ impl Reader {
                     .map(|(offset, len)| (*offset, *len, None))
                     .collect()
             };
+
+        // NIXI v1 databases are a single large zstd frame. Stream-decode them so
+        // we do not have to materialise the whole decompressed buffer at once.
+        if self.version == 1 {
+            if let Some((offset, len, frame_start_ordinal)) = frames_to_scan.first() {
+                let start = *offset;
+                let end = start + *len;
+                let compressed = self
+                    .data
+                    .get(start..end)
+                    .ok_or(Error::Corrupt("frame slice out of range"))?;
+                return search_frame_stream(
+                    compressed,
+                    path_pattern,
+                    package_pattern,
+                    hash,
+                    package_labels,
+                    *frame_start_ordinal,
+                    filter_ordinals,
+                );
+            }
+            return Ok(Vec::new());
+        }
 
         let per_frame: Vec<Vec<(StorePath, FileTreeEntry)>> = frames_to_scan
             .par_iter()
@@ -1201,8 +1246,9 @@ fn sidecars_exist(dir: &Path) -> bool {
         .any(|name| dir.join(name).is_file())
 }
 
-fn search_frame(
-    compressed: &[u8],
+/// Search a decoded frcode stream for entries matching the supplied patterns.
+fn search_frame_decoder<R: std::io::BufRead>(
+    decoder: &mut frcode::Decoder<R>,
     path_pattern: &Regex,
     package_pattern: Option<&Regex>,
     hash: Option<&str>,
@@ -1210,15 +1256,8 @@ fn search_frame(
     frame_start_ordinal: Option<u32>,
     package_ordinals: Option<&RoaringBitmap>,
 ) -> Result<Vec<(StorePath, FileTreeEntry)>> {
-    let raw = if compressed.is_empty() {
-        Vec::new()
-    } else {
-        crate::bounded_zstd_decode(compressed, crate::MAX_ZSTD_FRAME_BYTES).map_err(Error::Io)?
-    };
-
     let mut matches = Vec::new();
     let mut pending: Vec<FileTreeEntry> = Vec::new();
-    let mut decoder = frcode::Decoder::new(std::io::Cursor::new(&raw));
     let mut current_ordinal = match frame_start_ordinal {
         Some(ord) => ord,
         None => 0,
@@ -1295,6 +1334,61 @@ fn search_frame(
     }
 
     Ok(matches)
+}
+
+fn search_frame(
+    compressed: &[u8],
+    path_pattern: &Regex,
+    package_pattern: Option<&Regex>,
+    hash: Option<&str>,
+    package_labels: Option<&IndexSet<String>>,
+    frame_start_ordinal: Option<u32>,
+    package_ordinals: Option<&RoaringBitmap>,
+) -> Result<Vec<(StorePath, FileTreeEntry)>> {
+    let raw = if compressed.is_empty() {
+        Vec::new()
+    } else {
+        crate::bounded_zstd_decode(compressed, crate::MAX_ZSTD_FRAME_BYTES)?
+    };
+
+    let mut decoder = frcode::Decoder::new(std::io::Cursor::new(&raw));
+    search_frame_decoder(
+        &mut decoder,
+        path_pattern,
+        package_pattern,
+        hash,
+        package_labels,
+        frame_start_ordinal,
+        package_ordinals,
+    )
+}
+
+/// Search a single zstd-compressed frame by streaming it through `frcode`.
+///
+/// This is used for NIXI v1 databases (e.g. the upstream prebuilt index) whose
+/// single frame is far larger than the bounded in-memory decode limit.
+fn search_frame_stream(
+    compressed: &[u8],
+    path_pattern: &Regex,
+    package_pattern: Option<&Regex>,
+    hash: Option<&str>,
+    package_labels: Option<&IndexSet<String>>,
+    frame_start_ordinal: Option<u32>,
+    package_ordinals: Option<&RoaringBitmap>,
+) -> Result<Vec<(StorePath, FileTreeEntry)>> {
+    let cursor = std::io::Cursor::new(compressed);
+    let mut zstd_decoder = zstd::stream::read::Decoder::new(cursor)?;
+    zstd_decoder.window_log_max(crate::ZSTD_WINDOW_LOG_MAX)?;
+    let mut decoder = frcode::Decoder::new(std::io::BufReader::new(zstd_decoder));
+    search_frame_decoder(
+        &mut decoder,
+        path_pattern,
+        package_pattern,
+        hash,
+        package_labels,
+        frame_start_ordinal,
+        package_ordinals,
+    )
 }
 
 /// Output mode for a search request.
@@ -1911,29 +2005,49 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
     let mut all_package_meta: Vec<PackageMeta> = Vec::new();
     let mut all_package_attrs: Vec<(String, String, String)> = Vec::new();
 
-    for (offset, len) in &reader.frames {
-        let start = *offset;
-        let end = start + len;
-        let compressed = reader
-            .data
-            .get(start..end)
-            .ok_or(Error::Corrupt("frame slice out of range"))?;
+    // NIXI v1 databases (upstream prebuilt indexes) are a single large zstd frame.
+    // Stream-decode them instead of materialising the whole frame in memory.
+    if reader.version == 1 {
+        if let Some((offset, len)) = reader.frames.first() {
+            let start = *offset;
+            let end = start + *len;
+            let compressed = reader
+                .data
+                .get(start..end)
+                .ok_or(Error::Corrupt("frame slice out of range"))?;
+            scan_frame_stream_for_packages(
+                compressed,
+                &mut builder,
+                &mut path_builder,
+                &mut all_package_labels,
+                &mut all_package_meta,
+                &mut all_package_attrs,
+            )?;
+        }
+    } else {
+        for (offset, len) in &reader.frames {
+            let start = *offset;
+            let end = start + *len;
+            let compressed = reader
+                .data
+                .get(start..end)
+                .ok_or(Error::Corrupt("frame slice out of range"))?;
 
-        let raw = if compressed.is_empty() {
-            Vec::new()
-        } else {
-            crate::bounded_zstd_decode(compressed, crate::MAX_ZSTD_FRAME_BYTES)
-                .map_err(Error::Io)?
-        };
+            let raw = if compressed.is_empty() {
+                Vec::new()
+            } else {
+                crate::bounded_zstd_decode(compressed, crate::MAX_ZSTD_FRAME_BYTES)?
+            };
 
-        scan_frame_for_packages(
-            &raw,
-            &mut builder,
-            &mut path_builder,
-            &mut all_package_labels,
-            &mut all_package_meta,
-            &mut all_package_attrs,
-        )?;
+            scan_frame_for_packages(
+                &raw,
+                &mut builder,
+                &mut path_builder,
+                &mut all_package_labels,
+                &mut all_package_meta,
+                &mut all_package_attrs,
+            )?;
+        }
     }
 
     // Write basename and path sidecars.
@@ -1968,28 +2082,27 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
 /// Write a `packages.json` NDJSON sidecar from extracted package metadata.
 fn write_packages_json(db_dir: &Path, packages: &[PackageMeta]) -> Result<()> {
     let path = db_dir.join("packages.json");
-    let file = std::fs::File::create(&path).map_err(Error::Io)?;
+    let file = std::fs::File::create(&path)?;
     let mut writer = std::io::BufWriter::new(file);
 
     for package in packages {
         let line = sonic_rs::to_string(package).map_err(|err| Error::Json(err.to_string()))?;
-        writeln!(writer, "{line}").map_err(Error::Io)?;
+        writeln!(writer, "{line}")?;
     }
 
-    writer.flush().map_err(Error::Io)?;
+    writer.flush()?;
     Ok(())
 }
 
-/// Scan a single frame's frcode data to extract package paths.
-fn scan_frame_for_packages(
-    raw: &[u8],
+/// Scan a decoded frcode stream to extract package paths.
+fn scan_decoder_for_packages<R: std::io::BufRead>(
+    decoder: &mut frcode::Decoder<R>,
     builder: &mut BasenameIndexBuilder,
     path_builder: &mut PathIndexBuilder,
     all_package_labels: &mut Vec<String>,
     all_package_meta: &mut Vec<PackageMeta>,
     all_package_attrs: &mut Vec<(String, String, String)>,
 ) -> Result<()> {
-    let mut decoder = frcode::Decoder::new(std::io::Cursor::new(raw));
     let mut current_paths: Vec<Vec<u8>> = Vec::new();
 
     loop {
@@ -2046,6 +2159,52 @@ fn scan_frame_for_packages(
     }
 
     Ok(())
+}
+
+/// Scan a single in-memory frcode frame to extract package paths.
+fn scan_frame_for_packages(
+    raw: &[u8],
+    builder: &mut BasenameIndexBuilder,
+    path_builder: &mut PathIndexBuilder,
+    all_package_labels: &mut Vec<String>,
+    all_package_meta: &mut Vec<PackageMeta>,
+    all_package_attrs: &mut Vec<(String, String, String)>,
+) -> Result<()> {
+    let mut decoder = frcode::Decoder::new(std::io::Cursor::new(raw));
+    scan_decoder_for_packages(
+        &mut decoder,
+        builder,
+        path_builder,
+        all_package_labels,
+        all_package_meta,
+        all_package_attrs,
+    )
+}
+
+/// Scan a single zstd-compressed frcode frame by streaming decompression.
+///
+/// This is used for NIXI v1 databases whose single frame is far larger than the
+/// bounded in-memory decode limit.
+fn scan_frame_stream_for_packages(
+    compressed: &[u8],
+    builder: &mut BasenameIndexBuilder,
+    path_builder: &mut PathIndexBuilder,
+    all_package_labels: &mut Vec<String>,
+    all_package_meta: &mut Vec<PackageMeta>,
+    all_package_attrs: &mut Vec<(String, String, String)>,
+) -> Result<()> {
+    let cursor = std::io::Cursor::new(compressed);
+    let mut zstd_decoder = zstd::stream::read::Decoder::new(cursor)?;
+    zstd_decoder.window_log_max(crate::ZSTD_WINDOW_LOG_MAX)?;
+    let mut decoder = frcode::Decoder::new(std::io::BufReader::new(zstd_decoder));
+    scan_decoder_for_packages(
+        &mut decoder,
+        builder,
+        path_builder,
+        all_package_labels,
+        all_package_meta,
+        all_package_attrs,
+    )
 }
 
 /// Format an integer with thousands separators (e.g. `16_524` → `"16,524"`).
@@ -2317,7 +2476,7 @@ mod tests {
         let tree = sample_tree();
 
         {
-            let mut writer = Writer::create_with_version(&db_path, 3, 2).expect("create v2");
+            let mut writer = Writer::create_with_version(&db_path, 3, 2, false).expect("create v2");
             writer.add(&path, &tree, b"").expect("add");
             let size = writer.finish().expect("finish");
             assert!(size > 0);
@@ -2368,7 +2527,7 @@ mod tests {
         )]);
 
         {
-            let mut writer = Writer::create_with_version(&db_path, 1, 2).expect("create v2");
+            let mut writer = Writer::create_with_version(&db_path, 1, 2, false).expect("create v2");
             writer.add(&hello, &hello_tree, b"").expect("add hello");
             writer
                 .add(&coreutils, &coreutils_tree, b"")
@@ -2435,7 +2594,7 @@ mod tests {
         )]);
 
         {
-            let mut writer = Writer::create_with_version(&db_path, 1, 2).expect("create v2");
+            let mut writer = Writer::create_with_version(&db_path, 1, 2, false).expect("create v2");
             writer.add(&hello, &hello_tree, b"").expect("add hello");
             writer
                 .add(&coreutils, &coreutils_tree, b"")
@@ -2471,7 +2630,7 @@ mod tests {
         let tree = sample_tree();
 
         {
-            let mut writer = Writer::create_with_version(&db_path, 1, 2).expect("create v2");
+            let mut writer = Writer::create_with_version(&db_path, 1, 2, false).expect("create v2");
             writer.add(&path, &tree, b"").expect("add");
             writer.finish().expect("finish");
         }
