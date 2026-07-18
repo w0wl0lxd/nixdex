@@ -74,6 +74,8 @@ pub struct UpdateOptions {
     pub chunk_size: u64,
     /// On-disk database format version (1 or 2).
     pub format_version: u64,
+    /// Build the optional `redb` exact-path sidecar.
+    pub enable_redb: bool,
     /// Pass `--show-trace` to Nix evaluation.
     pub show_trace: bool,
     /// Only index paths starting with this prefix.
@@ -121,6 +123,7 @@ impl Default for UpdateOptions {
             compression_level: 22,
             chunk_size: 64 * 1024 * 1024,
             format_version: 2,
+            enable_redb: false,
             show_trace: false,
             filter_prefix: String::new(),
             small: false,
@@ -292,12 +295,16 @@ impl IndexBuilder {
         let attrs_map = self.load_attrs_sidecar();
 
         let db_file = opts.database.join("files");
-        let writer =
-            Writer::create_with_version(&db_file, opts.compression_level, opts.format_version)
-                .map_err(|source| Error::CreateDatabase {
-                    path: db_file.clone(),
-                    source: Box::new(source),
-                })?;
+        let writer = Writer::create_with_version(
+            &db_file,
+            opts.compression_level,
+            opts.format_version,
+            opts.enable_redb,
+        )
+        .map_err(|source| Error::CreateDatabase {
+            path: db_file.clone(),
+            source: Box::new(source),
+        })?;
 
         Ok(ListingContext {
             db_file,
@@ -747,6 +754,7 @@ mod tests {
             compression_level: 3,
             chunk_size: 4 * 1024 * 1024,
             format_version: 1,
+            enable_redb: false,
             show_trace: false,
             filter_prefix: "/bin/".into(),
             small: false,
