@@ -99,7 +99,7 @@ impl FetcherBuilder {
     }
 }
 
-/// Client for a Nix binary cache (for example `https://cache.nixos.org`).
+/// Client for a Nix binary cache (for example <https://cache.nixos.org>).
 #[derive(Debug, Clone)]
 pub struct Fetcher {
     base_url: String,
