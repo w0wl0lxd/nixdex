@@ -11,6 +11,30 @@ use nixdex_core::{FileTree, Origin, PackageMeta, StorePath, database::Writer};
 
 const NIXDEX_EXE: &str = env!("CARGO_BIN_EXE_nixdex");
 
+/// Resolve the path to a sibling binary (`nix-index` / `nix-locate`) built
+/// alongside `nixdex` in the same target directory. Derived from
+/// `NIXDEX_EXE` rather than a separate `CARGO_BIN_EXE_<name>` constant to
+/// avoid any ambiguity around how Cargo names that variable for binary
+/// targets whose name contains a hyphen.
+fn sibling_exe(name: &str) -> PathBuf {
+    let nixdex_path = PathBuf::from(NIXDEX_EXE);
+    let dir = nixdex_path.parent().expect("nixdex exe has a parent dir");
+    let mut file_name = std::ffi::OsString::from(name);
+    if let Some(ext) = nixdex_path.extension() {
+        file_name.push(".");
+        file_name.push(ext);
+    }
+    dir.join(file_name)
+}
+
+fn nix_index_exe() -> PathBuf {
+    sibling_exe("nix-index")
+}
+
+fn nix_locate_exe() -> PathBuf {
+    sibling_exe("nix-locate")
+}
+
 fn make_store_path(attr: &str, output: &str, toplevel: bool, name: &str, hash: &str) -> StorePath {
     StorePath::new(
         "/nix/store".into(),
@@ -124,6 +148,24 @@ fn run(args: &[&str]) -> std::process::Output {
         .args(args)
         .output()
         .expect("spawn nixdex")
+}
+
+/// Run `exe` with `args`, pinning `HOME` to a known directory and clearing
+/// environment variables that could otherwise override the computed default
+/// database directory (`XDG_CACHE_HOME`, `NIX_INDEX_DATABASE`).
+fn run_with_home(
+    exe: impl AsRef<std::path::Path>,
+    args: &[&str],
+    home: &str,
+) -> std::process::Output {
+    let exe = exe.as_ref();
+    Command::new(exe)
+        .args(args)
+        .env("HOME", home)
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("NIX_INDEX_DATABASE")
+        .output()
+        .unwrap_or_else(|err| panic!("spawn {} failed: {err}", exe.display()))
 }
 
 #[test]
@@ -256,4 +298,155 @@ fn generate_sidecars_creates_sidecar_files() {
     assert!(dir.path().join("files.basename.fst").is_file());
     assert!(dir.path().join("files.basename.postings").is_file());
     assert!(dir.path().join("files.packages.names").is_file());
+}
+
+#[test]
+fn nix_index_binary_defaults_to_upstream_cache_dir() {
+    let output = run_with_home(
+        nix_index_exe(),
+        &["--help"],
+        "/tmp/nixdex-test-home-nix-index",
+    );
+    assert!(
+        output.status.success(),
+        "nix-index --help failed: {output:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("/tmp/nixdex-test-home-nix-index/.cache/nix-index"),
+        "expected upstream-compatible nix-index cache dir as default, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("/tmp/nixdex-test-home-nix-index/.cache/nixdex"),
+        "nix-index must not default to the nixdex cache dir, got: {stdout}"
+    );
+}
+
+#[test]
+fn nix_locate_binary_defaults_to_upstream_cache_dir() {
+    let output = run_with_home(
+        nix_locate_exe(),
+        &["--help"],
+        "/tmp/nixdex-test-home-nix-locate",
+    );
+    assert!(
+        output.status.success(),
+        "nix-locate --help failed: {output:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("/tmp/nixdex-test-home-nix-locate/.cache/nix-index"),
+        "expected upstream-compatible nix-index cache dir as default, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("/tmp/nixdex-test-home-nix-locate/.cache/nixdex"),
+        "nix-locate must not default to the nixdex cache dir, got: {stdout}"
+    );
+}
+
+#[test]
+fn nixdex_index_subcommand_defaults_to_nixdex_cache_dir() {
+    let output = run_with_home(
+        NIXDEX_EXE,
+        &["index", "--help"],
+        "/tmp/nixdex-test-home-nixdex-index",
+    );
+    assert!(
+        output.status.success(),
+        "nixdex index --help failed: {output:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("/tmp/nixdex-test-home-nixdex-index/.cache/nixdex"),
+        "expected nixdex cache dir as default for `nixdex index`, got: {stdout}"
+    );
+}
+
+#[test]
+fn nixdex_locate_subcommand_defaults_to_nixdex_cache_dir() {
+    let output = run_with_home(
+        NIXDEX_EXE,
+        &["locate", "--help"],
+        "/tmp/nixdex-test-home-nixdex-locate",
+    );
+    assert!(
+        output.status.success(),
+        "nixdex locate --help failed: {output:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("/tmp/nixdex-test-home-nixdex-locate/.cache/nixdex"),
+        "expected nixdex cache dir as default for `nixdex locate`, got: {stdout}"
+    );
+}
+
+#[test]
+fn nixdex_search_subcommand_defaults_to_nixdex_cache_dir() {
+    let output = run_with_home(
+        NIXDEX_EXE,
+        &["search", "--help"],
+        "/tmp/nixdex-test-home-nixdex-search",
+    );
+    assert!(
+        output.status.success(),
+        "nixdex search --help failed: {output:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("/tmp/nixdex-test-home-nixdex-search/.cache/nixdex"),
+        "expected nixdex cache dir as default for `nixdex search`, got: {stdout}"
+    );
+}
+
+#[test]
+fn nix_locate_explicit_db_flag_overrides_default() {
+    // Even though the binary computes a default database directory, an
+    // explicit `-d` must still take precedence. We assert this by pointing
+    // at a nonexistent directory and checking that the resulting error
+    // references the explicit path rather than the default.
+    let output = Command::new(nix_locate_exe())
+        .args(["-d", "/nonexistent-nixdex-test-dir-xyz", "somepattern"])
+        .env("HOME", "/tmp/nixdex-test-home-override")
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("NIX_INDEX_DATABASE")
+        .output()
+        .expect("spawn nix-locate");
+    assert!(
+        !output.status.success(),
+        "expected failure for nonexistent database, got: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("/nonexistent-nixdex-test-dir-xyz"),
+        "expected explicit db path to be honored in error, got stderr: {stderr}"
+    );
+}
+
+#[test]
+fn nix_index_binary_parses_args_via_command_factory() {
+    // Sanity check that the custom `CommandFactory`/`FromArgMatches` wiring in
+    // the `nix-index` binary (needed to inject the upstream-compatible
+    // default database directory) still produces a working `Args` value that
+    // flows through to the existing validation logic in `run()`.
+    let output = Command::new(nix_index_exe())
+        .args([
+            "--small",
+            "--filter-prefix",
+            "/usr/",
+            "-d",
+            "/tmp/nixdex-test-smoke",
+        ])
+        .env("HOME", "/tmp/nixdex-test-home-smoke")
+        .env_remove("XDG_CACHE_HOME")
+        .output()
+        .expect("spawn nix-index");
+    assert!(
+        !output.status.success(),
+        "expected failure for incompatible --small/--filter-prefix, got: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--small is incompatible with --filter-prefix"),
+        "unexpected stderr: {stderr}"
+    );
 }
