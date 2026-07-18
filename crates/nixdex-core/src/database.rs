@@ -11,6 +11,7 @@
 //! (see [`crate::basename_index`]).
 
 use std::fs::{self, File};
+use std::io;
 use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 
@@ -235,6 +236,16 @@ impl Writer {
         file.write_all(FILE_MAGIC)?;
         file.write_u64::<LittleEndian>(version)?;
 
+        // If the redb sidecar is disabled, remove any stale sidecars left over
+        // from a previous build so the reader cannot open outdated exact-path
+        // indexes.
+        if !enable_redb
+            && let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty())
+        {
+            let _ = fs::remove_file(dir.join(redb_index::DEFAULT_FILE));
+            let _ = fs::remove_file(dir.join(redb_index::PATH_CACHE_FILE));
+        }
+
         let redb = if enable_redb {
             path.parent()
                 .filter(|dir| !dir.as_os_str().is_empty())
@@ -425,14 +436,22 @@ impl Writer {
             .as_mut()
             .ok_or_else(|| Error::Io(std::io::Error::other("database file not open")))?;
 
-        // Compress the slices sequentially with a single zstd context.
-        // Each slice is already a whole frcode frame, and `zstd::bulk`
-        // knows the exact source size. This avoids the per-frame `Encoder`
-        // allocations and the multi-worker `CCtx` memory explosion that
-        // makes high compression levels (e.g. 22) allocate ~1 GiB per core.
-        let mut compressor = zstd::bulk::Compressor::new(self.level)?;
-        for &slice in &slices {
-            let frame = compressor.compress(slice)?;
+        // Compress the slices in parallel using Rayon, with a single-threaded
+        // `zstd::bulk::Compressor` instantiated inside each task. This keeps the
+        // compression fast while avoiding the per-frame `Encoder` allocations and
+        // the multi-worker `CCtx` memory explosion that makes high compression
+        // levels allocate ~1 GiB per core.
+        let level = self.level;
+        let compressed: Vec<io::Result<Vec<u8>>> = slices
+            .par_iter()
+            .map(|&slice| {
+                let mut compressor = zstd::bulk::Compressor::new(level)?;
+                compressor.compress(slice)
+            })
+            .collect();
+
+        for frame_result in compressed {
+            let frame = frame_result.map_err(Error::Io)?;
             let len_u32 = u32::try_from(frame.len())
                 .map_err(|_| Error::Corrupt("compressed frame length overflow"))?;
             file.write_all(&frame)?;

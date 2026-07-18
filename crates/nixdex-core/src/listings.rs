@@ -278,9 +278,10 @@ async fn fetch_listings_with_source<S: ListingSource>(
                 roots.push(entry);
             }
         }
-        for entry in roots {
-            in_flight_for_feeder.fetch_add(1, Ordering::SeqCst);
-            queue_for_feeder.lock().await.push_back(entry);
+        in_flight_for_feeder.fetch_add(roots.len(), Ordering::SeqCst);
+        {
+            let mut q = queue_for_feeder.lock().await;
+            q.extend(roots);
         }
         input_done_for_feeder.store(true, Ordering::SeqCst);
         notify_for_feeder.notify_one();
