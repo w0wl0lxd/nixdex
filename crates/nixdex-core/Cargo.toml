@@ -5,8 +5,8 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description.workspace = true
-publish = false
+description = "Core library for nixdex — building and searching a Nix package file index"
+publish = true
 
 [features]
 default = []
