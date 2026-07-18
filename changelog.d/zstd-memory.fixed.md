@@ -1,1 +1,1 @@
-Switch `nixdex-core` database compression from multi-threaded `zstd::Encoder` to single-threaded `zstd::bulk::Compressor`. This removes the per-worker ~1 GiB memory allocation during index builds and drops peak RSS for large databases from ~11.7 GB to ~628 MB.
+- Switch `nixdex-core` database compression from multi-threaded `zstd::Encoder` to single-threaded `zstd::bulk::Compressor`. This removes the per-worker ~1 GiB memory allocation during index builds and drops peak RSS for large databases from ~11.7 GB to ~628 MB.
