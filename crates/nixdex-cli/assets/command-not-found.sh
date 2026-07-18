@@ -12,21 +12,6 @@ comma_cmd() {
   fi
 }
 
-# Detect whether the user is using `nix profile` rather than `nix-env`.
-# This checks the XDG-style state directory first, then the classic
-# ~/.nix-profile symlink, and caches the result in a global variable.
-uses_nix_profile() {
-  if [ -z "${__nixdex_uses_profile-}" ]; then
-    local state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
-    if [ -e "$state_home/nix/profile/manifest.json" ] || [ -e "$HOME/.nix-profile/manifest.json" ]; then
-      __nixdex_uses_profile=true
-    else
-      __nixdex_uses_profile=false
-    fi
-  fi
-  [ "$__nixdex_uses_profile" = "true" ]
-}
-
 # Print any extra nix-locate arguments derived from NIXDEX_DATABASE /
 # NIX_INDEX_DATABASE, one per line, so the caller can collect them with mapfile.
 nixdex_db_args() {
@@ -63,7 +48,7 @@ command_not_found_handle() {
   run_selected() {
     local selected=$1
     shift
-    if uses_nix_profile; then
+    if [ -e "$HOME/.nix-profile/manifest.json" ]; then
       nix shell "$toplevel#$selected" -c "$@"
     else
       local escaped
@@ -83,9 +68,12 @@ The program '$cmd' is currently not installed. It is provided by
 the package '$toplevel.$selected'.
 EOF
       printf 'Should it be used? ([Y]es | [n]one): ' >&2
-      read -r answer </dev/tty
+      if ! read -r answer </dev/tty; then
+        echo "$cmd: command not found" >&2
+        return 127
+      fi
       case "$answer" in
-      [yY] | "")
+      [yY])
         run_selected "$selected" "$@"
         return $?
         ;;
@@ -108,9 +96,12 @@ EOF
 $attrs
 EOF
     printf 'Should the first output be used? ([Y]es | [number] | [n]one): ' >&2
-    read -r answer </dev/tty
+    if ! read -r answer </dev/tty; then
+      echo "$cmd: command not found" >&2
+      return 127
+    fi
     case "$answer" in
-    [yY] | "")
+    [yY])
       selected=$(printf '%s\n' "$attrs" | head -n 1)
       ;;
     [nN])
@@ -149,7 +140,7 @@ EOF
 The program '$cmd' is currently not installed. It is provided by
 the package '$toplevel.$attrs', which I will now install for you.
 EOF
-      if uses_nix_profile; then
+      if [ -e "$HOME/.nix-profile/manifest.json" ]; then
         if nix profile install "$toplevel#$attrs"; then
           "$@"
           return
@@ -180,7 +171,7 @@ EOF
       prompt_and_run "$@"
       return $?
     else
-      if uses_nix_profile; then
+      if [ -e "$HOME/.nix-profile/manifest.json" ]; then
         if [ -n "$comma" ]; then
           cat >&2 <<EOF
 The program '$cmd' is currently not installed. You can install it
@@ -239,7 +230,7 @@ The program '$cmd' is currently not installed. It is provided by
 several packages. You can install it by typing one of the following:
 EOF
       while IFS= read -r attr; do
-        if uses_nix_profile; then
+        if [ -e "$HOME/.nix-profile/manifest.json" ]; then
           echo "  nix profile install $toplevel#$attr" >&2
         else
           echo "  nix-env -iA $toplevel.$attr" >&2
@@ -253,7 +244,7 @@ EOF
 Or run it once with:
 EOF
       while IFS= read -r attr; do
-        if uses_nix_profile; then
+        if [ -e "$HOME/.nix-profile/manifest.json" ]; then
           echo "  nix shell $toplevel#$attr -c $cmd ..." >&2
         else
           echo "  nix-shell -p $attr --run '$cmd ...'" >&2

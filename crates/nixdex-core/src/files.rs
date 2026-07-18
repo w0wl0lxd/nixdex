@@ -694,21 +694,38 @@ mod tests {
         };
         assert!(good.is_encodable());
 
-        let bad_path = FileTreeEntry {
+        let bad_path_newline = FileTreeEntry {
             path: b"/bin/b\nad".to_vec(),
             node: FileNode::Regular {
                 size: 1,
                 executable: true,
             },
         };
-        assert!(!bad_path.is_encodable());
+        assert!(!bad_path_newline.is_encodable());
 
-        let bad_target = FileTreeEntry {
+        let bad_path_nul = FileTreeEntry {
+            path: b"/bin/b\x00ad".to_vec(),
+            node: FileNode::Regular {
+                size: 1,
+                executable: true,
+            },
+        };
+        assert!(!bad_path_nul.is_encodable());
+
+        let bad_target_newline = FileTreeEntry {
             path: b"/bin/link".to_vec(),
             node: FileNode::Symlink {
                 target: Bytes::from_static(b"/etc/passwd\n"),
             },
         };
-        assert!(!bad_target.is_encodable());
+        assert!(!bad_target_newline.is_encodable());
+
+        let bad_target_nul = FileTreeEntry {
+            path: b"/bin/link2".to_vec(),
+            node: FileNode::Symlink {
+                target: Bytes::from_static(b"/etc/pass\x00wd"),
+            },
+        };
+        assert!(!bad_target_nul.is_encodable());
     }
 }

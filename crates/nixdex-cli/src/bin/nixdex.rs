@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use clap::{CommandFactory, Parser};
-use clap_complete::{Shell, generate, generate_to};
+use clap_complete::{Shell, generate};
 use color_eyre::eyre::WrapErr;
 use tracing_subscriber::EnvFilter;
 
@@ -90,9 +90,6 @@ enum Cmd {
     /// Generate manual pages (hidden; used by packaging).
     #[command(hide = true)]
     GenerateMan(GenerateManOpts),
-    /// Generate shell completion files (hidden; used by packaging).
-    #[command(hide = true)]
-    GenerateCompletions(GenerateCompletionsOpts),
     /// Build a nixdex database (alias for `nix-index`).
     Index(index::Args),
     /// Find files in nixpkgs packages (alias for `nix-locate`).
@@ -213,19 +210,6 @@ struct CompletionsOpts {
 #[command(author, about, version)]
 struct GenerateManOpts {
     /// Directory to write the generated `*.1` files to.
-    #[arg(value_name = "DIR")]
-    out_dir: PathBuf,
-}
-
-/// Generate shell completion files for nixdex, nix-index, and nix-locate.
-#[derive(Debug, Parser)]
-#[command(author, about, version)]
-struct GenerateCompletionsOpts {
-    /// Shell for which to generate completions.
-    #[arg(value_enum)]
-    shell: Shell,
-
-    /// Directory to write the completion files to.
     #[arg(value_name = "DIR")]
     out_dir: PathBuf,
 }
@@ -753,30 +737,12 @@ fn run_command_not_found(opts: CommandNotFoundOpts) -> color_eyre::Result<()> {
     }
 }
 
-fn nix_profile_manifest() -> Option<PathBuf> {
-    let state_home = std::env::var_os("XDG_STATE_HOME")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|s| !s.is_empty())
-                .map(|h| PathBuf::from(h).join(".local/state"))
-        })?;
-    let xdg = state_home.join("nix/profile/manifest.json");
-    if xdg.is_file() {
-        return Some(xdg);
-    }
-    let classic = std::env::var_os("HOME")
-        .filter(|s| !s.is_empty())
-        .map(|h| PathBuf::from(h).join(".nix-profile/manifest.json"))?;
-    if classic.is_file() {
-        return Some(classic);
-    }
-    None
-}
-
 fn auto_install_and_exec(provider: &str, cmd: &str, args: &[String]) -> color_eyre::Result<()> {
-    let uses_nix_profile = nix_profile_manifest().is_some();
+    let uses_nix_profile = std::env::var_os("HOME").is_some_and(|h| {
+        std::path::PathBuf::from(h)
+            .join(".nix-profile/manifest.json")
+            .is_file()
+    });
 
     let install_status = if uses_nix_profile {
         std::process::Command::new("nix")
@@ -892,6 +858,8 @@ fn run_completions(opts: CompletionsOpts) {
 }
 
 fn run_generate_man(opts: GenerateManOpts) -> color_eyre::Result<()> {
+    use std::io::Write;
+
     std::fs::create_dir_all(&opts.out_dir)
         .wrap_err_with(|| format!("failed to create {}", opts.out_dir.display()))?;
 
@@ -899,8 +867,8 @@ fn run_generate_man(opts: GenerateManOpts) -> color_eyre::Result<()> {
     let nixdex_name = nixdex_cmd.get_name().to_string();
     let pages = [
         (nixdex_name, nixdex_cmd),
-        (String::from("nix-index"), index::Args::command()),
-        (String::from("nix-locate"), locate::Opts::command()),
+        (String::from("nix-index"), index::Args::command().name("nix-index")),
+        (String::from("nix-locate"), locate::Opts::command().name("nix-locate")),
     ];
 
     for (name, cmd) in pages {
@@ -911,24 +879,8 @@ fn run_generate_man(opts: GenerateManOpts) -> color_eyre::Result<()> {
         clap_mangen::Man::new(cmd)
             .render(&mut buf)
             .wrap_err_with(|| format!("failed to render man page for {name}"))?;
-    }
-
-    Ok(())
-}
-
-fn run_generate_completions(opts: GenerateCompletionsOpts) -> color_eyre::Result<()> {
-    std::fs::create_dir_all(&opts.out_dir)
-        .wrap_err_with(|| format!("failed to create {}", opts.out_dir.display()))?;
-
-    let pages = [
-        (String::from("nixdex"), Opts::command()),
-        (String::from("nix-index"), index::Args::command()),
-        (String::from("nix-locate"), locate::Opts::command()),
-    ];
-
-    for (name, mut cmd) in pages {
-        generate_to(opts.shell, &mut cmd, &name, &opts.out_dir)
-            .wrap_err_with(|| format!("failed to generate completions for {name}"))?;
+        buf.flush()
+            .wrap_err_with(|| format!("failed to flush man page for {name}"))?;
     }
 
     Ok(())
@@ -990,7 +942,6 @@ async fn main() -> color_eyre::Result<()> {
             Ok(())
         }
         Cmd::GenerateMan(opts) => run_generate_man(opts),
-        Cmd::GenerateCompletions(opts) => run_generate_completions(opts),
         Cmd::Index(index_opts) => index::run(index_opts).await,
         Cmd::Locate(locate_opts) => locate::run(locate_opts),
         Cmd::Which(which_opts) => run_which(which_opts),
