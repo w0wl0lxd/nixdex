@@ -289,6 +289,7 @@ impl Writer {
                 !exclude_prefixes
                     .iter()
                     .any(|prefix| entry.path.starts_with(prefix))
+                    && entry.is_encodable()
             })
             .collect();
         if entries.is_empty() {
@@ -1841,6 +1842,9 @@ pub fn search_results(
 ///
 /// Returns an error if the database cannot be read or the pattern is invalid.
 pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
+    // Compile the path pattern once with defensive size limits for both the
+    // search and the output pass (highlighting, grouping).
+    let path_pattern = compile_search_regex(&options.pattern, "path")?;
     let results = search_results(options)?;
 
     // Track printed attrs for --minimal de-duplication (ordered set).
@@ -1862,9 +1866,7 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
 
         if print_match(
             options,
-            &Regex::new(&options.pattern).map_err(|err| {
-                crate::Error::Parse(format!("invalid path pattern '{}': {err}", options.pattern))
-            })?,
+            &path_pattern,
             &mut printed_attrs,
             &store_path,
             &entry,
@@ -2504,5 +2506,48 @@ mod tests {
 
         let err = Reader::open(&db_path).expect_err("truncated db should fail");
         assert!(matches!(err, Error::Corrupt(_)));
+    }
+
+    #[test]
+    fn add_skips_entries_with_forbidden_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+
+        let tree = FileTree::directory(vec![(
+            Bytes::from_static(b"bin"),
+            FileTree::directory(vec![
+                (Bytes::from_static(b"hello"), FileTree::regular(64472, true)),
+                // Symlink target containing a newline is invalid in frcode.
+                (
+                    Bytes::from_static(b"broken"),
+                    FileTree::symlink(Bytes::from_static(b"/etc/passwd\n")),
+                ),
+            ]),
+        )]);
+
+        let mut writer = Writer::create(&db_path, 1).expect("create");
+        writer.add(&sample_store_path(), &tree, b"").expect("add");
+        writer.finish().expect("finish");
+
+        let reader = Reader::open(&db_path).expect("reader");
+
+        let broken_re = Regex::new("broken").expect("regex");
+        let broken_hits = reader
+            .search_entries(&broken_re, None, None, None, None)
+            .expect("search");
+        assert!(
+            broken_hits.is_empty(),
+            "symlink with newline target should be skipped"
+        );
+
+        let hello_re = Regex::new("hello").expect("regex");
+        let hello_hits = reader
+            .search_entries(&hello_re, None, None, None, None)
+            .expect("search");
+        assert_eq!(hello_hits.len(), 1);
+        assert_eq!(
+            hello_hits.first().map(|(_, e)| e.path.as_slice()),
+            Some(b"/bin/hello".as_slice())
+        );
     }
 }

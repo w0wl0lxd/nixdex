@@ -1,0 +1,4 @@
+- Replace `mapfile` in `command-not-found.sh` with a POSIX-friendly read loop so Zsh can load the hook without errors.
+- Read interactive prompts from `/dev/tty` instead of stdin in `command-not-found.sh`.
+- Validate the selected package number before passing it to `sed`.
+- Leave the index fetch progress bar indeterminate because the closure fetcher discovers additional store paths as it runs.

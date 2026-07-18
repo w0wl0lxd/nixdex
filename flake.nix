@@ -85,6 +85,9 @@
                 --replace-fail "@out@" "$out"
               chmod 444 $out/etc/profile.d/command-not-found.fish
 
+              mkdir -p $out/share/man/man1
+              $out/bin/nixdex generate-man $out/share/man/man1
+
               if $out/bin/nixdex --version >/dev/null 2>&1; then
                 mkdir -p $out/share/bash-completion/completions
                 mkdir -p $out/share/zsh/site-functions

@@ -1,8 +1,9 @@
 # =============================================================================
 # nixdex .gitignore — dual-track AI / DevEx hygiene (2026)
 #
-# Tracked: product source, command-not-found scripts, research markdown notes
-# Ignored: local AI instruction overrides, tool scratch, secrets, build output
+# Tracked: product source and canonical command-not-found shell assets
+# Ignored: local AI instruction overrides, research dumps, dev tool configs,
+#          tool scratch, secrets, build output
 # =============================================================================
 
 # ----- Rust / Cargo ----------------------------------------------------------
@@ -35,6 +36,13 @@ Thumbs.db
 .vscode/
 *.code-workspace
 
+# ----- Stale root copies / local dev configs ---------------------------------
+/command-not-found.sh
+/command-not-found.nu
+/.cargo/config.toml
+/.config/sccache/config.toml
+/mise.toml
+
 # ----- Code indexing / analysis cache ----------------------------------------
 .codegraph/
 .cache/
@@ -47,8 +55,7 @@ mutants.out.old/
 
 # ----- Upstream / research dumps ---------------------------------------------
 .upstream/
-research/nix-index-db*/
-research/paths.cache
+/research/
 paths.cache
 
 # ----- AI agent instruction files (local-only) --------------------------------
@@ -99,9 +106,6 @@ lefthook-local.yml
 # Nextest / sccache local state
 .sccache/
 target-nextest/
-
-# Wave4 / research local DBs
-research/nixdex-db*/
 
 # Private local planning (never commit)
 .plan/
