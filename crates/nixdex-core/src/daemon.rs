@@ -280,7 +280,7 @@ async fn wait_signal() -> Result<SignalAction> {
 // The 15-point cognitive-complexity budget is too small for a `tokio::select!`
 // over three signal handlers; splitting this further would hurt readability.
 #[allow(clippy::cognitive_complexity)]
-#[cfg(unix)]
+#[cfg(all(feature = "daemon", unix))]
 async fn wait_unix_signal() -> Result<SignalAction> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -301,7 +301,7 @@ async fn wait_unix_signal() -> Result<SignalAction> {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(all(feature = "daemon", not(unix)))]
 async fn wait_ctrl_c() -> Result<SignalAction> {
     tokio::signal::ctrl_c().await.map_err(crate::Error::Io)?;
     tracing::info!("received Ctrl+C, shutting down");
