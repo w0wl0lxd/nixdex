@@ -1,0 +1,1 @@
+- `nix-locate` output highlighting now reuses the same defensively size-limited regex used for the search, avoiding a second unbounded compilation.

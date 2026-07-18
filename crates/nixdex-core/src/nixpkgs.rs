@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use indexmap::IndexMap;
+use indicatif::ProgressBar;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -576,6 +577,7 @@ async fn stream_options_to_entries(
     tx: &mpsc::Sender<PackageEntry>,
     meta_tx: Option<&mpsc::Sender<PackageMeta>>,
     main_program: bool,
+    progress: &ProgressBar,
 ) -> Result<usize> {
     if tx.is_closed() {
         return Ok(0);
@@ -626,6 +628,7 @@ async fn stream_options_to_entries(
                 return Ok(count);
             }
             count += 1;
+            progress.inc(1);
         }
     }
     await_eval_handle(stream.handle).await?;
@@ -646,9 +649,10 @@ pub async fn stream_package_entries(
     main_program: bool,
     tx: mpsc::Sender<PackageEntry>,
     meta_tx: mpsc::Sender<PackageMeta>,
+    progress: &ProgressBar,
 ) -> Result<usize> {
     let meta_ref = Some(&meta_tx);
-    let mut count = stream_options_to_entries(&base, &tx, meta_ref, main_program).await?;
+    let mut count = stream_options_to_entries(&base, &tx, meta_ref, main_program, progress).await?;
 
     // A `--select` expression is applied to the root nixpkgs set; extra scopes
     // are separate attribute paths and should not be evaluated when the caller
@@ -677,7 +681,7 @@ pub async fn stream_package_entries(
             scope: Some(scope.as_str()),
             no_overlays: base.no_overlays,
         };
-        match stream_options_to_entries(&scope_opts, &tx, meta_ref, main_program).await {
+        match stream_options_to_entries(&scope_opts, &tx, meta_ref, main_program, progress).await {
             Ok(n) => count += n,
             Err(_) => {
                 // Soft-skip missing scopes (custom nixpkgs without haskellPackages).

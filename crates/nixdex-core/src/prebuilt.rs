@@ -55,7 +55,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Configuration for prebuilt index polling.
 #[derive(Debug, Clone)]
 pub struct PrebuiltConfig {
-    /// Release URL pattern (e.g., "https://github.com/nix-community/nix-index-database/releases/download").
+    /// Release URL pattern (e.g., <https://github.com/nix-community/nix-index-database/releases/download>).
     pub release_url: String,
     /// Architecture identifier (e.g., "x86_64-linux").
     pub architecture: String,

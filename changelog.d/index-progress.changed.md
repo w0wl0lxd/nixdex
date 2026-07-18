@@ -1,0 +1,1 @@
+- `nix-index` builds now display `indicatif` progress bars for nixpkgs evaluation and `.ls` fetching, including per-second rates and ETA.

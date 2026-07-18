@@ -19,6 +19,7 @@ sonic-rs = { workspace = true }
 serde = { workspace = true }
 nixdex-core = { workspace = true, features = ["cli", "daemon"] }
 clap_complete = "4.6.7"
+clap_mangen = "0.2.26"
 
 [dev-dependencies]
 bytes = { workspace = true }
