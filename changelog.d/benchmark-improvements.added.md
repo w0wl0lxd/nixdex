@@ -1,0 +1,5 @@
+- Expanded the benchmark suite for `nixdex-core` and the `nixdex` CLI.
+- Added Criterion baselines for `SearchDb` open/load, literal/exact/regex/description/fuzzy package search, and sort orders across dataset sizes.
+- Parameterized locate and index Criterion benches by package/file count and added `Reader::open`, `search_entries`, `search_results`, and `generate_sidecars` baselines with element throughput reporting.
+- Added `scripts/benchmark-locate.sh`, `scripts/benchmark-search.sh`, and `scripts/benchmark-index-comparison.sh` to compare `nixdex` against upstream `nix-index`/`nix-locate` via `hyperfine`.
+- Updated `just benchmark` to run all Criterion benches and added `just benchmark-locate`, `just benchmark-search`, and `just benchmark-index-compare` recipes for CLI-level comparisons.
