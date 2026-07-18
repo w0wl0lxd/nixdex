@@ -1,0 +1,1 @@
+- Updated `.gitignore` to ignore the `research/` directory and local dev configs such as `.cargo/config.toml`, `.config/sccache/config.toml`, and `mise.toml`.

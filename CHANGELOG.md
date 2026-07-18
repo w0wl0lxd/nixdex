@@ -26,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Track `.config/rail.toml` and wire `cargo-rail` into `mise.toml` and `justfile` for dependency linting.
+- Daemon now loads index components into an atomic `IndexSnapshot` so requests never observe a partially loaded index during reload.
+- Add `--admin-token` / `NIXDEX_ADMIN_TOKEN` authentication for `POST /reload`; without a token the endpoint is restricted to loopback addresses.
 - Apply `cargo fmt` to the redb index and CLI command-not-found code.
 
 ### Fixed

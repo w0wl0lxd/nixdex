@@ -1,0 +1,2 @@
+- Daemon now loads index components into an atomic `IndexSnapshot` so requests never observe a partially loaded index during reload.
+- Add `--admin-token` / `NIXDEX_ADMIN_TOKEN` authentication for `POST /reload`; without a token the endpoint is restricted to loopback addresses.
