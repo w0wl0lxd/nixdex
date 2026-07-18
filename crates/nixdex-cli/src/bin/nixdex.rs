@@ -3,6 +3,7 @@
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate, generate_to};
@@ -42,6 +43,19 @@ fn comma_available() -> Option<&'static str> {
 #[cfg(not(unix))]
 fn comma_available() -> Option<&'static str> {
     None
+}
+
+/// Resolve the default nixdex database directory.
+fn default_db_dir() -> &'static str {
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            nixdex_core::nixdex_dir()
+                .into_os_string()
+                .into_string()
+                .unwrap_or_else(|_| String::from("/tmp/nixdex"))
+        })
+        .as_str()
 }
 
 /// Color policy for terminal output.
@@ -104,7 +118,7 @@ struct SearchOpts {
     pattern: String,
 
     /// Directory where the index is stored.
-    #[arg(short, long = "db", default_value_os_t = nixdex_core::nixdex_dir(), env = "NIX_INDEX_DATABASE")]
+    #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
     database: PathBuf,
 
     /// Treat PATTERN as regex instead of literal text.
@@ -164,7 +178,7 @@ struct InfoOpts {
     attr: String,
 
     /// Directory where the index is stored.
-    #[arg(short, long = "db", default_value_os_t = nixdex_core::nixdex_dir(), env = "NIX_INDEX_DATABASE")]
+    #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
     database: PathBuf,
 
     /// Print the result as JSON.
@@ -177,7 +191,7 @@ struct InfoOpts {
 #[command(author, about, version)]
 struct StatsOpts {
     /// Directory where the index is stored.
-    #[arg(short, long = "db", default_value_os_t = nixdex_core::nixdex_dir(), env = "NIX_INDEX_DATABASE")]
+    #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
     database: PathBuf,
 
     /// Print the statistics as JSON.
@@ -225,7 +239,7 @@ struct WhichOpts {
     cmd: String,
 
     /// Directory where the index is stored.
-    #[arg(short, long = "db", default_value_os_t = nixdex_core::nixdex_dir(), env = "NIX_INDEX_DATABASE")]
+    #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
     database: PathBuf,
 
     /// Print all matching packages instead of the first one.
@@ -242,7 +256,7 @@ struct WhichOpts {
 #[command(author, about, version)]
 struct UpdateOpts {
     /// Directory where the index is stored.
-    #[arg(short, long = "db", default_value_os_t = nixdex_core::nixdex_dir(), env = "NIX_INDEX_DATABASE")]
+    #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
     database: PathBuf,
 
     /// Release URL pattern for nix-index-database.
@@ -266,7 +280,7 @@ struct UpdateOpts {
 #[command(author, about, version)]
 struct GenerateSidecarsOpts {
     /// Directory where the index is stored.
-    #[arg(short, long = "db", default_value_os_t = nixdex_core::nixdex_dir(), env = "NIX_INDEX_DATABASE")]
+    #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
     database: PathBuf,
 }
 
@@ -283,7 +297,7 @@ struct CommandNotFoundOpts {
     args: Vec<String>,
 
     /// Directory where the index is stored.
-    #[arg(short, long = "db", default_value_os_t = nixdex_core::nixdex_dir(), env = "NIX_INDEX_DATABASE")]
+    #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
     database: PathBuf,
 
     /// Automatically install the package and re-execute the command.
