@@ -24,15 +24,15 @@ fn parse_jobs(s: &str) -> Result<usize, String> {
     Ok(n)
 }
 
-/// Resolve the default nix-index database directory.
+/// Resolve the default nixdex database directory.
 fn default_db_dir() -> &'static str {
     static CACHE: OnceLock<String> = OnceLock::new();
     CACHE
         .get_or_init(|| {
-            nixdex_core::nix_index_dir()
+            nixdex_core::nixdex_dir()
                 .into_os_string()
                 .into_string()
-                .unwrap_or_else(|_| String::from("/tmp/nix-index"))
+                .unwrap_or_else(|_| String::from("/tmp/nixdex"))
         })
         .as_str()
 }
@@ -115,6 +115,13 @@ pub struct Args {
     /// unlikely to be cached on the official binary cache.
     #[arg(long)]
     pub no_overlays: bool,
+
+    /// Allow unfree packages during nixpkgs evaluation.
+    ///
+    /// This sets `config.allowUnfree = true` so packages such as CUDA
+    /// tools and unfree firmware are included in the index.
+    #[arg(long)]
+    pub allow_unfree: bool,
 
     /// Do not recurse into runtime references when fetching `.ls` listings.
     ///
@@ -230,6 +237,17 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
         args.filter_prefix
     };
 
+    // On darwin targets, also walk the `darwin` scope to include darwin-specific
+    // command packages (e.g. darwin.traceroute, darwin.xcrun).
+    let mut extra_scopes = args.extra_scopes;
+    let target_system = args
+        .system
+        .clone()
+        .unwrap_or_else(nixdex_core::prebuilt::default_architecture);
+    if target_system.contains("darwin") && !extra_scopes.iter().any(|s| s == "darwin") {
+        extra_scopes.push(String::from("darwin"));
+    }
+
     let options = nixdex_core::index::UpdateOptions {
         jobs: args.jobs,
         timeout: args.timeout,
@@ -252,8 +270,9 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
         path_cache_ttl: args.path_cache_ttl,
         main_program: !args.no_main_program,
         no_overlays: args.no_overlays,
+        allow_unfree: args.allow_unfree,
         no_closure: args.no_closure,
-        extra_scopes: args.extra_scopes,
+        extra_scopes,
         only_eval: args.only_eval,
         cache_url: args.cache_url,
         exclude_prefix: args.exclude_prefix,
@@ -288,5 +307,26 @@ mod tests {
         let result =
             Args::try_parse_from(["nix-index", "--requests", "0", "-d", "/tmp/nix-index-test"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn default_db_dir_matches_nixdex_cache_dir() {
+        // The `nixdex index` subcommand (and the library `Args` type used by it)
+        // must default to `~/.cache/nixdex`, not the upstream-compatible
+        // `~/.cache/nix-index` used by the standalone `nix-index` binary.
+        assert_eq!(PathBuf::from(default_db_dir()), nixdex_core::nixdex_dir());
+    }
+
+    #[test]
+    fn args_parsing_defaults_database_to_nixdex_cache_dir() {
+        let args = Args::try_parse_from(["nix-index"]).expect("parse with defaults");
+        assert_eq!(args.database, nixdex_core::nixdex_dir());
+    }
+
+    #[test]
+    fn args_parsing_explicit_db_overrides_default() {
+        let args = Args::try_parse_from(["nix-index", "-d", "/tmp/nix-index-explicit"])
+            .expect("parse with explicit db");
+        assert_eq!(args.database, PathBuf::from("/tmp/nix-index-explicit"));
     }
 }
