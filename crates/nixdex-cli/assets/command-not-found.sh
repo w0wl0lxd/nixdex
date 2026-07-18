@@ -35,7 +35,9 @@ command_not_found_handle() {
   comma=$(comma_cmd)
 
   local db_args=()
-  mapfile -t db_args < <(nixdex_db_args)
+  while IFS= read -r line; do
+    [ -n "$line" ] && db_args+=("$line")
+  done < <(nixdex_db_args)
 
   local attrs
   attrs=$(@out@/bin/nix-locate "${db_args[@]}" --minimal --no-group --type x --type s --whole-name --at-root "/bin/$cmd")
@@ -66,7 +68,7 @@ The program '$cmd' is currently not installed. It is provided by
 the package '$toplevel.$selected'.
 EOF
       printf 'Should it be used? ([Y]es | [n]one): ' >&2
-      read -r answer
+      read -r answer </dev/tty
       case "$answer" in
       [yY] | "")
         run_selected "$selected" "$@"
@@ -91,7 +93,7 @@ EOF
 $attrs
 EOF
     printf 'Should the first output be used? ([Y]es | [number] | [n]one): ' >&2
-    read -r answer
+    read -r answer </dev/tty
     case "$answer" in
     [yY] | "")
       selected=$(printf '%s\n' "$attrs" | head -n 1)
@@ -105,7 +107,12 @@ EOF
       return 127
       ;;
     *)
-      selected=$(printf '%s\n' "$attrs" | sed -n "${answer}p")
+      if [ "$answer" -gt 0 ] && [ "$answer" -le "$len" ] 2>/dev/null; then
+        selected=$(printf '%s\n' "$attrs" | sed -n "${answer}p")
+      else
+        echo "$cmd: command not found" >&2
+        return 127
+      fi
       ;;
     esac
 

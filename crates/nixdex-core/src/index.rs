@@ -445,18 +445,10 @@ impl IndexBuilder {
         fetch_pb.set_message("Fetching listings...");
 
         let stream = self.spawn_package_eval_stream(eval_pb.clone());
-        let fetch_pb_for_eval = fetch_pb.clone();
-        let eval_handle = tokio::spawn(async move {
-            let result = Self::await_eval(stream.eval).await;
-            if let Ok((count, _)) = &result {
-                let len = match u64::try_from(*count) {
-                    Ok(value) => value,
-                    Err(_) => u64::MAX,
-                };
-                fetch_pb_for_eval.set_length(len);
-            }
-            result
-        });
+        // The fetch phase total is not known at evaluation time because the
+        // closure fetcher discovers additional runtime references as it
+        // processes each root, so leave the fetch progress bar indeterminate.
+        let eval_handle = tokio::spawn(Self::await_eval(stream.eval));
 
         let fetcher = self.new_fetcher()?;
         let filter_prefix = if opts.small && opts.filter_prefix.is_empty() {
@@ -596,14 +588,16 @@ fn eval_spinner() -> ProgressBar {
     pb
 }
 
-/// Create a bar progress bar for the listing fetch phase and attach it to `multi`.
+/// Create a spinner progress bar for the listing fetch phase and attach it to `multi`.
+/// The total amount of work is not known ahead of time because closure
+/// traversal discovers additional store paths as it runs.
 fn fetch_bar(multi: &MultiProgress) -> ProgressBar {
-    let pb = multi.add(ProgressBar::new(0));
+    let pb = multi.add(ProgressBar::new_spinner());
     pb.set_style(
         ProgressStyle::with_template(
-            "[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {per_sec} {msg}",
+            "{spinner:.green} Fetching listings... {pos} entries {per_sec} {elapsed_precise}",
         )
-        .unwrap_or_else(|_| ProgressStyle::default_bar()),
+        .unwrap_or_else(|_| ProgressStyle::default_spinner()),
     );
     pb
 }
