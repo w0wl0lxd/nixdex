@@ -45,15 +45,15 @@ fn comma_available() -> Option<&'static str> {
     None
 }
 
-/// Resolve the default nix-index database directory.
+/// Resolve the default nixdex database directory.
 fn default_db_dir() -> &'static str {
     static CACHE: OnceLock<String> = OnceLock::new();
     CACHE
         .get_or_init(|| {
-            nixdex_core::nix_index_dir()
+            nixdex_core::nixdex_dir()
                 .into_os_string()
                 .into_string()
-                .unwrap_or_else(|_| String::from("/tmp/nix-index"))
+                .unwrap_or_else(|_| String::from("/tmp/nixdex"))
         })
         .as_str()
 }
