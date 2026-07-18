@@ -140,6 +140,13 @@ pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// The requested database file does not exist.
+    #[error("no database found at {path}; run `nix-index` (or `nixdex update`) to create one")]
+    MissingDatabase {
+        /// Path to the missing database file.
+        path: PathBuf,
+    },
+
     /// JSON (de)serialization failed.
     #[error("JSON error: {0}")]
     Json(String),
@@ -599,7 +606,15 @@ impl Reader {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path_buf = path.as_ref().to_path_buf();
 
-        let metadata = fs::metadata(&path_buf)?;
+        let metadata = fs::metadata(&path_buf).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                Error::MissingDatabase {
+                    path: path_buf.clone(),
+                }
+            } else {
+                Error::Io(err)
+            }
+        })?;
         if metadata.len() > MAX_DATABASE_BYTES {
             return Err(Error::Corrupt("database file exceeds maximum size"));
         }
@@ -1774,7 +1789,10 @@ pub fn search_results(
                     package_re
                         .as_ref()
                         .is_none_or(|re| re.is_match(store_path.name().as_bytes()))
-                        && options.hash.as_deref().is_none_or(|h| h == store_path.hash())
+                        && options
+                            .hash
+                            .as_deref()
+                            .is_none_or(|h| h == store_path.hash())
                 });
                 hits
             }
@@ -2501,5 +2519,31 @@ mod tests {
 
         let err = Reader::open(&db_path).expect_err("truncated db should fail");
         assert!(matches!(err, Error::Corrupt(_)));
+    }
+
+    #[test]
+    fn open_missing_database_returns_missing_database_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("files");
+
+        let err = Reader::open(&missing).expect_err("missing db should fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("run `nix-index` (or `nixdex update`) to create one"),
+            "unexpected error message: {message}"
+        );
+        match err {
+            Error::MissingDatabase { path } => assert_eq!(path, missing),
+            other => panic!("expected MissingDatabase, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_directory_path_is_not_reported_as_missing_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The directory exists, so `fs::metadata` succeeds but the path is not
+        // a valid database file; this must not be classified as "missing".
+        let err = Reader::open(dir.path()).expect_err("directory is not a valid database");
+        assert!(!matches!(err, Error::MissingDatabase { .. }));
     }
 }

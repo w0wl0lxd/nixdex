@@ -235,6 +235,97 @@ fn command_not_found_suggests_provider() {
 }
 
 #[test]
+fn index_rejects_full_and_small_together() {
+    let output = run(&[
+        "index",
+        "--full",
+        "--small",
+        "-d",
+        "/tmp/nixdex-test-full-small",
+    ]);
+    assert!(
+        !output.status.success(),
+        "expected failure for --full --small, got success"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--full") && stderr.contains("--small"),
+        "expected conflict message mentioning both flags: {stderr}"
+    );
+}
+
+#[test]
+fn update_rejects_full_and_small_together() {
+    let output = run(&[
+        "update",
+        "--full",
+        "--small",
+        "-d",
+        "/tmp/nixdex-test-update-full-small",
+    ]);
+    assert!(
+        !output.status.success(),
+        "expected failure for --full --small, got success"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--full") && stderr.contains("--small"),
+        "expected conflict message mentioning both flags: {stderr}"
+    );
+}
+
+#[test]
+fn daemon_rejects_full_and_small_together() {
+    let output = run(&["daemon", "--full", "--small"]);
+    assert!(
+        !output.status.success(),
+        "expected failure for --full --small, got success"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--full") && stderr.contains("--small"),
+        "expected conflict message mentioning both flags: {stderr}"
+    );
+}
+
+#[test]
+fn index_default_small_rejects_custom_filter_prefix() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = run(&[
+        "index",
+        "-d",
+        dir.path().to_str().unwrap(),
+        "--filter-prefix",
+        "/nix/store",
+    ]);
+    assert!(
+        !output.status.success(),
+        "expected failure for default --small with custom --filter-prefix"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--small is incompatible with --filter-prefix"),
+        "unexpected stderr: {stderr}"
+    );
+}
+
+#[test]
+fn which_reports_helpful_error_for_missing_database() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let output = run(&["which", "-d", dir.path().to_str().unwrap(), "ls"]);
+    assert!(
+        !output.status.success(),
+        "expected failure for missing database"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("nix-index") && stderr.contains("nixdex update"),
+        "expected helpful hint mentioning nix-index / nixdex update: {stderr}"
+    );
+}
+
+#[test]
 fn generate_sidecars_creates_sidecar_files() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_fixture_database(dir.path());

@@ -108,6 +108,17 @@ pub struct Args {
     #[arg(long)]
     pub exclude_prefix: Vec<String>,
 
+    /// Exclude packages whose name contains `-fhs` or `-usr-target` from the index.
+    #[arg(long)]
+    pub exclude_fhs: bool,
+
+    /// Sort packages deterministically before writing the database.
+    ///
+    /// This makes the output reproducible across runs (useful for fixed-output
+    /// derivations) at the cost of holding all listings in memory.
+    #[arg(long)]
+    pub deterministic: bool,
+
     /// Disable nixpkgs overlays when evaluating the package set.
     ///
     /// This is equivalent to passing `--arg overlays '[]'` to `nix-env` and
@@ -123,10 +134,15 @@ pub struct Args {
     #[arg(long)]
     pub no_closure: bool,
 
+    /// Build a full, unfiltered database (opposite of the default `--small`).
+    #[arg(long, conflicts_with = "small")]
+    pub full: bool,
+
     /// Build a small database containing only files under `/bin/`.
     ///
     /// This is equivalent to `--filter-prefix /bin/` and is much faster to build
-    /// and query for command-not-found use cases.
+    /// and query for command-not-found use cases. This is the default; use `--full`
+    /// to index all paths.
     #[arg(long)]
     pub small: bool,
 
@@ -218,7 +234,8 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
         return Ok(());
     }
 
-    let filter_prefix = if args.small {
+    let small = args.small || !args.full;
+    let filter_prefix = if small {
         if !args.filter_prefix.is_empty() && args.filter_prefix != "/bin/" {
             color_eyre::eyre::bail!(
                 "--small is incompatible with --filter-prefix '{}'",
@@ -244,7 +261,7 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
         format_version: args.format_version,
         show_trace: args.show_trace,
         filter_prefix,
-        small: args.small,
+        small,
         path_cache: args.path_cache,
         force: args.force,
         cache_key: args.cache_key,
@@ -257,6 +274,8 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
         only_eval: args.only_eval,
         cache_url: args.cache_url,
         exclude_prefix: args.exclude_prefix,
+        exclude_fhs: args.exclude_fhs,
+        deterministic: args.deterministic,
     };
 
     nixdex_core::update_index(&options)
@@ -288,5 +307,121 @@ mod tests {
         let result =
             Args::try_parse_from(["nix-index", "--requests", "0", "-d", "/tmp/nix-index-test"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn args_parsing_rejects_full_and_small_together() {
+        let result = Args::try_parse_from([
+            "nix-index",
+            "--full",
+            "--small",
+            "-d",
+            "/tmp/nix-index-test",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn args_defaults_disable_new_flags() {
+        let args = Args::try_parse_from(["nix-index", "-d", "/tmp/nix-index-test"])
+            .expect("parse defaults");
+        assert!(!args.full);
+        assert!(!args.small);
+        assert!(!args.exclude_fhs);
+        assert!(!args.deterministic);
+    }
+
+    #[test]
+    fn args_parsing_accepts_exclude_fhs_and_deterministic() {
+        let args = Args::try_parse_from([
+            "nix-index",
+            "-d",
+            "/tmp/nix-index-test",
+            "--exclude-fhs",
+            "--deterministic",
+        ])
+        .expect("parse flags");
+        assert!(args.exclude_fhs);
+        assert!(args.deterministic);
+    }
+
+    #[test]
+    fn args_parsing_accepts_full_flag_alone() {
+        let args = Args::try_parse_from(["nix-index", "-d", "/tmp/nix-index-test", "--full"])
+            .expect("parse full");
+        assert!(args.full);
+        assert!(!args.small);
+    }
+
+    #[tokio::test]
+    async fn run_defaults_to_small_and_rejects_incompatible_filter_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args = Args::try_parse_from([
+            "nix-index",
+            "-d",
+            dir.path().to_str().unwrap(),
+            "--filter-prefix",
+            "/nix/store",
+        ])
+        .expect("parse args");
+
+        let err = run(args)
+            .await
+            .expect_err("should reject incompatible filter-prefix by default");
+        let message = err.to_string();
+        assert!(
+            message.contains("--small is incompatible with --filter-prefix"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_explicit_small_rejects_incompatible_filter_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args = Args::try_parse_from([
+            "nix-index",
+            "-d",
+            dir.path().to_str().unwrap(),
+            "--small",
+            "--filter-prefix",
+            "/nix/store",
+        ])
+        .expect("parse args");
+
+        let err = run(args)
+            .await
+            .expect_err("should reject incompatible filter-prefix with explicit --small");
+        let message = err.to_string();
+        assert!(
+            message.contains("--small is incompatible with --filter-prefix"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_full_flag_bypasses_small_incompatibility_check() {
+        // With `--full`, the implicit small default is disabled, so an
+        // arbitrary `--filter-prefix` must not trigger the `--small`
+        // incompatibility bail-out (any later failure must come from
+        // elsewhere, e.g. a missing `nix-eval-jobs` binary).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args = Args::try_parse_from([
+            "nix-index",
+            "-d",
+            dir.path().to_str().unwrap(),
+            "--full",
+            "--filter-prefix",
+            "/nix/store",
+            "--only-eval",
+        ])
+        .expect("parse args");
+
+        if let Err(err) = run(args).await {
+            let message = err.to_string();
+            assert!(
+                !message.contains("--small is incompatible with --filter-prefix"),
+                "unexpected incompatibility error with --full: {message}"
+            );
+        }
     }
 }
