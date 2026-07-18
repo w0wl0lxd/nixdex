@@ -1,1 +1,1 @@
-Stream-decode NIXI v1 (upstream prebuilt) zstd frames during search and sidecar generation, allowing `nixdex update` to process the upstream `nix-index-database` releases without hitting the `MAX_ZSTD_FRAME_BYTES` in-memory decode limit.
+- Stream-decode NIXI v1 (upstream prebuilt) zstd frames during search and sidecar generation, allowing `nixdex update` to process the upstream `nix-index-database` releases without hitting the `MAX_ZSTD_FRAME_BYTES` in-memory decode limit.
