@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/nixdex-core", "crates/nixdex-cli", "crates/nixdex-daemon"]
+members = ["crates/nixdex", "crates/nixdex-core", "crates/nixdex-cli", "crates/nixdex-daemon"]
 
 [workspace.package]
 version = "0.1.0"
@@ -72,7 +72,7 @@ proptest = "1"
 criterion = "0.5"
 
 # Workspace crates
-nixdex-core = { path = "crates/nixdex-core" }
+nixdex-core = { path = "crates/nixdex-core", version = "0.1.0" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
