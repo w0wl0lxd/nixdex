@@ -1,0 +1,1 @@
+- Use `~/.cache/nixdex` as the default database directory for `nixdex index`, `nixdex locate`, and `nixdex search`, while `nix-index` and `nix-locate` continue defaulting to `~/.cache/nix-index`.

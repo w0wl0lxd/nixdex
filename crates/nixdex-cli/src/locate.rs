@@ -12,15 +12,15 @@ use tracing_subscriber::EnvFilter;
 use nixdex_core::database::{SearchMode, SearchOptions, SearchSort};
 use nixdex_core::{ALL_FILE_TYPES, FileType};
 
-/// Resolve the default nix-index database directory.
+/// Resolve the default nixdex database directory.
 fn default_db_dir() -> &'static str {
     static CACHE: OnceLock<String> = OnceLock::new();
     CACHE
         .get_or_init(|| {
-            nixdex_core::nix_index_dir()
+            nixdex_core::nixdex_dir()
                 .into_os_string()
                 .into_string()
-                .unwrap_or_else(|_| String::from("/tmp/nix-index"))
+                .unwrap_or_else(|_| String::from("/tmp/nixdex"))
         })
         .as_str()
 }
@@ -132,7 +132,8 @@ pub struct Opts {
     #[arg(long)]
     pub count: bool,
 
-    /// Sort results: `size`, `size-asc`, `size-desc`, or `attr`/`attr-asc`.
+    /// Sort results: `relevance` (default), `none`, `size`/`size-asc`,
+    /// `size-desc`, or `attr`/`attr-asc`.
     #[arg(long)]
     pub sort: Option<String>,
 
@@ -303,4 +304,35 @@ pub fn run(matches: Opts) -> color_eyre::Result<()> {
 
     nixdex_core::search_database(&options).wrap_err("nix-locate failed")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_db_dir_matches_nixdex_cache_dir() {
+        // The `nixdex locate` subcommand (and the library `Opts` type used by
+        // it) must default to `~/.cache/nixdex`, not the upstream-compatible
+        // `~/.cache/nix-index` used by the standalone `nix-locate` binary.
+        assert_eq!(PathBuf::from(default_db_dir()), nixdex_core::nixdex_dir());
+    }
+
+    #[test]
+    fn opts_parsing_defaults_database_to_nixdex_cache_dir() {
+        let opts = Opts::try_parse_from(["nix-locate", "somepattern"]).expect("parse defaults");
+        assert_eq!(opts.database, nixdex_core::nixdex_dir());
+    }
+
+    #[test]
+    fn opts_parsing_explicit_db_overrides_default() {
+        let opts = Opts::try_parse_from([
+            "nix-locate",
+            "-d",
+            "/tmp/nix-locate-explicit",
+            "somepattern",
+        ])
+        .expect("parse with explicit db");
+        assert_eq!(opts.database, PathBuf::from("/tmp/nix-locate-explicit"));
+    }
 }

@@ -1,0 +1,1 @@
+- Add integration tests verifying that `nixdex` subcommands default to `~/.cache/nixdex` while standalone `nix-index` and `nix-locate` retain the upstream-compatible `~/.cache/nix-index` default.
