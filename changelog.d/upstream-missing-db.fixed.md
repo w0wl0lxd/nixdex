@@ -1,0 +1,1 @@
+- Improved the error message when opening a missing database to suggest running `nix-index` or `nixdex update`.

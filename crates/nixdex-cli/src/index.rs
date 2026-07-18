@@ -108,6 +108,17 @@ pub struct Args {
     #[arg(long)]
     pub exclude_prefix: Vec<String>,
 
+    /// Exclude packages whose name contains `-fhs` or `-usr-target` from the index.
+    #[arg(long)]
+    pub exclude_fhs: bool,
+
+    /// Sort packages deterministically before writing the database.
+    ///
+    /// This makes the output reproducible across runs (useful for fixed-output
+    /// derivations) at the cost of holding all listings in memory.
+    #[arg(long)]
+    pub deterministic: bool,
+
     /// Disable nixpkgs overlays when evaluating the package set.
     ///
     /// This is equivalent to passing `--arg overlays '[]'` to `nix-env` and
@@ -123,10 +134,15 @@ pub struct Args {
     #[arg(long)]
     pub no_closure: bool,
 
+    /// Build a full, unfiltered database (opposite of the default `--small`).
+    #[arg(long, conflicts_with = "small")]
+    pub full: bool,
+
     /// Build a small database containing only files under `/bin/`.
     ///
     /// This is equivalent to `--filter-prefix /bin/` and is much faster to build
-    /// and query for command-not-found use cases.
+    /// and query for command-not-found use cases. This is the default; use `--full`
+    /// to index all paths.
     #[arg(long)]
     pub small: bool,
 
@@ -218,7 +234,8 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
         return Ok(());
     }
 
-    let filter_prefix = if args.small {
+    let small = args.small || !args.full;
+    let filter_prefix = if small {
         if !args.filter_prefix.is_empty() && args.filter_prefix != "/bin/" {
             color_eyre::eyre::bail!(
                 "--small is incompatible with --filter-prefix '{}'",
@@ -244,7 +261,7 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
         format_version: args.format_version,
         show_trace: args.show_trace,
         filter_prefix,
-        small: args.small,
+        small,
         path_cache: args.path_cache,
         force: args.force,
         cache_key: args.cache_key,
@@ -257,6 +274,8 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
         only_eval: args.only_eval,
         cache_url: args.cache_url,
         exclude_prefix: args.exclude_prefix,
+        exclude_fhs: args.exclude_fhs,
+        deterministic: args.deterministic,
     };
 
     nixdex_core::update_index(&options)

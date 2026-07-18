@@ -14,10 +14,12 @@ use tracing::{info, warn};
 
 use crate::database::{Writer, read_attrs_sidecar};
 use crate::errors::{Error, Result};
+use crate::files::FileTree;
 use crate::hydra::Fetcher;
 use crate::listings;
 use crate::nixpkgs;
 use crate::path_cache::PathCache;
+use crate::store_path::StorePath;
 
 /// Name of the package metadata sidecar written alongside `files`.
 const PACKAGES_JSON: &str = "packages.json";
@@ -43,6 +45,8 @@ struct WriteListingsContext<'a> {
     progress: &'a MultiProgress,
     attrs_map: IndexMap<String, String>,
     no_closure: bool,
+    exclude_fhs: bool,
+    deterministic: bool,
 }
 
 /// Options controlling an index build.
@@ -100,6 +104,13 @@ pub struct UpdateOptions {
     pub cache_url: String,
     /// Only add paths that do not start with any of these prefixes.
     pub exclude_prefix: Vec<String>,
+    /// Exclude packages whose name contains `-fhs` or `-usr-target` from the index.
+    pub exclude_fhs: bool,
+    /// Sort packages deterministically before writing the database.
+    ///
+    /// This makes the output reproducible at the cost of holding all package
+    /// listings in memory until the build finishes.
+    pub deterministic: bool,
 }
 
 impl Default for UpdateOptions {
@@ -136,6 +147,8 @@ impl Default for UpdateOptions {
             only_eval: false,
             cache_url: crate::CACHE_URL.to_string(),
             exclude_prefix: Vec::new(),
+            exclude_fhs: false,
+            deterministic: false,
         }
     }
 }
@@ -452,6 +465,8 @@ impl IndexBuilder {
                 progress: &progress,
                 attrs_map: ctx.attrs_map,
                 no_closure: opts.no_closure,
+                exclude_fhs: opts.exclude_fhs,
+                deterministic: opts.deterministic,
             },
             stream.packages,
         )
@@ -580,8 +595,37 @@ fn finish_fetch_progress(
     ));
 }
 
+fn is_fhs_package(store_path: &StorePath) -> bool {
+    let name = store_path.name();
+    name.contains("-fhs") || name.contains("-usr-target")
+}
+
+fn write_listing(
+    ctx: &mut WriteListingsContext<'_>,
+    store_path: &StorePath,
+    tree: &FileTree,
+    chunk_bytes: u64,
+) -> Result<u64> {
+    let before_len = ctx.writer.estimated_size();
+    let exclude_slices: Vec<&[u8]> = ctx
+        .exclude_prefixes
+        .iter()
+        .map(std::vec::Vec::as_slice)
+        .collect();
+    ctx.writer
+        .add_excluding(store_path, tree, ctx.filter_prefix, &exclude_slices)
+        .map_err(|source| Error::WriteDatabase {
+            path: ctx.db_file.to_path_buf(),
+            source: Box::new(source),
+        })?;
+    let after_len = ctx.writer.estimated_size();
+    maybe_flush_chunk(ctx.writer, ctx.db_file, chunk_bytes)?;
+    Ok(after_len.saturating_sub(before_len))
+}
+
+#[allow(clippy::cognitive_complexity)]
 async fn write_listings(
-    ctx: WriteListingsContext<'_>,
+    mut ctx: WriteListingsContext<'_>,
     package_input: mpsc::Receiver<listings::PackageEntry>,
 ) -> Result<(usize, usize, Duration)> {
     // Flush raw packages to a v2 frame once the in-memory chunk reaches 256 MiB.
@@ -591,13 +635,14 @@ async fn write_listings(
     fetch_pb.set_message("Fetching listings...");
     let fetch_start = quanta::Instant::now();
 
+    let attrs_map = std::mem::take(&mut ctx.attrs_map);
     let mut listings = listings::fetch_listings(
         ctx.fetcher,
         ctx.jobs,
         package_input,
-        ctx.path_cache,
+        ctx.path_cache.clone(),
         ctx.filter_prefix,
-        ctx.attrs_map,
+        attrs_map,
         ctx.no_closure,
     )
     .await
@@ -611,34 +656,58 @@ async fn write_listings(
     let mut failed = 0usize;
     let mut bytes_written = 0u64;
 
-    while let Some(result) = listings.recv().await {
-        match result {
-            Ok((store_path, tree)) => {
-                let before_len = ctx.writer.estimated_size();
-                let exclude_slices: Vec<&[u8]> = ctx
-                    .exclude_prefixes
-                    .iter()
-                    .map(std::vec::Vec::as_slice)
-                    .collect();
-                ctx.writer
-                    .add_excluding(&store_path, &tree, ctx.filter_prefix, &exclude_slices)
-                    .map_err(|source| Error::WriteDatabase {
-                        path: ctx.db_file.to_path_buf(),
-                        source: Box::new(source),
-                    })?;
-                let after_len = ctx.writer.estimated_size();
-                bytes_written += after_len.saturating_sub(before_len);
-                indexed += 1;
-                maybe_flush_chunk(ctx.writer, ctx.db_file, CHUNK_BYTES)?;
+    if ctx.deterministic {
+        let mut buffer: Vec<(StorePath, FileTree)> = Vec::new();
+        let mut fetched = 0usize;
+        while let Some(result) = listings.recv().await {
+            fetched += 1;
+            match result {
+                Ok((store_path, tree)) => {
+                    if ctx.exclude_fhs && is_fhs_package(&store_path) {
+                        fetch_pb.set_message(format!("Fetched {fetched}, failed {failed}"));
+                        fetch_pb.inc(1);
+                        continue;
+                    }
+                    buffer.push((store_path, tree));
+                }
+                Err(err) => {
+                    warn!(error = %err, "closure fetch yielded an error; skipping");
+                    failed += 1;
+                }
             }
-            Err(err) => {
-                warn!(error = %err, "closure fetch yielded an error; skipping");
-                failed += 1;
-            }
+            fetch_pb.set_message(format!("Fetched {fetched}, failed {failed}"));
+            fetch_pb.inc(1);
         }
-        fetch_pb.set_message(format!("Indexed {indexed}, failed {failed}"));
-        fetch_pb.inc(1);
+        // Sort by store path to make the written package order deterministic.
+        buffer.sort_by(|(a, _), (b, _)| a.cmp(b));
+        for (store_path, tree) in buffer {
+            bytes_written += write_listing(&mut ctx, &store_path, &tree, CHUNK_BYTES)?;
+            indexed += 1;
+            fetch_pb.set_message(format!("Indexed {indexed}, failed {failed}"));
+            fetch_pb.inc(1);
+        }
+    } else {
+        while let Some(result) = listings.recv().await {
+            match result {
+                Ok((store_path, tree)) => {
+                    if ctx.exclude_fhs && is_fhs_package(&store_path) {
+                        fetch_pb.set_message(format!("Indexed {indexed}, failed {failed}"));
+                        fetch_pb.inc(1);
+                        continue;
+                    }
+                    bytes_written += write_listing(&mut ctx, &store_path, &tree, CHUNK_BYTES)?;
+                    indexed += 1;
+                }
+                Err(err) => {
+                    warn!(error = %err, "closure fetch yielded an error; skipping");
+                    failed += 1;
+                }
+            }
+            fetch_pb.set_message(format!("Indexed {indexed}, failed {failed}"));
+            fetch_pb.inc(1);
+        }
     }
+
     let fetch_elapsed = fetch_start.elapsed();
     finish_fetch_progress(fetch_pb, indexed, failed, bytes_written, fetch_elapsed);
 
@@ -707,6 +776,8 @@ mod tests {
             only_eval: false,
             cache_url: crate::CACHE_URL.to_string(),
             exclude_prefix: Vec::new(),
+            exclude_fhs: false,
+            deterministic: false,
         };
         IndexBuilder::new(opts).build().await.expect("build");
         assert!(dir.path().join("files").exists());

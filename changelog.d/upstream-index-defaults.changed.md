@@ -1,0 +1,2 @@
+- `nix-index` and `nixdex index` now build a small `/bin/`-filtered database by default; use `--full` to build a complete index.
+- `nixdex update` and `nixdex daemon` now download the `-small` prebuilt index by default; use `--full` for the complete variant.
