@@ -24,15 +24,15 @@ fn parse_jobs(s: &str) -> Result<usize, String> {
     Ok(n)
 }
 
-/// Resolve the default nix-index database directory.
+/// Resolve the default nixdex database directory.
 fn default_db_dir() -> &'static str {
     static CACHE: OnceLock<String> = OnceLock::new();
     CACHE
         .get_or_init(|| {
-            nixdex_core::nix_index_dir()
+            nixdex_core::nixdex_dir()
                 .into_os_string()
                 .into_string()
-                .unwrap_or_else(|_| String::from("/tmp/nix-index"))
+                .unwrap_or_else(|_| String::from("/tmp/nixdex"))
         })
         .as_str()
 }
@@ -303,5 +303,26 @@ mod tests {
         let result =
             Args::try_parse_from(["nix-index", "--requests", "0", "-d", "/tmp/nix-index-test"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn default_db_dir_matches_nixdex_cache_dir() {
+        // The `nixdex index` subcommand (and the library `Args` type used by it)
+        // must default to `~/.cache/nixdex`, not the upstream-compatible
+        // `~/.cache/nix-index` used by the standalone `nix-index` binary.
+        assert_eq!(PathBuf::from(default_db_dir()), nixdex_core::nixdex_dir());
+    }
+
+    #[test]
+    fn args_parsing_defaults_database_to_nixdex_cache_dir() {
+        let args = Args::try_parse_from(["nix-index"]).expect("parse with defaults");
+        assert_eq!(args.database, nixdex_core::nixdex_dir());
+    }
+
+    #[test]
+    fn args_parsing_explicit_db_overrides_default() {
+        let args = Args::try_parse_from(["nix-index", "-d", "/tmp/nix-index-explicit"])
+            .expect("parse with explicit db");
+        assert_eq!(args.database, PathBuf::from("/tmp/nix-index-explicit"));
     }
 }
