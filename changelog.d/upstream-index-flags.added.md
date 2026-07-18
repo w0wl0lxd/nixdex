@@ -1,0 +1,2 @@
+- Added `--deterministic` to `nix-index` and `nixdex index` for reproducible, sorted database output.
+- Added `--exclude-fhs` to `nix-index` and `nixdex index` to skip FHS-style packages (`-fhs` / `-usr-target`) during indexing.

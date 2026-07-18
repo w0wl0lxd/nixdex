@@ -242,7 +242,13 @@ struct UpdateOpts {
     #[arg(long, default_value_t = nixdex_core::prebuilt::default_architecture())]
     architecture: String,
 
+    /// Download the full prebuilt variant (default is `-small`).
+    #[arg(long, conflicts_with = "small")]
+    full: bool,
+
     /// Download the `-small` prebuilt variant.
+    ///
+    /// This is the default; use `--full` for the complete prebuilt index.
     #[arg(long)]
     small: bool,
 }
@@ -304,7 +310,13 @@ struct DaemonOpts {
     #[arg(long, default_value_t = nixdex_core::prebuilt::default_architecture())]
     architecture: String,
 
+    /// Use the full prebuilt variant instead of the default `-small` index.
+    #[arg(long, conflicts_with = "small")]
+    full: bool,
+
     /// Use the -small variant of the prebuilt index.
+    ///
+    /// This is the default; use `--full` for the complete prebuilt index.
     #[arg(long)]
     small: bool,
 
@@ -551,10 +563,11 @@ fn format_which_attr(store_path: &nixdex_core::StorePath) -> String {
 }
 
 async fn run_update(opts: UpdateOpts) -> color_eyre::Result<()> {
+    let small = opts.small || !opts.full;
     let config = nixdex_core::prebuilt::PrebuiltConfig {
         release_url: opts.release_url,
         architecture: opts.architecture,
-        small: opts.small,
+        small,
         cache_dir: opts.database.clone(),
         refresh_interval: std::time::Duration::ZERO,
     };
@@ -849,11 +862,12 @@ async fn run_daemon(opts: DaemonOpts) -> color_eyre::Result<()> {
     let cache_dir = opts
         .cache_dir
         .unwrap_or_else(|| nixdex_core::nixdex_dir().join("prebuilt"));
+    let small = opts.small || !opts.full;
     let config = nixdex_core::daemon::DaemonConfig {
         prebuilt: nixdex_core::prebuilt::PrebuiltConfig {
             release_url: opts.release_url,
             architecture: opts.architecture,
-            small: opts.small,
+            small,
             cache_dir,
             refresh_interval: std::time::Duration::from_secs(opts.interval),
         },
