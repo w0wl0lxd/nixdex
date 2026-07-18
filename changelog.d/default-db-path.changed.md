@@ -1,0 +1,1 @@
+Change the default database directory for `nixdex` subcommands and the `nixdex` umbrella binary to `~/.cache/nixdex`. The standalone `nix-index` and `nix-locate` binaries retain the upstream-compatible `~/.cache/nix-index` default.

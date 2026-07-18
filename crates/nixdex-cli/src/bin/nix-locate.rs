@@ -1,7 +1,30 @@
 //! Tool for searching for files in nixpkgs packages.
+//!
+//! This binary is a drop-in replacement for `nix-locate`, so it defaults to the
+//! upstream `~/.cache/nix-index` database directory unless the user explicitly
+//! passes `-d`/`--db`.
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
+use std::sync::OnceLock;
+
+fn nix_index_default_db_dir() -> &'static str {
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            nixdex_core::nix_index_dir()
+                .into_os_string()
+                .into_string()
+                .unwrap_or_else(|_| String::from("/tmp/nix-index"))
+        })
+        .as_str()
+}
 
 fn main() -> color_eyre::Result<()> {
-    nixdex_cli::locate::run(nixdex_cli::locate::Opts::parse())
+    let mut cmd = nixdex_cli::locate::Opts::command();
+    cmd = cmd.mut_arg("database", |arg| {
+        arg.default_value(nix_index_default_db_dir())
+    });
+    let matches = cmd.get_matches();
+    let opts = nixdex_cli::locate::Opts::from_arg_matches(&matches)?;
+    nixdex_cli::locate::run(opts)
 }
