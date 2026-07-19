@@ -1,0 +1,1 @@
+- Rework `frcode::Decoder`'s `ResizableBuf` so it is pre-zeroed and only grows when an entry exceeds the current allocation. This removes per-chunk `Vec::extend_from_slice` overhead and lets `read_to_nul` / `copy_shared` use `copy_from_slice` / `copy_within` directly.

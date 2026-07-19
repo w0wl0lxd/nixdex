@@ -745,6 +745,7 @@ impl Reader {
     /// # Errors
     ///
     /// Returns an error if a frame is corrupt or I/O fails.
+    #[allow(clippy::too_many_lines)]
     pub fn search_entries(
         &self,
         path_pattern: &PathMatcher<'_>,
@@ -799,8 +800,9 @@ impl Reader {
                     .collect()
             };
 
-        // NIXI v1 databases are a single large zstd frame. Stream-decode them so
-        // we do not have to materialise the whole decompressed buffer at once.
+        // NIXI v1 databases are a single large zstd frame. Stream-decode them
+        // so we do not have to materialise the whole decompressed buffer at
+        // once.
         if self.version == 1 {
             if let Some((offset, len, frame_start_ordinal)) = frames_to_scan.first() {
                 let start = *offset;
@@ -1635,7 +1637,8 @@ fn search_frame_stream(
     package_ordinals: Option<&RoaringBitmap>,
 ) -> Result<Vec<(StorePath, FileTreeEntry)>> {
     let cursor = std::io::Cursor::new(compressed);
-    let mut zstd_decoder = zstd::stream::read::Decoder::new(cursor)?;
+    let mut zstd_decoder = zstd::stream::read::Decoder::with_buffer(cursor)?;
+    zstd_decoder = zstd_decoder.single_frame();
     zstd_decoder.window_log_max(crate::ZSTD_WINDOW_LOG_MAX)?;
     // A larger input buffer reduces `fill_buf` round-trips through the
     // zstd streaming decoder for the large single-frame v1 database.
@@ -2642,7 +2645,8 @@ fn scan_frame_stream_for_packages(
     all_package_attrs: &mut Vec<(String, String, String)>,
 ) -> Result<()> {
     let cursor = std::io::Cursor::new(compressed);
-    let mut zstd_decoder = zstd::stream::read::Decoder::new(cursor)?;
+    let mut zstd_decoder = zstd::stream::read::Decoder::with_buffer(cursor)?;
+    zstd_decoder = zstd_decoder.single_frame();
     zstd_decoder.window_log_max(crate::ZSTD_WINDOW_LOG_MAX)?;
     let mut decoder =
         frcode::Decoder::new(std::io::BufReader::with_capacity(1 << 20, zstd_decoder));
