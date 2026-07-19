@@ -65,20 +65,9 @@ struct ResizableBuf {
 impl ResizableBuf {
     fn new(capacity: usize) -> Self {
         Self {
-            data: vec![0; capacity],
+            data: Vec::with_capacity(capacity),
             allow_resize: true,
         }
-    }
-
-    fn resize(&mut self, new_size: usize) -> bool {
-        if new_size <= self.data.len() {
-            return true;
-        }
-        if !self.allow_resize {
-            return false;
-        }
-        self.data.resize(new_size, b'\x00');
-        true
     }
 }
 
@@ -148,29 +137,18 @@ impl<R: BufRead> Decoder<R> {
                 previous_len,
                 shared_len: self.shared_len,
             })?;
-        if !self.buf.resize(new_pos) {
+        if new_pos > self.buf.data.capacity() && !self.buf.allow_resize {
             return Ok(false);
         }
 
-        let new_last_path = self.pos;
-        let (_, last) = self.buf.split_at_mut(self.last_path);
-        let (src, dst) = last.split_at_mut(previous_len);
-        if let Some(dst) = dst.get_mut(..shared_len) {
-            if let Some(src) = src.get(..shared_len) {
-                dst.copy_from_slice(src);
-            } else {
-                return Err(Error::SharedOutOfRange {
-                    previous_len,
-                    shared_len: self.shared_len,
-                });
-            }
-        } else {
-            return Err(Error::SharedOutOfRange {
-                previous_len,
-                shared_len: self.shared_len,
-            });
+        self.buf.data.resize(new_pos, b'\x00');
+        if shared_len > 0 {
+            self.buf
+                .data
+                .copy_within(self.last_path..self.last_path + shared_len, self.pos);
         }
 
+        let new_last_path = self.pos;
         self.pos = new_pos;
         self.last_path = new_last_path;
         Ok(true)
@@ -204,15 +182,14 @@ impl<R: BufRead> Decoder<R> {
                 };
 
                 let new_pos = *pos + len;
-                if buf.resize(new_pos) {
-                    if let (Some(dst), Some(src)) = (buf.get_mut(*pos..new_pos), input.get(..len)) {
-                        dst.copy_from_slice(src);
-                    }
-                    *pos = new_pos;
-                    (done, len)
-                } else {
+                if new_pos > buf.data.capacity() && !buf.allow_resize {
                     return Ok(Some(false));
                 }
+                if let Some(src) = input.get(..len) {
+                    buf.data.extend_from_slice(src);
+                }
+                *pos = new_pos;
+                (done, len)
             };
             self.reader.consume(len);
             if done {
@@ -249,25 +226,19 @@ impl<R: BufRead> Decoder<R> {
     ///
     /// Returns an error when the stream is corrupt or I/O fails.
     pub fn decode(&mut self) -> Result<&mut [u8]> {
-        let end = self.pos;
+        let end = self.buf.data.len();
         self.pos = 0;
 
-        let mut copy_pos = cmp::min(self.partial_entry_start, self.last_path);
+        let copy_pos = cmp::min(self.partial_entry_start, self.last_path);
         let item_start = self.partial_entry_start - copy_pos;
         self.last_path -= copy_pos;
 
-        // Source and destination may overlap; copy byte-by-byte.
-        while copy_pos < end {
-            let byte = match self.buf.get(copy_pos) {
-                Some(b) => *b,
-                None => break,
-            };
-            if let Some(dst) = self.buf.get_mut(self.pos) {
-                *dst = byte;
-            }
-            self.pos += 1;
-            copy_pos += 1;
+        let shift_len = end.saturating_sub(copy_pos);
+        if copy_pos > 0 && shift_len > 0 {
+            self.buf.data.copy_within(copy_pos..end, 0);
         }
+        self.buf.data.truncate(shift_len);
+        self.pos = shift_len;
 
         self.buf.allow_resize = true;
 

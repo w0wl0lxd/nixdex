@@ -1,0 +1,1 @@
+- Replaced the fixed-size frcode decode buffer with a `Vec`-backed resizable buffer and `copy_within` for residual shifting, and added a fast literal-substring `PathMatcher` using `memchr::memmem::Finder` for non-anchored `nix-locate` queries.

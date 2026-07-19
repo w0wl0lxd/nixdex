@@ -91,7 +91,8 @@ pub fn search_database(options: &database::SearchOptions<'_>) -> Result<()> {
 pub fn search_database_results(
     options: &database::SearchOptions<'_>,
 ) -> Result<Vec<(StorePath, crate::files::FileTreeEntry)>> {
-    database::search_results(options)
+    let path_matcher = database::path_matcher_for(options)?;
+    database::search_results(options, &path_matcher)
 }
 
 #[cfg(test)]

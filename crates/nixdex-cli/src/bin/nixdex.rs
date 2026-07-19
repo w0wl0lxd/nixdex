@@ -617,7 +617,13 @@ fn find_command_providers(
     let re = regex::bytes::Regex::new(&pattern).wrap_err("invalid path pattern")?;
 
     let results = reader
-        .search_entries(&re, None, None, None, None)
+        .search_entries(
+            &nixdex_core::database::PathMatcher::Regex(re),
+            None,
+            None,
+            None,
+            None,
+        )
         .map_err(|err| color_eyre::eyre::eyre!("search failed: {err}"))?;
 
     let mut providers: Vec<nixdex_core::StorePath> = results
