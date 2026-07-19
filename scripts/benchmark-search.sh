@@ -14,6 +14,9 @@ WARMUP="${WARMUP:-3}"
 MIN_RUNS="${MIN_RUNS:-5}"
 OUT_MD="${OUT_MD:-/tmp/nixdex-bench-search.md}"
 
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
 cargo build --release --bin nixdex
 NIXDEX="$(realpath "${CARGO_TARGET_DIR:-target}/release/nixdex")"
 
@@ -40,8 +43,13 @@ rm -f "$OUT_MD"
 } >"$OUT_MD"
 
 for entry in "${QUERIES[@]}"; do
-  pattern="${entry%%:*}"
-  flags="${entry##*:}"
+  if [[ "$entry" == *":"* ]]; then
+    pattern="${entry%%:*}"
+    flags="${entry##*:}"
+  else
+    pattern="$entry"
+    flags=""
+  fi
 
   cmd="\"$NIXDEX\" search -d \"$DB_DIR\""
   if [[ "$flags" == *"r"* ]]; then
@@ -55,13 +63,15 @@ for entry in "${QUERIES[@]}"; do
   echo "## Pattern: '$pattern' (flags=$flags)" >>"$OUT_MD"
   echo "" >>"$OUT_MD"
 
+  QUERY_MD="$(mktemp -p "$TMP_DIR" bench-search-query-XXXXXX.md)"
+
   hyperfine \
     --warmup "$WARMUP" \
     --min-runs "$MIN_RUNS" \
-    --export-markdown /tmp/bench-search-query.md \
+    --export-markdown "$QUERY_MD" \
     "$cmd"
 
-  cat /tmp/bench-search-query.md >>"$OUT_MD"
+  cat "$QUERY_MD" >>"$OUT_MD"
   echo "" >>"$OUT_MD"
 done
 

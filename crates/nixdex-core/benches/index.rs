@@ -4,7 +4,7 @@ use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use regex::bytes::Regex;
 
-use nixdex_core::database::{Reader, Writer};
+use nixdex_core::database::{PathMatcher, Reader, Writer};
 use nixdex_core::files::FileTree;
 use nixdex_core::generate_sidecars;
 use nixdex_core::store_path::{Origin, StorePath};
@@ -99,6 +99,7 @@ fn bench_reader_search(c: &mut Criterion) {
     let mut group = c.benchmark_group("index_reader_search");
     group.sample_size(50);
     let re = Regex::new("program").expect("regex");
+    let matcher = PathMatcher::regex(re).expect("matcher");
     for count in PACKAGE_COUNTS {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("files");
@@ -109,7 +110,7 @@ fn bench_reader_search(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(count), &reader, |b, reader| {
             b.iter(|| {
                 let hits = reader
-                    .search_entries(black_box(&re), None, None, None, None)
+                    .search_entries(black_box(&matcher), None, None, None, None)
                     .expect("search");
                 black_box(hits);
             });

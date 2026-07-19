@@ -9,7 +9,7 @@ use clap::Parser;
 use color_eyre::eyre::WrapErr;
 use tracing_subscriber::EnvFilter;
 
-use nixdex_core::database::{SearchMode, SearchOptions, SearchSort};
+use nixdex_core::database::{SearchMode, SearchOptions, SearchSort, literal_pattern_for};
 use nixdex_core::{ALL_FILE_TYPES, FileType};
 
 /// Resolve the default nixdex database directory.
@@ -177,12 +177,12 @@ fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
     let as_regex = matches.regex;
 
     // Plain (non-anchored, non-regex) patterns can use a fast substring search.
-    let literal_pattern =
-        if as_regex || matches.at_root || matches.whole_name || matches.pattern.is_empty() {
-            None
-        } else {
-            Some(matches.pattern.clone())
-        };
+    let literal_pattern = literal_pattern_for(
+        &matches.pattern,
+        as_regex,
+        matches.at_root,
+        matches.whole_name,
+    );
 
     let exact_basename = if !matches.regex && matches.whole_name && !matches.pattern.is_empty() {
         // The FST is an exact-basename index. It is only safe to use when the

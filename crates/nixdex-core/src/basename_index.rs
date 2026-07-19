@@ -13,7 +13,8 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use byteorder::{LittleEndian, WriteBytesExt};
-use fst::{Map, Streamer};
+use fst::automaton::{Automaton, Str};
+use fst::{IntoStreamer, Map, Streamer};
 use mmap_guard;
 use roaring::RoaringBitmap;
 use thiserror::Error;
@@ -309,18 +310,21 @@ impl BasenameIndex {
     ///
     /// Returns an error when the FST stream operation fails or postings are corrupt.
     pub fn lookup_basename_prefix_ordinals(&self, prefix: &[u8]) -> Result<Vec<u32>> {
-        let mut matched = RoaringBitmap::new();
-        let mut stream = self.map.stream();
+        // FST automata operate on UTF-8 byte strings; a non-UTF-8 prefix can
+        // never match the valid UTF-8 keys stored in the index.
+        let prefix = std::str::from_utf8(prefix)
+            .map_err(|_| Error::Fst("non-UTF-8 basename prefix".into()))?;
 
-        while let Some((key, cookie)) = stream.next() {
-            if key.starts_with(prefix) {
-                let ordinals = read_ordinals_at(&self.postings, cookie)?;
-                for ord in ordinals {
-                    matched.insert(ord);
-                }
-            } else if !key.is_empty() && key > prefix {
-                // FST keys are sorted, so once we pass the prefix range we can stop.
-                break;
+        let mut matched = RoaringBitmap::new();
+        let mut stream = self
+            .map
+            .search(Str::new(prefix).starts_with())
+            .into_stream();
+
+        while let Some((_key, cookie)) = stream.next() {
+            let ordinals = read_ordinals_at(&self.postings, cookie)?;
+            for ord in ordinals {
+                matched.insert(ord);
             }
         }
 
