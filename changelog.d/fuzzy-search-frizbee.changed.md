@@ -1,0 +1,1 @@
+- Package fuzzy search now uses the `frizbee` SIMD matcher, dramatically improving matching throughput and reducing query latency.

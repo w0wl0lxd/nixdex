@@ -52,7 +52,7 @@ scc = "3.4"
 quanta = "0.12"
 
 # Fuzzy matching for package search
-fuzzy-matcher = "0.3.7"
+frizbee = "0.10"
 
 # Error handling
 thiserror = "2"
@@ -70,6 +70,7 @@ proptest = "1"
 
 # Benchmarking
 criterion = "0.5"
+divan = "0.1"
 
 # Workspace crates
 nixdex-core = { path = "crates/nixdex-core", version = "0.1.0" }
