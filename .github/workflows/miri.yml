@@ -29,4 +29,6 @@ jobs:
       - name: Install Miri
         run: cargo miri setup
       - name: Run Miri on nixdex-core
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
         run: cargo miri test -p nixdex-core --lib -- --test-threads=1
