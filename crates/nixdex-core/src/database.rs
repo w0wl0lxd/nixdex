@@ -1336,6 +1336,82 @@ fn search_frame_decoder<R: std::io::BufRead>(
     Ok(matches)
 }
 
+// Per-thread zstd decompression context reused across frames during a parallel
+// search. Without reuse, `search_entries` built a new streaming `Decoder` (and
+// its window context, which can be tens of MiB at high compression levels)
+// for every frame on every query — dominating the cost of small, selective
+// queries such as `nix-locate bin/ls`.
+thread_local! {
+    static SEARCH_DECOMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Decompress one frame into a freshly allocated `Vec<u8>`, reusing a
+/// per-thread zstd decompression context so the window buffer is not
+/// re-allocated for every frame.
+///
+/// The output `Vec` is owned by the caller: it outlives the thread-local
+/// decompressor and is consumed wholesale by the frcode decoder before the next
+/// frame on this worker runs, so there is no aliasing hazard. A defensive cap
+/// rejects zstd bombs that would expand past [`crate::MAX_ZSTD_FRAME_BYTES`].
+fn decompress_frame_threaded(compressed: &[u8]) -> std::result::Result<Vec<u8>, Error> {
+    if compressed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    SEARCH_DECOMPRESSOR.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let decompressor = match guard.as_mut() {
+            Some(d) => d,
+            None => {
+                let d = match zstd::bulk::Decompressor::new() {
+                    Ok(d) => d,
+                    Err(err) => return Err(Error::Io(err)),
+                };
+                guard.insert(d)
+            }
+        };
+
+        // Size the output from the frame's declared content size when available
+        // so a single decode usually suffices. If the header does not store the
+        // content size (or it exceeds the safety cap), start with a modest
+        // buffer and grow geometrically.
+        let mut out = match zstd::zstd_safe::get_frame_content_size(compressed) {
+            Ok(Some(s)) => {
+                let size = usize::try_from(s)
+                    .map_err(|_| Error::Corrupt("zstd frame content size exceeds usize"))?;
+                if size > crate::MAX_ZSTD_FRAME_BYTES {
+                    return Err(Error::Corrupt("zstd decompressed size exceeds limit"));
+                }
+                Vec::with_capacity(size)
+            }
+            _ => Vec::with_capacity(1 << 16),
+        };
+
+        loop {
+            match decompressor.decompress_to_buffer(compressed, &mut out) {
+                Ok(written) => {
+                    out.truncate(written);
+                    return Ok(out);
+                }
+                Err(_) => {
+                    let cap = out.capacity();
+                    if cap >= crate::MAX_ZSTD_FRAME_BYTES {
+                        return Err(Error::Corrupt("zstd decompressed size exceeds limit"));
+                    }
+                    let next = cap
+                        .saturating_mul(2)
+                        .clamp(1 << 16, crate::MAX_ZSTD_FRAME_BYTES);
+                    if next <= cap {
+                        return Err(Error::Corrupt("zstd decompressed size exceeds limit"));
+                    }
+                    out.reserve(next - cap);
+                }
+            }
+        }
+    })
+}
+
 fn search_frame(
     compressed: &[u8],
     path_pattern: &Regex,
@@ -1345,13 +1421,9 @@ fn search_frame(
     frame_start_ordinal: Option<u32>,
     package_ordinals: Option<&RoaringBitmap>,
 ) -> Result<Vec<(StorePath, FileTreeEntry)>> {
-    let raw = if compressed.is_empty() {
-        Vec::new()
-    } else {
-        crate::bounded_zstd_decode(compressed, crate::MAX_ZSTD_FRAME_BYTES)?
-    };
+    let raw = decompress_frame_threaded(compressed)?;
 
-    let mut decoder = frcode::Decoder::new(std::io::Cursor::new(&raw));
+    let mut decoder = frcode::Decoder::new(std::io::Cursor::new(raw));
     search_frame_decoder(
         &mut decoder,
         path_pattern,

@@ -36,7 +36,7 @@ scc = { workspace = true }
 quanta = { workspace = true }
 byteorder = { workspace = true }
 regex = { workspace = true }
-fuzzy-matcher = { workspace = true }
+frizbee = { workspace = true }
 clap = { workspace = true, optional = true }
 xz2 = "0.1.7"
 mmap-guard = "0.2.2"
@@ -51,6 +51,7 @@ tempfile = "3"
 tokio = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
+divan = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 
 [[bench]]
@@ -63,6 +64,14 @@ harness = false
 
 [[bench]]
 name = "index"
+harness = false
+
+[[bench]]
+name = "frcode"
+harness = false
+
+[[bench]]
+name = "basename_index"
 harness = false
 
 [lints]
