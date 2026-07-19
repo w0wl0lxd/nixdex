@@ -50,7 +50,8 @@ pub(crate) const ZSTD_WINDOW_LOG_MAX: u32 = 27;
 /// This bounds the memory impact of a zstd bomb: a tiny compressed payload
 /// that expands to many gigabytes will hit the limit before OOMing the host.
 pub(crate) fn bounded_zstd_decode(compressed: &[u8], max_bytes: usize) -> io::Result<Vec<u8>> {
-    let mut decoder = zstd::stream::read::Decoder::new(compressed)?;
+    let mut decoder = zstd::stream::read::Decoder::with_buffer(compressed)?;
+    decoder = decoder.single_frame();
     decoder.window_log_max(ZSTD_WINDOW_LOG_MAX)?;
     let mut out = Vec::with_capacity(compressed.len().min(max_bytes));
     // Read one byte past the cap so we can tell whether the true size exceeds it.

@@ -57,6 +57,11 @@ pub enum Error {
 type Result<T> = std::result::Result<T, Error>;
 
 /// Buffer that can optionally grow while decoding incomplete entries.
+///
+/// `data` is pre-initialised to `capacity` zeroed bytes and only grows when
+/// an encoded entry exceeds the current length. This lets the decoder use
+/// `copy_from_slice` / `copy_within` without `Vec::extend_from_slice`
+/// per-chunk overhead and without `Vec::resize` on every write.
 struct ResizableBuf {
     allow_resize: bool,
     data: Vec<u8>,
@@ -65,9 +70,27 @@ struct ResizableBuf {
 impl ResizableBuf {
     fn new(capacity: usize) -> Self {
         Self {
-            data: Vec::with_capacity(capacity),
+            data: vec![0; capacity],
             allow_resize: true,
         }
+    }
+
+    /// Ensure at least `len` bytes are allocated. Returns `false` when the
+    /// buffer would need to grow but resizing is disabled.
+    fn ensure_len(&mut self, len: usize) -> bool {
+        if len <= self.data.len() {
+            return true;
+        }
+        if !self.allow_resize {
+            return false;
+        }
+        // Amortise growth; reserve at least enough for `len` and prefer
+        // doubling the current allocation.
+        let additional = len.saturating_sub(self.data.len());
+        let reserve = additional.max(self.data.len());
+        self.data.reserve(reserve);
+        self.data.resize(len, b'\x00');
+        true
     }
 }
 
@@ -137,17 +160,26 @@ impl<R: BufRead> Decoder<R> {
                 previous_len,
                 shared_len: self.shared_len,
             })?;
-        if new_pos > self.buf.data.capacity() && !self.buf.allow_resize {
+        if !self.buf.ensure_len(new_pos) {
             return Ok(false);
         }
 
-        self.buf.data.resize(new_pos, b'\x00');
         if shared_len > 0 {
             // Source and destination are non-overlapping: the previous entry
             // ends at `self.pos` and the shared prefix is copied after it.
-            self.buf
-                .data
-                .copy_within(self.last_path..self.last_path + shared_len, self.pos);
+            // Use `split_at_mut` so the compiler can emit `memcpy`.
+            let (left, right) = self.buf.data.split_at_mut(self.pos);
+            let src = left
+                .get(self.last_path..self.last_path + shared_len)
+                .ok_or(Error::SharedOutOfRange {
+                    previous_len,
+                    shared_len: self.shared_len,
+                })?;
+            let dst = right.get_mut(..shared_len).ok_or(Error::SharedOutOfRange {
+                previous_len,
+                shared_len: self.shared_len,
+            })?;
+            dst.copy_from_slice(src);
         }
 
         let new_last_path = self.pos;
@@ -184,11 +216,12 @@ impl<R: BufRead> Decoder<R> {
                 };
 
                 let new_pos = *pos + len;
-                if new_pos > buf.data.capacity() && !buf.allow_resize {
+                if !buf.ensure_len(new_pos) {
                     return Ok(Some(false));
                 }
-                if let Some(src) = input.get(..len) {
-                    buf.data.extend_from_slice(src);
+                if let (Some(src), Some(dst)) = (input.get(..len), buf.data.get_mut(*pos..new_pos))
+                {
+                    dst.copy_from_slice(src);
                 }
                 *pos = new_pos;
                 (done, len)
@@ -228,7 +261,7 @@ impl<R: BufRead> Decoder<R> {
     ///
     /// Returns an error when the stream is corrupt or I/O fails.
     pub fn decode(&mut self) -> Result<&mut [u8]> {
-        let end = self.buf.data.len();
+        let end = self.pos;
         self.pos = 0;
 
         let copy_pos = cmp::min(self.partial_entry_start, self.last_path);
@@ -239,7 +272,6 @@ impl<R: BufRead> Decoder<R> {
         if copy_pos > 0 && shift_len > 0 {
             self.buf.data.copy_within(copy_pos..end, 0);
         }
-        self.buf.data.truncate(shift_len);
         self.pos = shift_len;
 
         self.buf.allow_resize = true;
