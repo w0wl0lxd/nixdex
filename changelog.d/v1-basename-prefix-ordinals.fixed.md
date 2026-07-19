@@ -1,0 +1,1 @@
+- Fix package-ordinal tracking when scanning frcode blocks during v1 database searches so basename-prefix filters resolve to the correct packages instead of rejecting all candidates.

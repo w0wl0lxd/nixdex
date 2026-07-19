@@ -13,7 +13,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use byteorder::{LittleEndian, WriteBytesExt};
-use fst::Map;
+use fst::{Map, Streamer};
 use mmap_guard;
 use roaring::RoaringBitmap;
 use thiserror::Error;
@@ -295,6 +295,36 @@ impl BasenameIndex {
             return Ok(Vec::new());
         };
         read_ordinals_at(&self.postings, cookie)
+    }
+
+    /// Look up package ordinals for basenames that start with `prefix`.
+    ///
+    /// This is a safe over-approximation for literal patterns whose last `/`-delimited
+    /// component is `prefix`: any path containing such a literal must contain a path
+    /// component that starts with `prefix`, and that component appears in the index.
+    ///
+    /// Returns an empty list when no basenames match the prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the FST stream operation fails or postings are corrupt.
+    pub fn lookup_basename_prefix_ordinals(&self, prefix: &[u8]) -> Result<Vec<u32>> {
+        let mut matched = RoaringBitmap::new();
+        let mut stream = self.map.stream();
+
+        while let Some((key, cookie)) = stream.next() {
+            if key.starts_with(prefix) {
+                let ordinals = read_ordinals_at(&self.postings, cookie)?;
+                for ord in ordinals {
+                    matched.insert(ord);
+                }
+            } else if !key.is_empty() && key > prefix {
+                // FST keys are sorted, so once we pass the prefix range we can stop.
+                break;
+            }
+        }
+
+        Ok(matched.iter().collect())
     }
 
     /// Number of packages recorded in the name table.
@@ -672,6 +702,40 @@ mod tests {
         let err = BasenameIndex::open(dir.path()).expect_err("should fail");
         assert!(matches!(err, Error::Corrupt(_)));
         assert!(err.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn build_and_query_basename_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut builder = BasenameIndexBuilder::new();
+        builder
+            .record_package(
+                "coreutils.out".into(),
+                vec![b"/bin/ls".to_vec(), b"/bin/lscpu".to_vec()],
+            )
+            .expect("pkg0");
+        builder
+            .record_package("hello.out".into(), vec![b"/bin/hello".to_vec()])
+            .expect("pkg1");
+        builder
+            .record_package(
+                "firefox.out".into(),
+                vec![b"/bin/firefox".to_vec(), b"/bin/firefox-profile".to_vec()],
+            )
+            .expect("pkg2");
+        builder.write_sidecars(dir.path()).expect("write");
+
+        let index = BasenameIndex::open(dir.path()).expect("open");
+        let mut ordinals = index
+            .lookup_basename_prefix_ordinals(b"fire")
+            .expect("fire prefix");
+        ordinals.sort();
+        assert_eq!(ordinals, vec![2u32]);
+
+        let ls = index
+            .lookup_basename_prefix_ordinals(b"ls")
+            .expect("ls prefix");
+        assert!(ls.contains(&0));
     }
 
     #[test]
