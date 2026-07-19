@@ -1,0 +1,1 @@
+- Added `frcode` (Divan) and `basename_index` (Criterion) benchmark suites covering hot codec and secondary-index paths.

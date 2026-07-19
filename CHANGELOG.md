@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Restructure `ci.yml` into fmt/check/clippy/test/deny/benchmark jobs with stable/beta and Ubuntu/macOS matrices.
 - Add Kani proof for `basename_index::read_u32_le` and set `deny.toml` `all-features = true`.
 - Added `nixdex generate-man` and installed man pages for `nixdex`, `nix-index`, and `nix-locate` through `flake.nix`.
+- Added `frcode` (Divan) and `basename_index` (Criterion) benchmark suites covering hot codec and secondary-index paths.
 - `nixdex info` text output now includes `main_program` for each output.
 - `nixdex search` supports `--sort` by `attr`, `name`, and `main-program` in ascending or descending order.
 - `nixdex index` accepts `--no-overlays` to disable nixpkgs overlays during evaluation.
@@ -44,10 +45,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `--admin-token` / `NIXDEX_ADMIN_TOKEN` authentication for `POST /reload`; without a token the endpoint is restricted to loopback addresses.
 - `nix-index` now includes the `darwin` package set in the default extra scopes when the target system is Darwin.
 - Change the default database directory for `nixdex` subcommands and the `nixdex` umbrella binary to `~/.cache/nixdex`. The standalone `nix-index` and `nix-locate` binaries retain the upstream-compatible `~/.cache/nix-index` default.
+- Exact attribute lookups in package search now use a pre-built index, making `nixdex info` and `nixdex search --exact --attr` O(1).
 - Apply `cargo fmt` to the redb index and CLI command-not-found code.
+- Package fuzzy search now uses the `frizbee` SIMD matcher, dramatically improving matching throughput and reducing query latency.
 - `nix-index` builds now display `indicatif` progress bars for nixpkgs evaluation and `.ls` fetching, including per-second rates and ETA.
 - Updated `.gitignore` to ignore the `research/` directory and local dev configs such as `.cargo/config.toml`, `.config/sccache/config.toml`, and `mise.toml`.
 - Make the `redb` exact-path sidecar opt-in via a new `--redb` flag on `nixdex index` / `nix-index`. The sidecar is no longer built by default, which substantially reduces database size and improves query startup latency. Users who need fast `--at-root` or exact full-path lookups can enable it explicitly.
+- Database searches reuse a per-thread zstd decompression context, reducing allocator pressure and improving repeated `nixdex locate` query latency.
 
 ### Fixed
 - Cache `uses_nix_profile` in the shell wrapper to avoid repeated filesystem checks inside loops.

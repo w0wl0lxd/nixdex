@@ -1,0 +1,1 @@
+- Database searches reuse a per-thread zstd decompression context, reducing allocator pressure and improving repeated `nixdex locate` query latency.

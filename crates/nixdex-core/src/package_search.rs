@@ -9,8 +9,8 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::str::FromStr;
 
-use fuzzy_matcher::FuzzyMatcher;
-use fuzzy_matcher::skim::SkimMatcherV2;
+use ahash::AHashMap;
+use frizbee::{Config, Matcher, Scoring};
 use regex::RegexBuilder;
 
 use crate::errors::{Error, Result};
@@ -156,6 +156,8 @@ impl clap::ValueEnum for SearchField {
 /// Backed by the `packages.json` NDJSON sidecar produced during `nix-index`.
 pub struct SearchDb {
     records: Vec<PackageMeta>,
+    /// Fast exact attribute lookups.
+    attr_index: AHashMap<String, Vec<usize>>,
 }
 
 impl SearchDb {
@@ -179,7 +181,18 @@ impl SearchDb {
             records.push(record);
         }
 
-        Ok(Self { records })
+        let mut attr_index: AHashMap<String, Vec<usize>> = AHashMap::with_capacity(records.len());
+        for (idx, record) in records.iter().enumerate() {
+            attr_index
+                .entry(record.attr.to_lowercase())
+                .or_default()
+                .push(idx);
+        }
+
+        Ok(Self {
+            records,
+            attr_index,
+        })
     }
 
     /// Search loaded records by attribute and/or description.
@@ -204,6 +217,36 @@ impl SearchDb {
                 "pattern exceeds maximum length of {MAX_PATTERN_BYTES} bytes"
             )));
         }
+
+        // Fast path for exact attribute lookups, which are used by `nixdex info`
+        // and by `nixdex search --exact --attr`. The index is keyed by the
+        // lowercased attribute, so case-insensitive lookups are a single hash
+        // lookup; case-sensitive lookups filter the candidate bucket.
+        if !regex && exact && field == SearchField::Attr {
+            let mut matches: Vec<&PackageMeta> =
+                if let Some(indices) = self.attr_index.get(&pattern.to_lowercase()) {
+                    if case_sensitive {
+                        indices
+                            .iter()
+                            .filter_map(|&i| self.records.get(i))
+                            .filter(|r| r.attr == *pattern)
+                            .collect()
+                    } else {
+                        indices
+                            .iter()
+                            .filter_map(|&i| self.records.get(i))
+                            .collect()
+                    }
+                } else {
+                    Vec::new()
+                };
+            Self::sort_records(&mut matches, sort);
+            if let Some(limit) = limit {
+                matches.truncate(limit);
+            }
+            return Ok(matches);
+        }
+
         let mut matches: Vec<&PackageMeta> = if regex {
             let anchored = if exact {
                 format!("^(?:{pattern})$")
@@ -246,7 +289,7 @@ impl SearchDb {
         Ok(matches)
     }
 
-    /// Fuzzy-search package records using the skim v2 scoring algorithm.
+    /// Fuzzy-search package records using the frizbee SIMD fuzzy matcher.
     ///
     /// Records are ranked by the highest fuzzy match score across the selected
     /// field(s). Results are returned in descending score order, optionally
@@ -264,17 +307,25 @@ impl SearchDb {
                 "pattern exceeds maximum length of {MAX_PATTERN_BYTES} bytes"
             )));
         }
-        let matcher = if case_sensitive {
-            SkimMatcherV2::default().respect_case()
-        } else {
-            SkimMatcherV2::default().smart_case()
-        };
 
-        let mut scored: Vec<(i64, &PackageMeta)> = self
+        let config = Config {
+            max_typos: Some(0),
+            casing: if case_sensitive {
+                frizbee::CaseMatching::Respect
+            } else {
+                frizbee::CaseMatching::Ignore
+            },
+            unicode: frizbee::UnicodeMatching::Smart,
+            sort: false,
+            scoring: Scoring::default(),
+        };
+        let mut matcher = Matcher::new(pattern, &config);
+
+        let mut scored: Vec<(u16, &PackageMeta)> = self
             .records
             .iter()
             .filter_map(|record| {
-                fuzzy_score(record, pattern, field, &matcher).map(|score| (score, record))
+                fuzzy_score(record, &mut matcher, field).map(|score| (score, record))
             })
             .collect();
 
@@ -434,39 +485,62 @@ fn record_matches_exact(
     }
 }
 
-fn fuzzy_score(
-    record: &PackageMeta,
-    pattern: &str,
-    field: SearchField,
-    matcher: &SkimMatcherV2,
-) -> Option<i64> {
+fn fuzzy_score(record: &PackageMeta, matcher: &mut Matcher, field: SearchField) -> Option<u16> {
+    let mut haystacks = ["", "", ""];
+    let mut count = 0usize;
     match field {
-        SearchField::Attr => matcher.fuzzy_match(&record.attr, pattern),
-        SearchField::Description => record
-            .description
-            .as_ref()
-            .and_then(|desc| matcher.fuzzy_match(desc, pattern)),
-        SearchField::MainProgram => record
-            .main_program
-            .as_ref()
-            .and_then(|main| matcher.fuzzy_match(main, pattern)),
-        SearchField::Both => {
-            let mut best: Option<i64> = None;
-            for value in [
-                Some(record.attr.as_str()),
-                record.description.as_deref(),
-                record.main_program.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                if let Some(score) = matcher.fuzzy_match(value, pattern) {
-                    best = Some(best.map_or(score, |current| current.max(score)));
-                }
+        SearchField::Attr => {
+            if let Some(slot) = haystacks.get_mut(count) {
+                *slot = record.attr.as_str();
+                count += 1;
             }
-            best
+        }
+        SearchField::Description => {
+            if let (Some(desc), Some(slot)) =
+                (record.description.as_deref(), haystacks.get_mut(count))
+            {
+                *slot = desc;
+                count += 1;
+            }
+        }
+        SearchField::MainProgram => {
+            if let (Some(main), Some(slot)) =
+                (record.main_program.as_deref(), haystacks.get_mut(count))
+            {
+                *slot = main;
+                count += 1;
+            }
+        }
+        SearchField::Both => {
+            if let Some(slot) = haystacks.get_mut(count) {
+                *slot = record.attr.as_str();
+                count += 1;
+            }
+            if let (Some(desc), Some(slot)) =
+                (record.description.as_deref(), haystacks.get_mut(count))
+            {
+                *slot = desc;
+                count += 1;
+            }
+            if let (Some(main), Some(slot)) =
+                (record.main_program.as_deref(), haystacks.get_mut(count))
+            {
+                *slot = main;
+                count += 1;
+            }
         }
     }
+
+    if count == 0 {
+        return None;
+    }
+
+    let slice = match haystacks.get(..count) {
+        Some(s) => s,
+        None => &[],
+    };
+
+    matcher.match_list(slice).into_iter().map(|m| m.score).max()
 }
 
 #[cfg(test)]
