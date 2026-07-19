@@ -36,7 +36,7 @@ fn build_synthetic_db(path: &std::path::Path, packages: usize) {
         let mut bin_entries = Vec::with_capacity(FILES_PER_PACKAGE);
         for file in 0..FILES_PER_PACKAGE {
             let exe = file % 10 == 0;
-            let name = if file == 0 && pkg == 500 {
+            let name = if file == 0 && pkg == packages / 2 {
                 Bytes::from_static(b"ls")
             } else {
                 Bytes::from(format!("cmd{file}"))
@@ -66,6 +66,14 @@ fn db_path(packages: usize) -> std::path::PathBuf {
 
 fn real_db_path() -> Option<std::path::PathBuf> {
     std::env::var(DB_ENV_VAR).ok().map(std::path::PathBuf::from)
+}
+
+fn db_files_path(packages: usize) -> std::path::PathBuf {
+    real_db_path().unwrap_or_else(|| db_path(packages))
+}
+
+fn db_dir_for(packages: usize) -> std::path::PathBuf {
+    db_files_path(packages).parent().unwrap().to_path_buf()
 }
 
 fn open_baseline(c: &mut Criterion) {
@@ -104,7 +112,7 @@ fn search_entries_baseline(c: &mut Criterion) {
     ];
 
     for count in PACKAGE_COUNTS {
-        let path = db_path(count);
+        let path = db_files_path(count);
         let reader = Reader::open(&path).expect("open database");
         group.throughput(Throughput::Elements((count * FILES_PER_PACKAGE) as u64));
         for (label, pattern) in patterns {
@@ -137,8 +145,7 @@ fn search_results_baseline(c: &mut Criterion) {
     ];
 
     for count in PACKAGE_COUNTS {
-        let path = db_path(count);
-        let dir = path.parent().unwrap().to_path_buf();
+        let dir = db_dir_for(count);
         group.throughput(Throughput::Elements((count * FILES_PER_PACKAGE) as u64));
         for (label, pattern, exact_basename) in queries {
             let opts = SearchOptions {
