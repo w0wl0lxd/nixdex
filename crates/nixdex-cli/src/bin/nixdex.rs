@@ -972,8 +972,7 @@ struct Opts {
     cmd: Cmd,
 }
 
-#[tokio::main]
-async fn main() -> color_eyre::Result<()> {
+fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -993,12 +992,24 @@ async fn main() -> color_eyre::Result<()> {
         }
         Cmd::GenerateMan(opts) => run_generate_man(opts),
         Cmd::GenerateCompletions(opts) => run_generate_completions(opts),
-        Cmd::Index(index_opts) => index::run(index_opts).await,
+        Cmd::Index(index_opts) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| color_eyre::eyre::eyre!("failed to build tokio runtime: {e}"))?
+            .block_on(index::run(index_opts)),
         Cmd::Locate(locate_opts) => locate::run(locate_opts),
         Cmd::Which(which_opts) => run_which(which_opts),
-        Cmd::Update(update_opts) => run_update(update_opts).await,
+        Cmd::Update(update_opts) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| color_eyre::eyre::eyre!("failed to build tokio runtime: {e}"))?
+            .block_on(run_update(update_opts)),
         Cmd::GenerateSidecars(opts) => run_generate_sidecars(opts),
         Cmd::CommandNotFound(opts) => run_command_not_found(opts),
-        Cmd::Daemon(daemon_opts) => run_daemon(daemon_opts).await,
+        Cmd::Daemon(daemon_opts) => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| color_eyre::eyre::eyre!("failed to build tokio runtime: {e}"))?
+            .block_on(run_daemon(daemon_opts)),
     }
 }

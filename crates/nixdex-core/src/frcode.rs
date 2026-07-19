@@ -145,11 +145,9 @@ impl<R: BufRead> Decoder<R> {
         if shared_len > 0 {
             // Source and destination are non-overlapping: the previous entry
             // ends at `self.pos` and the shared prefix is copied after it.
-            let (left, right) = self.buf.data.split_at_mut(self.pos);
-            let (_, src) = left.split_at_mut(self.last_path);
-            let (src, _) = src.split_at_mut(shared_len);
-            let (dst, _) = right.split_at_mut(shared_len);
-            dst.copy_from_slice(src);
+            self.buf
+                .data
+                .copy_within(self.last_path..self.last_path + shared_len, self.pos);
         }
 
         let new_last_path = self.pos;
@@ -239,15 +237,7 @@ impl<R: BufRead> Decoder<R> {
 
         let shift_len = end.saturating_sub(copy_pos);
         if copy_pos > 0 && shift_len > 0 {
-            if copy_pos >= shift_len {
-                // Non-overlapping shift: the source range starts at or after the
-                // destination range ends, so a plain `memcpy` is safe.
-                let (left, right) = self.buf.data.split_at_mut(copy_pos);
-                let (dst, _) = left.split_at_mut(shift_len);
-                dst.copy_from_slice(right);
-            } else {
-                self.buf.data.copy_within(copy_pos..end, 0);
-            }
+            self.buf.data.copy_within(copy_pos..end, 0);
         }
         self.buf.data.truncate(shift_len);
         self.pos = shift_len;

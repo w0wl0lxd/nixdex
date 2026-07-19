@@ -1397,7 +1397,8 @@ fn find_package(
     cache.take();
 
     while pos < block.len() {
-        let Some((line_start, line_end, next_pos)) = next_candidate_line(matcher, block, pos)?
+        let Some((line_start, line_end, next_pos)) =
+            next_regex_candidate_line(matcher, block, pos)?
         else {
             return Ok(None);
         };
@@ -1426,11 +1427,11 @@ fn find_package(
     Ok(None)
 }
 
-/// Line-oriented search helper used by `find_package`.
+/// Line-oriented search helper used by `PathMatcher` and `find_package`.
 ///
-/// Mirrors `PathMatcher::next_candidate_line` but works on an arbitrary
-/// `grep` matcher, so it can be reused for the package footer matcher.
-fn next_candidate_line(
+/// Works on an arbitrary `grep` matcher, so it can be reused for the package
+/// footer matcher.
+fn next_regex_candidate_line(
     matcher: &grep_regex::RegexMatcher,
     block: &[u8],
     start: usize,
@@ -1479,6 +1480,45 @@ fn next_candidate_line(
         return Ok(Some((line_start, line_end, next_pos)));
     }
     Ok(None)
+}
+
+/// Line-oriented search helper for literal substring patterns.
+///
+/// Finds the next occurrence of `needle` in `block` at or after `start`, then
+/// returns the line (between `\n` delimiters) containing that occurrence. Package
+/// footer lines (`p\0...`) are skipped because they contain JSON metadata, not
+/// file paths.
+fn next_literal_candidate_line(
+    finder: &memchr::memmem::Finder,
+    block: &[u8],
+    mut start: usize,
+) -> Option<(usize, usize, usize)> {
+    while start < block.len() {
+        let haystack = block.get(start..)?;
+        let offset = finder.find(haystack)?;
+        let abs = start + offset;
+
+        let before = block.get(..abs)?;
+        let line_start = memchr::memrchr(b'\n', before).map_or(0, |i| i + 1);
+
+        let after = block.get(abs..)?;
+        let line_end = memchr::memchr(b'\n', after).map_or(block.len(), |i| abs + i);
+        let next_pos = if line_end < block.len() {
+            line_end + 1
+        } else {
+            block.len()
+        };
+
+        if block.get(line_start).copied() == Some(b'p')
+            && block.get(line_start + 1).copied() == Some(b'\x00')
+        {
+            start = next_pos;
+            continue;
+        }
+
+        return Some((line_start, line_end, next_pos));
+    }
+    None
 }
 
 // Per-thread zstd decompression context reused across frames during a parallel
@@ -1708,20 +1748,16 @@ fn no_error<T>(result: std::result::Result<T, NoError>) -> Result<T> {
 /// Fast path-style matcher for file paths.
 ///
 /// Most `nix-locate` queries are plain substrings, which can be answered with
-/// `memchr::memmem` instead of the full `regex` engine. The literal path keeps
-/// a cached `Finder` for exact verification, while both variants keep a
-/// `grep`-style line matcher that can skip whole lines at a time during the
-/// frcode block scan.
+/// `memchr::memmem` instead of the full `regex` engine. Literal queries use a
+/// cached `Finder` for both individual path verification and line-oriented
+/// skipping inside an frcode block; regex queries fall back to a `grep` line
+/// matcher.
 #[derive(Debug)]
 pub enum PathMatcher<'a> {
     /// Literal substring search using a cached `memmem` searcher.
     Literal {
-        /// The original literal pattern, used to build the block matcher.
-        needle: &'a str,
         /// Fast exact matcher for individual decoded paths.
         finder: Box<memchr::memmem::Finder<'a>>,
-        /// Line-oriented matcher for skipping non-candidate lines in a block.
-        block: grep_regex::RegexMatcher,
     },
     /// General regex search.
     Regex {
@@ -1737,20 +1773,15 @@ impl<'a> PathMatcher<'a> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the literal is too long or the block matcher cannot
-    /// be built.
+    /// Returns an error if the literal is too long.
     pub fn literal(needle: &'a str) -> crate::Result<Self> {
         if needle.len() > MAX_PATTERN_BYTES {
             return Err(crate::Error::Parse(format!(
                 "path pattern exceeds maximum length of {MAX_PATTERN_BYTES} bytes"
             )));
         }
-        let escaped = regex::escape(needle);
-        let block = build_block_matcher(&escaped)?;
         Ok(Self::Literal {
-            needle,
             finder: Box::new(memchr::memmem::Finder::new(needle.as_bytes())),
-            block,
         })
     }
 
@@ -1769,7 +1800,7 @@ impl PathMatcher<'_> {
     /// Returns `true` when the haystack contains the pattern.
     fn is_match(&self, haystack: &[u8]) -> bool {
         match self {
-            PathMatcher::Literal { finder, .. } => finder.find(haystack).is_some(),
+            PathMatcher::Literal { finder } => finder.find(haystack).is_some(),
             PathMatcher::Regex { exact, .. } => exact.is_match(haystack),
         }
     }
@@ -1777,7 +1808,7 @@ impl PathMatcher<'_> {
     /// Returns the end position of the last match, if any.
     fn last_match_end(&self, haystack: &[u8]) -> Option<usize> {
         match self {
-            PathMatcher::Literal { finder, .. } => {
+            PathMatcher::Literal { finder } => {
                 let needle_len = finder.needle().len();
                 finder
                     .find_iter(haystack)
@@ -1796,10 +1827,14 @@ impl PathMatcher<'_> {
         block: &[u8],
         start: usize,
     ) -> Result<Option<(usize, usize, usize)>> {
-        let matcher = match self {
-            PathMatcher::Literal { block: m, .. } | PathMatcher::Regex { block: m, .. } => m,
-        };
-        next_candidate_line(matcher, block, start)
+        match self {
+            PathMatcher::Literal { finder } => {
+                Ok(next_literal_candidate_line(finder, block, start))
+            }
+            PathMatcher::Regex { block: matcher, .. } => {
+                next_regex_candidate_line(matcher, block, start)
+            }
+        }
     }
 }
 
@@ -2197,9 +2232,9 @@ fn build_block_matcher(pattern: &str) -> crate::Result<grep_regex::RegexMatcher>
 
 /// Build a path matcher for the supplied options.
 ///
-/// Plain literal patterns use a fast `memchr::memmem` substring search for
-/// individual path verification, while both variants use a `grep` line matcher
-/// to skip whole non-matching lines during the frcode block scan.
+/// Plain literal patterns use a fast `memchr::memmem` substring search for both
+/// individual path verification and line-oriented skipping inside an frcode
+/// block; regex patterns use a `grep` line matcher for skipping.
 pub(crate) fn path_matcher_for<'a>(
     options: &'a SearchOptions<'a>,
 ) -> crate::Result<PathMatcher<'a>> {
@@ -2209,13 +2244,7 @@ pub(crate) fn path_matcher_for<'a>(
                 "path pattern exceeds maximum length of {MAX_PATTERN_BYTES} bytes"
             )));
         }
-        let escaped = regex::escape(lit);
-        let block = build_block_matcher(&escaped)?;
-        Ok(PathMatcher::Literal {
-            needle: lit,
-            finder: Box::new(memchr::memmem::Finder::new(lit.as_bytes())),
-            block,
-        })
+        PathMatcher::literal(lit)
     } else {
         let re = compile_search_regex(&options.pattern, "path")?;
         let block = build_block_matcher(re.as_str())?;
