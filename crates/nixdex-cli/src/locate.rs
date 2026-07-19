@@ -154,6 +154,7 @@ pub struct Opts {
 struct ProcessedArgs {
     database: PathBuf,
     pattern: String,
+    literal_pattern: Option<String>,
     hash: Option<String>,
     package_pattern: Option<String>,
     exact_basename: Option<String>,
@@ -174,6 +175,14 @@ fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
     let start_anchor = if matches.at_root { "^" } else { "" };
     let end_anchor = if matches.whole_name { "$" } else { "" };
     let as_regex = matches.regex;
+
+    // Plain (non-anchored, non-regex) patterns can use a fast substring search.
+    let literal_pattern =
+        if as_regex || matches.at_root || matches.whole_name || matches.pattern.is_empty() {
+            None
+        } else {
+            Some(matches.pattern.clone())
+        };
 
     let exact_basename = if !matches.regex && matches.whole_name && !matches.pattern.is_empty() {
         // The FST is an exact-basename index. It is only safe to use when the
@@ -257,6 +266,7 @@ fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
     Ok(ProcessedArgs {
         database: matches.database,
         pattern,
+        literal_pattern,
         hash: matches.hash,
         package_pattern,
         exact_basename,
@@ -286,6 +296,7 @@ pub fn run(matches: Opts) -> color_eyre::Result<()> {
     let options = SearchOptions {
         database: args.database,
         pattern: args.pattern,
+        literal_pattern: args.literal_pattern,
         hash: args.hash,
         package_pattern: args.package_pattern,
         exact_basename: args.exact_basename,

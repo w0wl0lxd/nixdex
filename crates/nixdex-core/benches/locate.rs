@@ -144,6 +144,7 @@ fn search_results_baseline(c: &mut Criterion) {
             let opts = SearchOptions {
                 database: dir.clone(),
                 pattern: pattern.to_string(),
+                literal_pattern: None,
                 hash: None,
                 package_pattern: None,
                 exact_basename: exact_basename.map(String::from),
