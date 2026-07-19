@@ -1636,8 +1636,7 @@ fn search_frame_stream(
     frame_start_ordinal: Option<u32>,
     package_ordinals: Option<&RoaringBitmap>,
 ) -> Result<Vec<(StorePath, FileTreeEntry)>> {
-    let cursor = std::io::Cursor::new(compressed);
-    let mut zstd_decoder = zstd::stream::read::Decoder::with_buffer(cursor)?;
+    let mut zstd_decoder = zstd::stream::read::Decoder::with_buffer(compressed)?;
     zstd_decoder = zstd_decoder.single_frame();
     zstd_decoder.window_log_max(crate::ZSTD_WINDOW_LOG_MAX)?;
     // A larger input buffer reduces `fill_buf` round-trips through the
@@ -2644,8 +2643,7 @@ fn scan_frame_stream_for_packages(
     all_package_meta: &mut Vec<PackageMeta>,
     all_package_attrs: &mut Vec<(String, String, String)>,
 ) -> Result<()> {
-    let cursor = std::io::Cursor::new(compressed);
-    let mut zstd_decoder = zstd::stream::read::Decoder::with_buffer(cursor)?;
+    let mut zstd_decoder = zstd::stream::read::Decoder::with_buffer(compressed)?;
     zstd_decoder = zstd_decoder.single_frame();
     zstd_decoder.window_log_max(crate::ZSTD_WINDOW_LOG_MAX)?;
     let mut decoder =
