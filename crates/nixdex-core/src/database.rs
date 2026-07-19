@@ -1529,6 +1529,10 @@ thread_local! {
 /// decompressor and is consumed wholesale by the frcode decoder before the next
 /// frame on this worker runs, so there is no aliasing hazard. A defensive cap
 /// rejects zstd bombs that would expand past [`crate::MAX_ZSTD_FRAME_BYTES`].
+fn is_zstd_dst_too_small(err: &std::io::Error) -> bool {
+    err.to_string().to_lowercase().contains("too small")
+}
+
 fn decompress_frame_threaded(compressed: &[u8]) -> std::result::Result<Vec<u8>, Error> {
     if compressed.is_empty() {
         return Ok(Vec::new());
@@ -1539,10 +1543,11 @@ fn decompress_frame_threaded(compressed: &[u8]) -> std::result::Result<Vec<u8>, 
         let decompressor = match guard.as_mut() {
             Some(d) => d,
             None => {
-                let d = match zstd::bulk::Decompressor::new() {
-                    Ok(d) => d,
-                    Err(err) => return Err(Error::Io(err)),
-                };
+                let mut d = zstd::bulk::Decompressor::new().map_err(Error::Io)?;
+                d.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(
+                    crate::ZSTD_WINDOW_LOG_MAX,
+                ))
+                .map_err(Error::Io)?;
                 guard.insert(d)
             }
         };
@@ -1551,17 +1556,22 @@ fn decompress_frame_threaded(compressed: &[u8]) -> std::result::Result<Vec<u8>, 
         // so a single decode usually suffices. If the header does not store the
         // content size (or it exceeds the safety cap), start with a modest
         // buffer and grow geometrically.
-        let mut out = match zstd::zstd_safe::get_frame_content_size(compressed) {
+        let content_size = match zstd::zstd_safe::get_frame_content_size(compressed) {
             Ok(Some(s)) => {
                 let size = usize::try_from(s)
                     .map_err(|_| Error::Corrupt("zstd frame content size exceeds usize"))?;
                 if size > crate::MAX_ZSTD_FRAME_BYTES {
                     return Err(Error::Corrupt("zstd decompressed size exceeds limit"));
                 }
-                Vec::with_capacity(size)
+                Some(size)
             }
-            Ok(None) => Vec::with_capacity(1 << 16),
+            Ok(None) => None,
             Err(_) => return Err(Error::Corrupt("invalid zstd frame header")),
+        };
+
+        let mut out = match content_size {
+            Some(size) => Vec::with_capacity(size),
+            None => Vec::with_capacity(1 << 16),
         };
 
         loop {
@@ -1570,7 +1580,16 @@ fn decompress_frame_threaded(compressed: &[u8]) -> std::result::Result<Vec<u8>, 
                     out.truncate(written);
                     return Ok(out);
                 }
-                Err(_) => {
+                Err(err) => {
+                    // A declared content size means the buffer is already large
+                    // enough; any error is a corrupt frame. For unknown sizes,
+                    // only retry the handful of errors caused by a too-small
+                    // destination buffer.
+                    if content_size.is_some() || !is_zstd_dst_too_small(&err) {
+                        return Err(Error::Corrupt(
+                            "zstd frame corrupt or decompressed size exceeds limit",
+                        ));
+                    }
                     let cap = out.capacity();
                     if cap >= crate::MAX_ZSTD_FRAME_BYTES {
                         return Err(Error::Corrupt("zstd decompressed size exceeds limit"));
@@ -1733,6 +1752,23 @@ pub struct SearchOptions<'a> {
 /// a corrupt database.
 fn no_error<T>(result: std::result::Result<T, NoError>) -> Result<T> {
     result.map_err(|_| Error::Corrupt("grep matcher returned an impossible error"))
+}
+
+/// Returns the original literal pattern when a query is a plain, non-empty
+/// substring that is neither a regex nor anchored, so the fast `memmem` path
+/// can be used.
+#[must_use]
+pub fn literal_pattern_for(
+    pattern: &str,
+    regex: bool,
+    at_root: bool,
+    whole_name: bool,
+) -> Option<String> {
+    if regex || at_root || whole_name || pattern.is_empty() {
+        None
+    } else {
+        Some(pattern.to_string())
+    }
 }
 
 /// Fast path-style matcher for file paths.

@@ -39,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nix-index --cache-url` now accepts `--substituter` as a visible alias for compatibility with upstream nix-index.
 
 ### Changed
+
 - Track `.config/rail.toml` and wire `cargo-rail` into `mise.toml` and `justfile` for dependency linting.
 - Added `--chunk-size` to `nix-index` to control uncompressed v2 frame buffering; the default is now 64 MiB to reduce peak memory usage during builds.
 - Daemon now loads index components into an atomic `IndexSnapshot` so requests never observe a partially loaded index during reload.
@@ -54,6 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Database searches reuse a per-thread zstd decompression context, reducing allocator pressure and improving repeated `nixdex locate` query latency.
 
 ### Fixed
+
 - Cache `uses_nix_profile` in the shell wrapper to avoid repeated filesystem checks inside loops.
 - Filter empty `XDG_STATE_HOME`/`HOME` values when locating the `nix profile` manifest.
 - Guard shell-completion generation with a can-run check so cross-compiled builds do not fail.

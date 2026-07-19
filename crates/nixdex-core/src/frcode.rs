@@ -85,11 +85,12 @@ impl ResizableBuf {
             return false;
         }
         // Amortise growth; reserve at least enough for `len` and prefer
-        // doubling the current allocation.
+        // doubling the current allocation, then grow the zeroed length to the
+        // full capacity so small subsequent appends do not force a realloc.
         let additional = len.saturating_sub(self.data.len());
         let reserve = additional.max(self.data.len());
         self.data.reserve(reserve);
-        self.data.resize(len, b'\x00');
+        self.data.resize(self.data.capacity(), b'\x00');
         true
     }
 }
@@ -165,21 +166,14 @@ impl<R: BufRead> Decoder<R> {
         }
 
         if shared_len > 0 {
-            // Source and destination are non-overlapping: the previous entry
-            // ends at `self.pos` and the shared prefix is copied after it.
-            // Use `split_at_mut` so the compiler can emit `memcpy`.
-            let (left, right) = self.buf.data.split_at_mut(self.pos);
-            let src = left
-                .get(self.last_path..self.last_path + shared_len)
-                .ok_or(Error::SharedOutOfRange {
-                    previous_len,
-                    shared_len: self.shared_len,
-                })?;
-            let dst = right.get_mut(..shared_len).ok_or(Error::SharedOutOfRange {
-                previous_len,
-                shared_len: self.shared_len,
-            })?;
-            dst.copy_from_slice(src);
+            // `ensure_len` has already verified the destination is in bounds,
+            // and `shared_len <= previous_len` guarantees the source and
+            // destination ranges are within the same vector. `copy_within` is a
+            // single `memmove`-style call that handles both overlapping and
+            // non-overlapping ranges.
+            self.buf
+                .data
+                .copy_within(self.last_path..self.last_path + shared_len, self.pos);
         }
 
         let new_last_path = self.pos;

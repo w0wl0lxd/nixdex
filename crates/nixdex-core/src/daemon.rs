@@ -639,12 +639,12 @@ async fn nix_locate_handler(
     let pattern = format!("{start_anchor}{pattern_body}{end_anchor}");
 
     // Plain (non-anchored, non-regex) daemon patterns can use a fast substring search.
-    let literal_pattern =
-        if params.regex || params.at_root || params.whole_name || params.pattern.is_empty() {
-            None
-        } else {
-            Some(params.pattern.clone())
-        };
+    let literal_pattern = crate::database::literal_pattern_for(
+        &params.pattern,
+        params.regex,
+        params.at_root,
+        params.whole_name,
+    );
 
     // Determine whether the secondary indexes can answer this query exactly.
     let exact_basename = if !params.regex && params.whole_name && !params.pattern.is_empty() {

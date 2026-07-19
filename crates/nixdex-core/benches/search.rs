@@ -51,12 +51,13 @@ fn bench_search_literal(c: &mut Criterion) {
     for count in COUNTS {
         let (path, _fixture) = fixture_path(count);
         let db = SearchDb::open(&path).unwrap();
+        let query = format!("pkg{}", count / 2);
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &db, |b, db| {
             b.iter(|| {
                 black_box(
                     db.search(
-                        black_box("pkg5000"),
+                        black_box(&query),
                         false,
                         SearchField::Attr,
                         false,
@@ -78,12 +79,13 @@ fn bench_search_exact(c: &mut Criterion) {
     for count in COUNTS {
         let (path, _fixture) = fixture_path(count);
         let db = SearchDb::open(&path).unwrap();
+        let query = format!("pkg{}", count / 2);
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &db, |b, db| {
             b.iter(|| {
                 black_box(
                     db.search(
-                        black_box("pkg5000"),
+                        black_box(&query),
                         false,
                         SearchField::Attr,
                         false,
@@ -105,12 +107,13 @@ fn bench_search_description(c: &mut Criterion) {
     for count in COUNTS {
         let (path, _fixture) = fixture_path(count);
         let db = SearchDb::open(&path).unwrap();
+        let query = format!("pkg{}", count / 2);
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &db, |b, db| {
             b.iter(|| {
                 black_box(
                     db.search(
-                        black_box("named pkg5000"),
+                        black_box(&query),
                         false,
                         SearchField::Both,
                         false,
@@ -132,12 +135,13 @@ fn bench_search_regex(c: &mut Criterion) {
     for count in COUNTS {
         let (path, _fixture) = fixture_path(count);
         let db = SearchDb::open(&path).unwrap();
+        let query = format!(r"^pkg{}.*", count / 2);
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &db, |b, db| {
             b.iter(|| {
                 black_box(
                     db.search(
-                        black_box(r"^pkg50.*"),
+                        black_box(&query),
                         true,
                         SearchField::Attr,
                         false,
@@ -194,12 +198,13 @@ fn bench_search_fuzzy(c: &mut Criterion) {
     for count in [1_000, 10_000] {
         let (path, _fixture) = fixture_path(count);
         let db = SearchDb::open(&path).unwrap();
+        let query = format!("pkg{}", count / 2);
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &db, |b, db| {
             b.iter(|| {
                 black_box(
                     db.search_fuzzy(
-                        black_box("pkg5000"),
+                        black_box(&query),
                         SearchField::Attr,
                         false,
                         SearchSort::None,

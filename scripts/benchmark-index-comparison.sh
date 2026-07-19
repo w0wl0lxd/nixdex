@@ -20,7 +20,10 @@ fi
 cargo build --release --bin nixdex
 NIXDEX="$(realpath "${CARGO_TARGET_DIR:-target}/release/nixdex")"
 
-NIXPKGS_MINIMAL="$(mktemp -t nixpkgs-minimal-XXXXXX.nix)"
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+NIXPKGS_MINIMAL="$TMP_DIR/minimal.nix"
 cat >"$NIXPKGS_MINIMAL" <<'EOF'
 let
   pkgs = import <nixpkgs> { config = {}; };
@@ -30,11 +33,8 @@ in
 }
 EOF
 
-trap 'rm -f "$NIXPKGS_MINIMAL"' EXIT
-
-NIXDEX_DB="$(mktemp -d -t nixdex-index-compare-XXXXXX)"
-NIXINDEX_DB="$(mktemp -d -t nix-index-compare-XXXXXX)"
-trap 'rm -rf "$NIXDEX_DB" "$NIXINDEX_DB" "$NIXPKGS_MINIMAL"' EXIT
+NIXDEX_DB="$TMP_DIR/nixdex-db"
+NIXINDEX_DB="$TMP_DIR/nix-index-db"
 
 SELECT="p: { inherit (p) hello coreutils; }"
 

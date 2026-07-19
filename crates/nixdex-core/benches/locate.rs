@@ -4,7 +4,7 @@ use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use regex::bytes::Regex;
 
-use nixdex_core::database::{Reader, SearchMode, SearchOptions, SearchSort};
+use nixdex_core::database::{PathMatcher, Reader, SearchMode, SearchOptions, SearchSort};
 use nixdex_core::files::FileTree;
 use nixdex_core::generate_sidecars;
 use nixdex_core::store_path::{Origin, StorePath};
@@ -36,7 +36,7 @@ fn build_synthetic_db(path: &std::path::Path, packages: usize) {
         let mut bin_entries = Vec::with_capacity(FILES_PER_PACKAGE);
         for file in 0..FILES_PER_PACKAGE {
             let exe = file % 10 == 0;
-            let name = if file == 0 && pkg == 500 {
+            let name = if file == 0 && pkg == packages / 2 {
                 Bytes::from_static(b"ls")
             } else {
                 Bytes::from(format!("cmd{file}"))
@@ -66,6 +66,14 @@ fn db_path(packages: usize) -> std::path::PathBuf {
 
 fn real_db_path() -> Option<std::path::PathBuf> {
     std::env::var(DB_ENV_VAR).ok().map(std::path::PathBuf::from)
+}
+
+fn db_files_path(packages: usize) -> std::path::PathBuf {
+    real_db_path().unwrap_or_else(|| db_path(packages))
+}
+
+fn db_dir_for(packages: usize) -> std::path::PathBuf {
+    db_files_path(packages).parent().unwrap().to_path_buf()
 }
 
 fn open_baseline(c: &mut Criterion) {
@@ -104,18 +112,19 @@ fn search_entries_baseline(c: &mut Criterion) {
     ];
 
     for count in PACKAGE_COUNTS {
-        let path = db_path(count);
+        let path = db_files_path(count);
         let reader = Reader::open(&path).expect("open database");
         group.throughput(Throughput::Elements((count * FILES_PER_PACKAGE) as u64));
         for (label, pattern) in patterns {
             let re = Regex::new(pattern).expect("valid regex");
+            let matcher = PathMatcher::regex(re).expect("matcher");
             group.bench_with_input(
                 BenchmarkId::new(label, count),
-                &(&reader, &re),
-                |b, &(reader, re)| {
+                &(&reader, matcher),
+                |b, (reader, matcher)| {
                     b.iter(|| {
                         let hits = reader
-                            .search_entries(black_box(re), None, None, None, None)
+                            .search_entries(black_box(matcher), None, None, None, None)
                             .expect("search");
                         black_box(hits);
                     });
@@ -137,14 +146,14 @@ fn search_results_baseline(c: &mut Criterion) {
     ];
 
     for count in PACKAGE_COUNTS {
-        let path = db_path(count);
-        let dir = path.parent().unwrap().to_path_buf();
+        let dir = db_dir_for(count);
         group.throughput(Throughput::Elements((count * FILES_PER_PACKAGE) as u64));
         for (label, pattern, exact_basename) in queries {
+            let literal_pattern = label.starts_with("literal").then(|| pattern.to_string());
             let opts = SearchOptions {
                 database: dir.clone(),
                 pattern: pattern.to_string(),
-                literal_pattern: None,
+                literal_pattern,
                 hash: None,
                 package_pattern: None,
                 exact_basename: exact_basename.map(String::from),
