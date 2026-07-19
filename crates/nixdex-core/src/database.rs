@@ -1385,7 +1385,8 @@ fn decompress_frame_threaded(compressed: &[u8]) -> std::result::Result<Vec<u8>, 
                 }
                 Vec::with_capacity(size)
             }
-            _ => Vec::with_capacity(1 << 16),
+            Ok(None) => Vec::with_capacity(1 << 16),
+            Err(_) => return Err(Error::Corrupt("invalid zstd frame header")),
         };
 
         loop {
