@@ -1271,14 +1271,6 @@ fn search_frame_decoder<R: std::io::BufRead>(
         None => 0,
     };
 
-    // Package footers are always `p\0{json}\n`. Using a line matcher lets us
-    // skip straight to the next footer without decoding every line.
-    let package_matcher = RegexMatcherBuilder::new()
-        .line_terminator(Some(b'\n'))
-        .multi_line(true)
-        .build("^p\0")
-        .map_err(|_| Error::Corrupt("failed to build package footer matcher"))?;
-
     let package_filter = |pkg: &StorePath, ord: u32| {
         package_pattern.is_none_or(|re| re.is_match(pkg.name().as_bytes()))
             && hash.is_none_or(|h| h == pkg.hash())
@@ -1307,13 +1299,8 @@ fn search_frame_decoder<R: std::io::BufRead>(
         // footer ended up in this block, resolve them against the first footer
         // found here.
         if !pending.is_empty()
-            && let Some((pkg, ord)) = find_package(
-                &package_matcher,
-                block,
-                0,
-                &mut package_cache,
-                &mut current_ordinal,
-            )?
+            && let Some((pkg, ord)) =
+                find_package(block, 0, &mut package_cache, &mut current_ordinal)?
         {
             if package_filter(&pkg, ord) {
                 for entry in std::mem::take(&mut pending) {
@@ -1348,13 +1335,7 @@ fn search_frame_decoder<R: std::io::BufRead>(
                 continue;
             }
 
-            match find_package(
-                &package_matcher,
-                block,
-                pos,
-                &mut package_cache,
-                &mut current_ordinal,
-            )? {
+            match find_package(block, pos, &mut package_cache, &mut current_ordinal)? {
                 Some((pkg, ord)) => {
                     if package_filter(&pkg, ord) {
                         matches.push((pkg, entry));
@@ -1367,6 +1348,12 @@ fn search_frame_decoder<R: std::io::BufRead>(
                 None => pending.push(entry),
             }
         }
+
+        // Advance the running package ordinal through the rest of this block
+        // so that candidates in later blocks use global ordinals. Footers that
+        // were already parsed by `find_package` above are skipped via
+        // `package_cache`, so each footer is only parsed once.
+        let _ = find_package(block, block.len(), &mut package_cache, &mut current_ordinal)?;
     }
 
     if !pending.is_empty() {
@@ -1383,7 +1370,6 @@ fn search_frame_decoder<R: std::io::BufRead>(
 /// footers between the cache and `item_end` so ordinals remain correct even for
 /// packages that contain no matching path entries.
 fn find_package(
-    matcher: &grep_regex::RegexMatcher,
     block: &[u8],
     item_end: usize,
     cache: &mut Option<(StorePath, u32, usize)>,
@@ -1395,35 +1381,37 @@ fn find_package(
         return Ok(Some((pkg.clone(), *ord)));
     }
 
-    let mut pos = cache.as_ref().map_or(0, |(_, _, end)| *end);
+    let start = cache.as_ref().map_or(0, |(_, _, end)| *end);
     cache.take();
 
-    while pos < block.len() {
-        let Some((line_start, line_end, next_pos)) =
-            next_regex_candidate_line(matcher, block, pos)?
-        else {
-            return Ok(None);
-        };
-        pos = next_pos;
-
-        let ord = *ordinal;
-        *ordinal = ordinal
-            .checked_add(1)
-            .ok_or(Error::Corrupt("package ordinal overflow"))?;
-
-        if item_end < next_pos {
-            let line = block
-                .get(line_start..line_end)
-                .ok_or(Error::Corrupt("package footer line out of bounds"))?;
+    let mut line_start = start;
+    let tail = match block.get(start..) {
+        Some(t) => t,
+        None => &[],
+    };
+    for line_end_rel in memchr::memchr_iter(b'\n', tail) {
+        let line_end = start + line_end_rel;
+        let line = block
+            .get(line_start..line_end)
+            .ok_or(Error::Corrupt("invalid line bounds"))?;
+        if line.starts_with(b"p\0") {
             let json = line.get(2..).ok_or_else(|| Error::StorePathParse {
                 path: line.to_vec(),
             })?;
             let pkg: StorePath = sonic_rs::from_slice(json).map_err(|_| Error::StorePathParse {
                 path: json.to_vec(),
             })?;
+            let ord = *ordinal;
+            *ordinal = ordinal
+                .checked_add(1)
+                .ok_or(Error::Corrupt("package ordinal overflow"))?;
+            let next_pos = line_end + 1;
             cache.replace((pkg.clone(), ord, next_pos));
-            return Ok(Some((pkg, ord)));
+            if item_end < next_pos {
+                return Ok(Some((pkg, ord)));
+            }
         }
+        line_start = line_end + 1;
     }
 
     Ok(None)
@@ -1836,6 +1824,51 @@ impl PathMatcher<'_> {
             PathMatcher::Regex { block: matcher, .. } => {
                 next_regex_candidate_line(matcher, block, start)
             }
+        }
+    }
+}
+
+/// Return the basename suffix of a literal pattern if it can be used as a
+/// safe over-approximation filter. A literal that contains a `/` can only
+/// match paths where a component starts with the text after the last `/`.
+fn literal_basename_prefix(literal: &str) -> Option<&str> {
+    let suffix = literal.rsplit_once('/')?.1;
+    if suffix.is_empty() {
+        return None;
+    }
+    Some(suffix)
+}
+
+/// Resolve the set of candidate package ordinals from the basename secondary index
+/// for all basenames that start with `prefix`.
+///
+/// Errors are logged and treated as a full-scan fallback; `None` is returned
+/// when there are no sidecar candidates.
+#[allow(clippy::cognitive_complexity)]
+fn resolve_basename_prefix_ordinals(
+    index_file: &Path,
+    prefix: Option<&str>,
+) -> Option<RoaringBitmap> {
+    let base = prefix?;
+    let dir = index_file.parent()?;
+    if dir.as_os_str().is_empty() {
+        return None;
+    }
+    match BasenameIndex::open(dir) {
+        Ok(index) => match index.lookup_basename_prefix_ordinals(base.as_bytes()) {
+            Ok(ordinals) => Some(ordinals.into_iter().collect()),
+            Err(err) => {
+                if sidecars_exist(dir) {
+                    tracing::warn!(%err, "basename index sidecars unreadable; falling back to full scan");
+                }
+                None
+            }
+        },
+        Err(err) => {
+            if sidecars_exist(dir) {
+                tracing::warn!(%err, "basename index sidecars unreadable; falling back to full scan");
+            }
+            None
         }
     }
 }
@@ -2257,6 +2290,8 @@ pub(crate) fn path_matcher_for<'a>(
 /// # Errors
 ///
 /// Returns an error if the database cannot be read or the pattern is invalid.
+#[allow(clippy::cognitive_complexity)]
+#[allow(clippy::too_many_lines)]
 pub fn search_results(
     options: &SearchOptions<'_>,
     path_matcher: &PathMatcher<'_>,
@@ -2279,16 +2314,38 @@ pub fn search_results(
         options.path_prefix.as_deref(),
     );
 
-    // Combine ordinals from both sources if both are present
-    let package_ordinals: Option<RoaringBitmap> = match (basename_ordinals, path_ordinals) {
-        (Some(b), Some(p)) => {
-            let combined = b | &p;
-            Some(combined)
+    // Resolve ordinals from basename index using the last `/`-delimited component
+    // of a literal pattern. Any path containing the literal must contain a path
+    // component starting with that suffix, so the package list is a safe over-
+    // approximation that the frcode scan then verifies.
+    let basename_prefix = options
+        .literal_pattern
+        .as_deref()
+        .and_then(literal_basename_prefix);
+    let basename_prefix_ordinals = resolve_basename_prefix_ordinals(&index_file, basename_prefix);
+    tracing::debug!(
+        literal = ?options.literal_pattern,
+        basename_prefix = ?basename_prefix,
+        prefix_count = ?basename_prefix_ordinals.as_ref().map(RoaringBitmap::len),
+        "basename prefix ordinals"
+    );
+
+    // Combine ordinals from all available sidecar sources.
+    let mut package_ordinals: Option<RoaringBitmap> = None;
+    let mut add_ordinals = |ords: Option<RoaringBitmap>| {
+        if let Some(ords) = ords {
+            if let Some(ref mut existing) = package_ordinals {
+                *existing |= ords;
+            } else {
+                package_ordinals = Some(ords);
+            }
         }
-        (Some(b), None) => Some(b),
-        (None, Some(p)) => Some(p),
-        (None, None) => None,
     };
+    add_ordinals(basename_ordinals);
+    add_ordinals(path_ordinals);
+    add_ordinals(basename_prefix_ordinals);
+
+    tracing::debug!(package_ordinals_count = ?package_ordinals.as_ref().map(RoaringBitmap::len), "combined package ordinals");
 
     if package_ordinals
         .as_ref()
@@ -2502,9 +2559,15 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
         .write_sidecars(db_dir)
         .map_err(Error::PathIndex)?;
 
-    // Write frame_map sidecar if we have v2 frame data.
+    // Write frame_map sidecar if we have v2 frame data, or synthesize one for v1.
+    // A v1 database is a single frame, so every package maps to frame 0; this
+    // lets `Reader::search_entries` use `package_ordinals` filters while still
+    // streaming the lone zstd frame.
     if let (Some(frame_map), Some(_frame_starts)) = (&reader.frame_map, &reader.frame_starts) {
         write_frame_map(db_dir, frame_map, reader.frames.len())?;
+    } else if reader.version == 1 {
+        let v1_frame_map = vec![0u32; all_package_labels.len()];
+        write_frame_map(db_dir, &v1_frame_map, 1)?;
     }
 
     // Synthesize a packages.json sidecar from package footers so that
@@ -3201,6 +3264,84 @@ mod tests {
         assert_eq!(
             hello_hits.first().map(|(_, e)| e.path.as_slice()),
             Some(b"/bin/hello".as_slice())
+        );
+    }
+
+    #[test]
+    fn v1_sidecar_literal_prefix_search() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+
+        let hello = sample_store_path();
+        let hello_tree = FileTree::directory(vec![(
+            Bytes::from_static(b"bin"),
+            FileTree::directory(vec![(
+                Bytes::from_static(b"hello"),
+                FileTree::regular(0, true),
+            )]),
+        )]);
+
+        let coreutils = StorePath::new(
+            "/nix/store".into(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            "coreutils-9.11".into(),
+            Origin {
+                attr: "coreutils".into(),
+                output: "out".into(),
+                toplevel: true,
+                system: Some("x86_64-linux".into()),
+            },
+        );
+        let coreutils_tree = FileTree::directory(vec![(
+            Bytes::from_static(b"bin"),
+            FileTree::directory(vec![(
+                Bytes::from_static(b"ls"),
+                FileTree::regular(0, true),
+            )]),
+        )]);
+
+        {
+            let mut writer = Writer::create_with_version(&db_path, 3, 1, false).expect("create v1");
+            writer.add(&hello, &hello_tree, b"").expect("add hello");
+            writer
+                .add(&coreutils, &coreutils_tree, b"")
+                .expect("add coreutils");
+            writer.finish().expect("finish");
+        }
+
+        generate_sidecars(&db_path).expect("generate sidecars");
+
+        let options = SearchOptions {
+            database: dir.path().to_path_buf(),
+            pattern: "bin/ls".into(),
+            literal_pattern: Some("bin/ls".into()),
+            hash: None,
+            package_pattern: None,
+            exact_basename: None,
+            exact_path: None,
+            path_prefix: None,
+            file_type: &[],
+            mode: SearchMode::Minimal,
+            json: false,
+            limit: None,
+            count: false,
+            sort: SearchSort::None,
+            min_size: None,
+            max_size: None,
+            exclude_fhs: false,
+        };
+        let matcher = path_matcher_for(&options).expect("matcher");
+        let results = search_results(&options, &matcher).expect("search");
+
+        assert!(
+            results
+                .iter()
+                .any(|(p, e)| p.name() == "coreutils-9.11" && e.path == b"/bin/ls"),
+            "literal prefix search should find /bin/ls in coreutils; got {:?}",
+            results
+                .iter()
+                .map(|(p, e)| (p.name(), String::from_utf8_lossy(&e.path)))
+                .collect::<Vec<_>>()
         );
     }
 }
