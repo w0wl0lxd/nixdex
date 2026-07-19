@@ -39,7 +39,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nix-index --cache-url` now accepts `--substituter` as a visible alias for compatibility with upstream nix-index.
 
 ### Changed
-
 - Track `.config/rail.toml` and wire `cargo-rail` into `mise.toml` and `justfile` for dependency linting.
 - Added `--chunk-size` to `nix-index` to control uncompressed v2 frame buffering; the default is now 64 MiB to reduce peak memory usage during builds.
 - Daemon now loads index components into an atomic `IndexSnapshot` so requests never observe a partially loaded index during reload.
@@ -48,14 +47,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Change the default database directory for `nixdex` subcommands and the `nixdex` umbrella binary to `~/.cache/nixdex`. The standalone `nix-index` and `nix-locate` binaries retain the upstream-compatible `~/.cache/nix-index` default.
 - Exact attribute lookups in package search now use a pre-built index, making `nixdex info` and `nixdex search --exact --attr` O(1).
 - Apply `cargo fmt` to the redb index and CLI command-not-found code.
+- Rework `frcode::Decoder`'s `ResizableBuf` so it is pre-zeroed and only grows when an entry exceeds the current allocation. This removes per-chunk `Vec::extend_from_slice` overhead and lets `read_to_nul` / `copy_shared` use `copy_from_slice` / `copy_within` directly.
 - Package fuzzy search now uses the `frizbee` SIMD matcher, dramatically improving matching throughput and reducing query latency.
 - `nix-index` builds now display `indicatif` progress bars for nixpkgs evaluation and `.ls` fetching, including per-second rates and ETA.
 - Updated `.gitignore` to ignore the `research/` directory and local dev configs such as `.cargo/config.toml`, `.config/sccache/config.toml`, and `mise.toml`.
 - Make the `redb` exact-path sidecar opt-in via a new `--redb` flag on `nixdex index` / `nix-index`. The sidecar is no longer built by default, which substantially reduces database size and improves query startup latency. Users who need fast `--at-root` or exact full-path lookups can enable it explicitly.
+- Use `memchr::memmem` directly for literal `PathMatcher` block candidate search instead of a `grep` line matcher, and use `copy_within` for `frcode` shared-prefix copies and residual shifts.
+- Switch the `nixdex` CLI to a synchronous `main` with a manually-built Tokio runtime only for async subcommands, eliminating runtime startup overhead for `locate`, `which`, and `command-not-found`.
+- Rewrote `PathMatcher` to build a `grep`-style line matcher and `search_frame_decoder` to jump directly to candidate lines, decoding and verifying only path matches instead of every frcode line.
+- Replaced the fixed-size frcode decode buffer with a `Vec`-backed resizable buffer and `copy_within` for residual shifting, and added a fast literal-substring `PathMatcher` using `memchr::memmem::Finder` for non-anchored `nix-locate` queries.
 - Database searches reuse a per-thread zstd decompression context, reducing allocator pressure and improving repeated `nixdex locate` query latency.
+- Open `zstd::stream::read::Decoder` with `with_buffer` / `single_frame` for `&[u8]` inputs, avoiding an extra `BufReader` layer, the `Cursor` wrapper, and an unnecessary multi-frame scan during database locate operations.
 
 ### Fixed
-
 - Cache `uses_nix_profile` in the shell wrapper to avoid repeated filesystem checks inside loops.
 - Filter empty `XDG_STATE_HOME`/`HOME` values when locating the `nix profile` manifest.
 - Guard shell-completion generation with a can-run check so cross-compiled builds do not fail.
@@ -85,5 +89,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optimize path index prefix lookup to stop early when keys no longer match prefix
 - Fix prebuilt cache key to use SHA256 digest instead of raw ETag/Last-Modified header values
 - `nix-locate` output highlighting now reuses the same defensively size-limited regex used for the search, avoiding a second unbounded compilation.
+- Fix package-ordinal tracking when scanning frcode blocks during v1 database searches so basename-prefix filters resolve to the correct packages instead of rejecting all candidates.
 - `command-not-found.sh` and `nixdex command-not-found --auto-install` now detect `nix profile` via `$XDG_STATE_HOME/nix/profile/manifest.json` before falling back to `~/.nix-profile/manifest.json`.
 - Switch `nixdex-core` database compression from multi-threaded `zstd::Encoder` to single-threaded `zstd::bulk::Compressor`. This removes the per-worker ~1 GiB memory allocation during index builds and drops peak RSS for large databases from ~11.7 GB to ~628 MB.
