@@ -1,0 +1,2 @@
+- Add a content-defined chunking (CDC) client foundation using FastCDC (`v2020`) with BLAKE3 chunk digests, behind the `cdc` feature.
+- Add a Criterion benchmark (`benches/cnf.rs`) for the cold command-not-found lookup path.
