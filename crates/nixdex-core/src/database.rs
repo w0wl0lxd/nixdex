@@ -172,6 +172,14 @@ pub enum Error {
     /// Trigram (n-gram) secondary index is missing or unreadable.
     #[error("ngram index: {0}")]
     NgramIndex(#[from] crate::ngram_index::Error),
+
+    /// Path-level per-entry cache is missing or unreadable.
+    #[error("path entry index: {0}")]
+    PathEntryIndex(#[from] crate::path_entry_index::IndexError),
+
+    /// Path-level trigram index is missing or unreadable.
+    #[error("path trigram index: {0}")]
+    PathTrigramIndex(#[from] crate::path_trigram_index::Error),
 }
 
 /// Convenience alias for this module.
@@ -626,6 +634,12 @@ pub struct Reader {
     frame_starts: Option<Vec<u32>>,
     /// Optional redb reader for fast exact-path lookups.
     redb: Option<redb_index::Reader>,
+    /// Optional path-level trigram index for fast literal substring queries.
+    path_trigram: Option<crate::path_trigram_index::PathTrigramIndex>,
+    /// Optional per-path entry cache for fast result materialisation.
+    path_entry: Option<crate::path_entry_index::PathEntryIndex>,
+    /// Optional basename-based entry cache for fast `nixdex locate -w` queries.
+    entry_index: Option<crate::entry_index::EntryIndex>,
     /// Cached decompressed frcode data for version 1 databases. Version 1 uses
     /// a single large zstd frame; caching the decoded bytes lets repeated
     /// searches (in particular the daemon) avoid decompressing it every query.
@@ -639,6 +653,7 @@ impl Reader {
     ///
     /// Returns an error if the path does not exist or is not a valid database.
     #[allow(clippy::cognitive_complexity)]
+    #[allow(clippy::too_many_lines)]
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path_buf = path.as_ref().to_path_buf();
 
@@ -724,6 +739,36 @@ impl Reader {
             None
         };
 
+        // Try to open the path-level trigram and entry sidecars.
+        let (path_trigram, path_entry, entry_index) = if let Some(dir) = path_buf.parent()
+            && !dir.as_os_str().is_empty()
+        {
+            let trigram = match crate::path_trigram_index::PathTrigramIndex::open(dir) {
+                Ok(t) => Some(t),
+                Err(err) => {
+                    tracing::debug!(%err, "path trigram index unavailable; falling back to scan");
+                    None
+                }
+            };
+            let path_entry = match crate::path_entry_index::PathEntryIndex::open(dir) {
+                Ok(e) => Some(e),
+                Err(err) => {
+                    tracing::debug!(%err, "path entry index unavailable; falling back to scan");
+                    None
+                }
+            };
+            let entry_index = match crate::entry_index::EntryIndex::open(dir) {
+                Ok(e) => Some(e),
+                Err(err) => {
+                    tracing::debug!(%err, "entry index unavailable; falling back to scan");
+                    None
+                }
+            };
+            (trigram, path_entry, entry_index)
+        } else {
+            (None, None, None)
+        };
+
         Ok(Self {
             path: path_buf,
             version,
@@ -732,6 +777,9 @@ impl Reader {
             frame_map,
             frame_starts,
             redb,
+            path_trigram,
+            path_entry,
+            entry_index,
             v1_decompressed: once_cell::sync::OnceCell::new(),
         })
     }
@@ -918,6 +966,99 @@ impl Reader {
             matches.extend(frame_matches);
         }
         Ok(matches)
+    }
+
+    /// Fast literal-substring search using the path-level trigram + entry sidecars.
+    ///
+    /// Returns `Ok(None)` if the sidecars are missing, the pattern is not a
+    /// literal substring, or the trigram candidate set is empty. Otherwise returns
+    /// `Ok(Some(results))` with all matching `(StorePath, FileTreeEntry)` pairs,
+    /// pre-filtered by `package_pattern`, `hash`, and `should_include_match`.
+    pub fn search_path_trigram(
+        &self,
+        pattern: &str,
+        path_pattern: &Regex,
+        package_pattern: Option<&Regex>,
+        hash: Option<&str>,
+        options: &SearchOptions<'_>,
+    ) -> Result<Option<Vec<(StorePath, FileTreeEntry)>>> {
+        let Some(trigram) = &self.path_trigram else {
+            return Ok(None);
+        };
+        let Some(entry) = &self.path_entry else {
+            return Ok(None);
+        };
+
+        let candidates = match trigram.candidate_path_ids(pattern) {
+            Ok(Some(ids)) => ids,
+            Ok(None) => return Ok(None),
+            Err(err) => {
+                tracing::debug!(%err, "path trigram candidate lookup failed; falling back");
+                return Ok(None);
+            }
+        };
+
+        if candidates.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+
+        let needle = pattern.as_bytes();
+        let mut results = Vec::new();
+        for path_id in candidates {
+            let path = entry.path_bytes(path_id).map_err(Error::PathEntryIndex)?;
+            if memchr::memmem::find(path, needle).is_none() {
+                continue;
+            }
+
+            let hits = entry
+                .lookup_entries_by_id(path_id)
+                .map_err(Error::PathEntryIndex)?;
+            for (store_path, entry) in hits {
+                if package_pattern.is_some_and(|re| !re.is_match(store_path.name().as_bytes())) {
+                    continue;
+                }
+                if hash.is_some_and(|h| h != store_path.hash()) {
+                    continue;
+                }
+                if should_include_match(options, path_pattern, &store_path, &entry) {
+                    results.push((store_path, entry));
+                }
+            }
+        }
+
+        Ok(Some(results))
+    }
+
+    /// Fast exact-basename search using the basename-based entry sidecar.
+    ///
+    /// Returns `Ok(None)` if the sidecar is missing. Otherwise returns
+    /// `Some(results)` filtered by package/hash/options.
+    pub fn search_entry_index(
+        &self,
+        basename: &[u8],
+        path_pattern: &Regex,
+        package_pattern: Option<&Regex>,
+        hash: Option<&str>,
+        options: &SearchOptions<'_>,
+    ) -> Result<Option<Vec<(StorePath, FileTreeEntry)>>> {
+        let Some(index) = &self.entry_index else {
+            return Ok(None);
+        };
+
+        let mut results = Vec::new();
+        for (store_path, entry) in index.lookup_entries(basename).map_err(Error::EntryIndex)? {
+            if package_pattern.is_some_and(|re| !re.is_match(store_path.name().as_bytes())) {
+                continue;
+            }
+            if hash.is_some_and(|h| h != store_path.hash()) {
+                continue;
+            }
+            if should_include_match(options, path_pattern, &store_path, &entry) {
+                results.push((store_path, entry));
+            }
+        }
+
+        Ok(Some(results))
     }
 
     /// Exact-basename lookup via the optional FST secondary index.
@@ -2242,6 +2383,7 @@ pub fn search_results(
 ///
 /// Returns an error if the pattern is invalid or the search fails.
 #[allow(clippy::cognitive_complexity)]
+#[allow(clippy::too_many_lines)]
 pub fn search_results_with_reader(
     reader: &Reader,
     index_file: &Path,
@@ -2282,42 +2424,138 @@ pub fn search_results_with_reader(
         (None, None) => None,
     };
 
+    // Only short-circuit before the fast paths when we already know the exact
+    // basename/path/prefix/literal candidates are empty and no fast path could
+    // change that. If any fast path may apply, let it run.
     if package_ordinals
         .as_ref()
         .is_some_and(RoaringBitmap::is_empty)
+        && options.exact_path.is_none()
+        && options.exact_basename.is_none()
+        && options.literal_pattern.is_none()
     {
         return Ok(Vec::new());
     }
 
-    // Try redb index for exact-path lookups when available.
-    // Apply the same package/hash filters the full scan would use.
-    let mut results = if let (Some(redb), Some(exact_path)) = (&reader.redb, &options.exact_path) {
-        let path_bytes = exact_path.as_bytes();
-        match redb.exact_path_entries(path_bytes) {
-            Ok(Some(mut hits)) => {
-                hits.retain(|(store_path, _)| {
-                    package_re
-                        .as_ref()
-                        .is_none_or(|re| re.is_match(store_path.name().as_bytes()))
-                        && options
-                            .hash
-                            .as_deref()
-                            .is_none_or(|h| h == store_path.hash())
-                });
-                hits
+    // Try the fast path sidecars in order of specificity:
+    // 1. exact full path, 2. exact basename, 3. literal substring.
+    let mut results = Vec::new();
+    let mut used_fast_path = false;
+
+    // 1. Exact full path: prefer the per-path entry cache, then redb.
+    if let Some(exact_path) = &options.exact_path {
+        let bytes = exact_path.as_bytes();
+        if let Some(path_entry) = &reader.path_entry {
+            let mut hits = Vec::new();
+            for (store_path, entry) in
+                path_entry
+                    .lookup_entries(bytes)
+                    .map_err(|source| crate::Error::ReadDatabase {
+                        path: index_file.to_path_buf(),
+                        source: Box::new(Error::PathEntryIndex(source)),
+                    })?
+            {
+                if package_re
+                    .as_ref()
+                    .is_none_or(|re| re.is_match(store_path.name().as_bytes()))
+                    && options
+                        .hash
+                        .as_deref()
+                        .is_none_or(|h| h == store_path.hash())
+                    && should_include_match(options, &path_pattern, &store_path, &entry)
+                {
+                    hits.push((store_path, entry));
+                }
             }
-            Ok(None) => Vec::new(),
-            Err(err) => {
-                tracing::debug!(%err, "redb exact-path lookup failed; falling back to scan");
-                Vec::new()
+            results = hits;
+            used_fast_path = true;
+        } else if let Some(redb) = &reader.redb {
+            let mut hits = Vec::new();
+            match redb.exact_path_entries(bytes) {
+                Ok(Some(redb_hits)) => {
+                    for (store_path, entry) in redb_hits {
+                        if package_re
+                            .as_ref()
+                            .is_none_or(|re| re.is_match(store_path.name().as_bytes()))
+                            && options
+                                .hash
+                                .as_deref()
+                                .is_none_or(|h| h == store_path.hash())
+                            && should_include_match(options, &path_pattern, &store_path, &entry)
+                        {
+                            hits.push((store_path, entry));
+                        }
+                    }
+                    results = hits;
+                    used_fast_path = true;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::debug!(%err, "redb exact-path lookup failed; falling back to scan");
+                }
             }
         }
-    } else {
-        Vec::new()
-    };
+    }
 
-    // If redb didn't return results (or wasn't used), fall back to full scan
-    if results.is_empty() {
+    // 2. Exact basename (whole_name without --root, or basename portion only).
+    if !used_fast_path
+        && options.exact_basename.is_some()
+        && options.exact_path.is_none()
+        && options.path_prefix.is_none()
+    {
+        let base_bytes = match options.exact_basename.as_deref() {
+            Some(s) => s.as_bytes(),
+            None => b"",
+        };
+        match reader.search_entry_index(
+            base_bytes,
+            &path_pattern,
+            package_re.as_ref(),
+            options.hash.as_deref(),
+            options,
+        ) {
+            Ok(Some(entry_results)) => {
+                results = entry_results;
+                used_fast_path = true;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::debug!(%err, "entry index search failed; falling back");
+            }
+        }
+    }
+
+    // 3. Literal substring: path-level trigram + entry cache.
+    if !used_fast_path
+        && options.literal_pattern.is_some()
+        && options.exact_basename.is_none()
+        && options.exact_path.is_none()
+        && options.path_prefix.is_none()
+    {
+        let pattern_str: &str = match options.literal_pattern.as_deref() {
+            Some(s) => s,
+            None => &options.pattern,
+        };
+        match reader.search_path_trigram(
+            pattern_str,
+            &path_pattern,
+            package_re.as_ref(),
+            options.hash.as_deref(),
+            options,
+        ) {
+            Ok(Some(path_results)) => {
+                results = path_results;
+                used_fast_path = true;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::debug!(%err, "path trigram search failed; falling back");
+            }
+        }
+    }
+
+    // 4. Fall back to frcode scanning when no fast path applied.
+    if !used_fast_path {
         results = reader
             .search_entries(
                 &path_pattern,
@@ -2435,6 +2673,7 @@ pub(crate) fn generate_sidecars_mode(db_path: &Path, include_heavy: bool) -> Res
 }
 
 #[allow(clippy::cognitive_complexity)]
+#[allow(clippy::too_many_lines)]
 fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
     let reader = Reader::open(db_path)?;
     let db_dir = db_path
@@ -2447,6 +2686,11 @@ fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
     let mut path_builder = PathIndexBuilder::new();
     let mut entry_builder = if include_heavy {
         Some(crate::entry_index::EntryIndexBuilder::new())
+    } else {
+        None
+    };
+    let mut path_entry_builder = if include_heavy {
+        Some(crate::path_entry_index::PathEntryIndexBuilder::new())
     } else {
         None
     };
@@ -2474,6 +2718,7 @@ fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
                 &mut builder,
                 &mut path_builder,
                 entry_builder.as_mut(),
+                path_entry_builder.as_mut(),
                 ngram_builder.as_mut(),
                 &mut all_package_labels,
                 &mut all_package_meta,
@@ -2500,6 +2745,7 @@ fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
                 &mut builder,
                 &mut path_builder,
                 entry_builder.as_mut(),
+                path_entry_builder.as_mut(),
                 ngram_builder.as_mut(),
                 &mut all_package_labels,
                 &mut all_package_meta,
@@ -2516,12 +2762,35 @@ fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
         .write_sidecars(db_dir)
         .map_err(Error::PathIndex)?;
 
-    // Write the heavy entry/ngram secondary indexes when requested.
-    if let (Some(entry_builder), Some(ngram_builder)) = (entry_builder, ngram_builder) {
+    // Build and write the heavy secondary indexes when requested.
+    if let (Some(entry_builder), Some(path_entry_builder), Some(ngram_builder)) =
+        (entry_builder, path_entry_builder, ngram_builder)
+    {
         // Write entry-level basename sidecar (fast command-not-found lookups).
         entry_builder
             .write_sidecars(db_dir)
             .map_err(Error::EntryIndex)?;
+
+        // Build path-level trigram index from the sorted path entry map.
+        let mut path_trigram_builder = crate::path_trigram_index::PathTrigramIndexBuilder::new();
+        let mut path_id = 0u32;
+        for (path, _records) in path_entry_builder.iter() {
+            path_trigram_builder
+                .record_path(path_id, path)
+                .map_err(Error::PathTrigramIndex)?;
+            path_id = path_id
+                .checked_add(1)
+                .ok_or(Error::Corrupt("path-id overflow in path trigram index"))?;
+        }
+        path_trigram_builder
+            .write_sidecars(db_dir)
+            .map_err(Error::PathTrigramIndex)?;
+
+        // Write per-path entry cache last, after the trigram builder has consumed
+        // the sorted iterator.
+        path_entry_builder
+            .write_sidecars(db_dir)
+            .map_err(Error::PathEntryIndex)?;
 
         // Write trigram (n-gram) inverted path index for fast literal queries.
         ngram_builder
@@ -2566,11 +2835,13 @@ fn write_packages_json(db_dir: &Path, packages: &[PackageMeta]) -> Result<()> {
 }
 
 /// Scan a decoded frcode stream to extract package paths.
+#[allow(clippy::too_many_arguments)]
 fn scan_decoder_for_packages<R: std::io::BufRead>(
     decoder: &mut frcode::Decoder<R>,
     builder: &mut BasenameIndexBuilder,
     path_builder: &mut PathIndexBuilder,
     mut entry_builder: Option<&mut crate::entry_index::EntryIndexBuilder>,
+    mut path_entry_builder: Option<&mut crate::path_entry_index::PathEntryIndexBuilder>,
     mut ngram_builder: Option<&mut crate::ngram_index::NgramIndexBuilder>,
     all_package_labels: &mut Vec<String>,
     all_package_meta: &mut Vec<PackageMeta>,
@@ -2625,6 +2896,11 @@ fn scan_decoder_for_packages<R: std::io::BufRead>(
                             .record_package(&pkg, &entries)
                             .map_err(Error::EntryIndex)?;
                     }
+                    if let Some(path_entry_builder) = path_entry_builder.as_mut() {
+                        path_entry_builder
+                            .record_package(&pkg, &entries)
+                            .map_err(Error::PathEntryIndex)?;
+                    }
                     if let Some(ngram_builder) = ngram_builder.as_mut() {
                         ngram_builder
                             .record_package(ordinal, paths)
@@ -2641,7 +2917,7 @@ fn scan_decoder_for_packages<R: std::io::BufRead>(
                     entry: line.to_vec(),
                 })?;
                 current_paths.push(path.to_vec());
-                if entry_builder.is_some() {
+                if entry_builder.is_some() || path_entry_builder.is_some() {
                     let node =
                         FileNode::<()>::decode_meta(meta).ok_or_else(|| Error::EntryParse {
                             entry: line.to_vec(),
@@ -2659,11 +2935,13 @@ fn scan_decoder_for_packages<R: std::io::BufRead>(
 }
 
 /// Scan a single in-memory frcode frame to extract package paths.
+#[allow(clippy::too_many_arguments)]
 fn scan_frame_for_packages(
     raw: &[u8],
     builder: &mut BasenameIndexBuilder,
     path_builder: &mut PathIndexBuilder,
     entry_builder: Option<&mut crate::entry_index::EntryIndexBuilder>,
+    path_entry_builder: Option<&mut crate::path_entry_index::PathEntryIndexBuilder>,
     ngram_builder: Option<&mut crate::ngram_index::NgramIndexBuilder>,
     all_package_labels: &mut Vec<String>,
     all_package_meta: &mut Vec<PackageMeta>,
@@ -2675,6 +2953,7 @@ fn scan_frame_for_packages(
         builder,
         path_builder,
         entry_builder,
+        path_entry_builder,
         ngram_builder,
         all_package_labels,
         all_package_meta,
@@ -2686,11 +2965,13 @@ fn scan_frame_for_packages(
 ///
 /// This is used for NIXI v1 databases whose single frame is far larger than the
 /// bounded in-memory decode limit.
+#[allow(clippy::too_many_arguments)]
 fn scan_frame_stream_for_packages(
     compressed: &[u8],
     builder: &mut BasenameIndexBuilder,
     path_builder: &mut PathIndexBuilder,
     entry_builder: Option<&mut crate::entry_index::EntryIndexBuilder>,
+    path_entry_builder: Option<&mut crate::path_entry_index::PathEntryIndexBuilder>,
     ngram_builder: Option<&mut crate::ngram_index::NgramIndexBuilder>,
     all_package_labels: &mut Vec<String>,
     all_package_meta: &mut Vec<PackageMeta>,
@@ -2706,6 +2987,7 @@ fn scan_frame_stream_for_packages(
         builder,
         path_builder,
         entry_builder,
+        path_entry_builder,
         ngram_builder,
         all_package_labels,
         all_package_meta,
@@ -3058,6 +3340,235 @@ mod tests {
                 "sidecar pruning diverged from full scan for literal {pat:?}"
             );
         }
+    }
+
+    #[test]
+    fn entry_index_exact_basename_matches_full_scan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+
+        let hello = sample_store_path();
+        let hello2 = StorePath::new(
+            "/nix/store".into(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            "hello-2.13".into(),
+            Origin {
+                attr: "hello".into(),
+                output: "out".into(),
+                toplevel: true,
+                system: Some("x86_64-linux".into()),
+            },
+        );
+        let tree = sample_tree();
+
+        {
+            let mut writer = Writer::create(&db_path, 3).expect("create");
+            writer.add(&hello, &tree, b"").expect("add");
+            writer.add(&hello2, &tree, b"").expect("add");
+            writer.finish().expect("finish");
+        }
+
+        generate_sidecars(&db_path).expect("sidecars");
+
+        let reader = Reader::open(&db_path).expect("reader");
+        let re = Regex::new(&(regex::escape("hello") + "$")).expect("regex");
+        let baseline = reader
+            .search_entries(&re, None, None, None, None)
+            .expect("baseline");
+
+        let options = SearchOptions {
+            database: dir.path().to_path_buf(),
+            pattern: "hello$".into(),
+            hash: None,
+            package_pattern: None,
+            exact_basename: Some("hello".into()),
+            exact_path: None,
+            path_prefix: None,
+            literal_pattern: None,
+            file_type: &[],
+            mode: SearchMode::Minimal,
+            json: false,
+            limit: None,
+            count: false,
+            sort: SearchSort::None,
+            min_size: None,
+            max_size: None,
+            exclude_fhs: false,
+        };
+        let pruned = search_results(&options).expect("entry-index search");
+
+        let normalize = |results: Vec<(StorePath, FileTreeEntry)>| -> Vec<(String, Vec<u8>)> {
+            let mut v: Vec<(String, Vec<u8>)> = results
+                .into_iter()
+                .map(|(sp, e)| (sp.name().to_string(), e.path.to_vec()))
+                .collect();
+            v.sort();
+            v
+        };
+
+        assert_eq!(
+            normalize(pruned),
+            normalize(baseline),
+            "entry-index exact basename diverged from full scan"
+        );
+    }
+
+    #[test]
+    fn fast_path_fallbacks_for_regex_and_short_literals() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+
+        let make_sp = |hash: &str, name: &str, attr: &str| {
+            StorePath::new(
+                "/nix/store".into(),
+                hash.into(),
+                name.into(),
+                Origin {
+                    attr: attr.into(),
+                    output: "out".into(),
+                    toplevel: true,
+                    system: Some("x86_64-linux".into()),
+                },
+            )
+        };
+        let hello = make_sp(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "hello-2.12",
+            "hello",
+        );
+        let hello_tree = FileTree::directory(vec![(
+            Bytes::from_static(b"bin"),
+            FileTree::directory(vec![(
+                Bytes::from_static(b"hello"),
+                FileTree::regular(64472, true),
+            )]),
+        )]);
+
+        {
+            let mut writer = Writer::create(&db_path, 3).expect("create");
+            writer.add(&hello, &hello_tree, b"").expect("add");
+            writer.finish().expect("finish");
+        }
+
+        generate_sidecars(&db_path).expect("sidecars");
+
+        let reader = Reader::open(&db_path).expect("reader");
+
+        let normalize = |results: Vec<(StorePath, FileTreeEntry)>| -> Vec<(String, Vec<u8>)> {
+            let mut v: Vec<(String, Vec<u8>)> = results
+                .into_iter()
+                .map(|(sp, e)| (sp.name().to_string(), e.path.to_vec()))
+                .collect();
+            v.sort();
+            v
+        };
+
+        // Regex: path trigram fast path is skipped, falls back to frcode.
+        let regex_options = SearchOptions {
+            database: dir.path().to_path_buf(),
+            pattern: "b.n".into(),
+            hash: None,
+            package_pattern: None,
+            exact_basename: None,
+            exact_path: None,
+            path_prefix: None,
+            literal_pattern: None,
+            file_type: &[],
+            mode: SearchMode::Minimal,
+            json: false,
+            limit: None,
+            count: false,
+            sort: SearchSort::None,
+            min_size: None,
+            max_size: None,
+            exclude_fhs: false,
+        };
+        let regex_baseline = reader
+            .search_entries(&Regex::new("b.n").expect("regex"), None, None, None, None)
+            .expect("baseline");
+        let regex_pruned = search_results(&regex_options).expect("regex search");
+        assert_eq!(
+            normalize(regex_pruned),
+            normalize(regex_baseline),
+            "regex query diverged from full scan"
+        );
+
+        // Short literal (<3 bytes): path trigram returns None, falls back.
+        let short_options = SearchOptions {
+            database: dir.path().to_path_buf(),
+            pattern: "he".into(),
+            literal_pattern: Some("he".into()),
+            ..regex_options.clone()
+        };
+        let short_baseline = reader
+            .search_entries(&Regex::new("he").expect("regex"), None, None, None, None)
+            .expect("baseline");
+        let short_pruned = search_results(&short_options).expect("short literal search");
+        assert_eq!(
+            normalize(short_pruned),
+            normalize(short_baseline),
+            "short literal query diverged from full scan"
+        );
+    }
+
+    #[test]
+    fn missing_path_trigram_sidecars_fall_back_to_frcode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+        let path = sample_store_path();
+        let tree = sample_tree();
+
+        {
+            let mut writer = Writer::create(&db_path, 3).expect("create");
+            writer.add(&path, &tree, b"").expect("add");
+            writer.finish().expect("finish");
+        }
+
+        generate_sidecars(&db_path).expect("sidecars");
+
+        // Remove the new path-level sidecars so the fast paths cannot run.
+        let dir = db_path.parent().expect("parent");
+        let _ = std::fs::remove_file(dir.join(crate::path_trigram_index::FST_FILE));
+        let _ = std::fs::remove_file(dir.join(crate::path_trigram_index::POSTINGS_FILE));
+        let _ = std::fs::remove_file(dir.join(crate::path_entry_index::ENTRIES_FILE));
+        let _ = std::fs::remove_file(dir.join(crate::path_entry_index::FST_FILE));
+
+        let reader = Reader::open(&db_path).expect("reader");
+        let re = Regex::new(&regex::escape("bin/hello")).expect("regex");
+        let baseline = reader
+            .search_entries(&re, None, None, None, None)
+            .expect("baseline");
+
+        let options = SearchOptions {
+            database: dir.to_path_buf(),
+            pattern: "bin/hello".into(),
+            hash: None,
+            package_pattern: None,
+            exact_basename: None,
+            exact_path: None,
+            path_prefix: None,
+            literal_pattern: Some("bin/hello".into()),
+            file_type: &[],
+            mode: SearchMode::Minimal,
+            json: false,
+            limit: None,
+            count: false,
+            sort: SearchSort::None,
+            min_size: None,
+            max_size: None,
+            exclude_fhs: false,
+        };
+        let pruned = search_results(&options).expect("fallback search");
+
+        let mut baseline: Vec<_> = baseline.into_iter().map(|(_, e)| e.path).collect();
+        baseline.sort();
+        let mut pruned: Vec<_> = pruned.into_iter().map(|(_, e)| e.path).collect();
+        pruned.sort();
+
+        assert_eq!(
+            pruned, baseline,
+            "missing sidecars should fall back to frcode"
+        );
     }
 
     #[test]
