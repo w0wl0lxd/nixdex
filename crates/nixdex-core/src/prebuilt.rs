@@ -513,7 +513,6 @@ async fn try_segmented_download(
         for handle in handles {
             if matches!(handle.await, Ok(Err(SegmentError::Changed))) {
                 changed = true;
-                break;
             }
         }
 
@@ -525,7 +524,11 @@ async fn try_segmented_download(
         }
     }
 
-    concat_parts(tmp, n).await
+    if let Err(err) = concat_parts(tmp, n).await {
+        remove_parts(tmp, n).await;
+        return Err(err);
+    }
+    Ok(())
 }
 
 /// Download the full file as a single serial stream into `tmp`.
