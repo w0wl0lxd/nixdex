@@ -392,6 +392,7 @@ pub fn parse_narinfo_references(narinfo: &str, store_dir: &str) -> Result<Vec<St
 mod tests {
     use super::*;
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn decompress_plain_json() {
         let data = br#"{"root":{"type":"directory","entries":{}}}"#;
@@ -399,6 +400,7 @@ mod tests {
         assert_eq!(out, data);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn decompress_zstd_payload() {
         let data = br#"{"root":{"type":"directory","entries":{}}}"#;
@@ -407,6 +409,7 @@ mod tests {
         assert_eq!(out, data);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn decompress_xz_payload() {
         let data = br#"{"root":{"type":"directory","entries":{}}}"#;
@@ -420,6 +423,7 @@ mod tests {
         assert_eq!(out, data);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn parse_narinfo_url_line() {
         let text = "StorePath: /nix/store/abc-foo\nURL: nar/abc-foo.nar.xz\n";
@@ -429,6 +433,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn parse_references_line() {
         let text = "\
@@ -444,12 +449,14 @@ References: ias8xacs1h3jy7xgwi2awvim61k2ji6c-glibc-2.42-67 pg2zfrrbm58ynbjshhzkg
         assert_eq!(refs.first().map(StorePath::name), Some("glibc-2.42-67"));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn parse_narinfo_url_missing_field() {
         let text = "StorePath: /nix/store/abc-foo\n";
         assert!(parse_narinfo_url(text).is_none());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn parse_narinfo_references_missing_field() {
         let text = "StorePath: /nix/store/abc-foo\nURL: nar/abc-foo.nar.xz\n";
@@ -457,6 +464,7 @@ References: ias8xacs1h3jy7xgwi2awvim61k2ji6c-glibc-2.42-67 pg2zfrrbm58ynbjshhzkg
         assert!(refs.is_empty());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn parse_narinfo_references_empty() {
         let text = "StorePath: /nix/store/abc-foo\nReferences: \n";
@@ -464,6 +472,7 @@ References: ias8xacs1h3jy7xgwi2awvim61k2ji6c-glibc-2.42-67 pg2zfrrbm58ynbjshhzkg
         assert!(refs.is_empty());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn parse_narinfo_references_invalid_store_path() {
         let text = "StorePath: /nix/store/abc-foo\nReferences: invalid-hash-name\n";
@@ -477,6 +486,7 @@ References: ias8xacs1h3jy7xgwi2awvim61k2ji6c-glibc-2.42-67 pg2zfrrbm58ynbjshhzkg
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn fetcher_rejects_empty_base_url() {
         let result = Fetcher::new("");
@@ -489,12 +499,14 @@ References: ias8xacs1h3jy7xgwi2awvim61k2ji6c-glibc-2.42-67 pg2zfrrbm58ynbjshhzkg
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn fetcher_trims_trailing_slash() {
         let fetcher = Fetcher::new("https://cache.nixos.org/").expect("fetcher");
         assert_eq!(fetcher.base_url(), "https://cache.nixos.org");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn listing_url_construction() {
         let fetcher = Fetcher::new("https://cache.nixos.org").expect("fetcher");
@@ -514,6 +526,7 @@ References: ias8xacs1h3jy7xgwi2awvim61k2ji6c-glibc-2.42-67 pg2zfrrbm58ynbjshhzkg
         assert_eq!(url, "https://cache.nixos.org/abc123hello.ls");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn narinfo_url_construction() {
         let fetcher = Fetcher::new("https://cache.nixos.org").expect("fetcher");
@@ -533,6 +546,7 @@ References: ias8xacs1h3jy7xgwi2awvim61k2ji6c-glibc-2.42-67 pg2zfrrbm58ynbjshhzkg
         assert_eq!(url, "https://cache.nixos.org/abc123hello.narinfo");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn error_is_not_found_detection() {
         let err = Error::Request("https://cache.nixos.org/abc.narinfo: HTTP 404".to_string());
@@ -545,6 +559,7 @@ References: ias8xacs1h3jy7xgwi2awvim61k2ji6c-glibc-2.42-67 pg2zfrrbm58ynbjshhzkg
         assert!(!parse_err.is_not_found());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn decompress_unknown_magic_returns_as_is() {
         // Data that doesn't match any known magic should be returned as-is
@@ -553,6 +568,7 @@ References: ias8xacs1h3jy7xgwi2awvim61k2ji6c-glibc-2.42-67 pg2zfrrbm58ynbjshhzkg
         assert_eq!(out, data);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn bounded_xz_decode_respects_limit() {
         // Compress a single byte and ensure the zero-byte limit rejects it.

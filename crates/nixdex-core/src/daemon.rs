@@ -690,6 +690,14 @@ async fn nix_locate_handler(
     };
     let pattern = format!("{start_anchor}{pattern_body}{end_anchor}");
 
+    // Plain (non-anchored, non-regex) daemon patterns can use a fast substring search.
+    let literal_pattern =
+        if params.regex || params.at_root || params.whole_name || params.pattern.is_empty() {
+            None
+        } else {
+            Some(params.pattern.clone())
+        };
+
     // Determine whether the secondary indexes can answer this query exactly.
     let exact_basename = if !params.regex && params.whole_name && !params.pattern.is_empty() {
         let base = crate::basename_index::basename_of(params.pattern.as_bytes());
@@ -741,12 +749,6 @@ async fn nix_locate_handler(
             Some(s) => crate::database::SearchSort::from_str(s)
                 .map_err(|_| "bad_request: invalid sort order".to_string())?,
             None => crate::database::SearchSort::None,
-        };
-
-        let literal_pattern = if params.regex {
-            None
-        } else {
-            Some(params.pattern.clone())
         };
 
         let options = crate::database::SearchOptions {

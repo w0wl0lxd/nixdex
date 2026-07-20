@@ -1,0 +1,2 @@
+- Use `memchr::memmem` directly for literal `PathMatcher` block candidate search instead of a `grep` line matcher, and use `copy_within` for `frcode` shared-prefix copies and residual shifts.
+- Switch the `nixdex` CLI to a synchronous `main` with a manually-built Tokio runtime only for async subcommands, eliminating runtime startup overhead for `locate`, `which`, and `command-not-found`.
