@@ -181,38 +181,44 @@ impl<R: BufRead> Decoder<R> {
     /// with no further input.
     #[allow(clippy::indexing_slicing)]
     fn read_to_nul(&mut self) -> Result<Option<bool>> {
-        loop {
+        let mut done = false;
+        let mut result: Result<Option<bool>> = Ok(None);
+        while !done {
             match self.reader.fill_buf() {
                 Ok(input) => {
                     if input.is_empty() {
-                        return Ok(None);
-                    }
+                        done = true;
+                    } else {
+                        let (nul, len) = match memchr::memchr(b'\x00', input) {
+                            Some(i) => (true, i + 1),
+                            None => (false, input.len()),
+                        };
 
-                    let (done, len) = match memchr::memchr(b'\x00', input) {
-                        Some(i) => (true, i + 1),
-                        None => (false, input.len()),
-                    };
-
-                    let new_pos = self.pos + len;
-                    if !self.buf.ensure_len(new_pos) {
-                        return Ok(Some(false));
+                        let new_pos = self.pos + len;
+                        if self.buf.ensure_len(new_pos) {
+                            self.buf.data[self.pos..new_pos].copy_from_slice(&input[..len]);
+                            self.pos = new_pos;
+                            self.reader.consume(len);
+                            if nul {
+                                result = Ok(Some(true));
+                                done = true;
+                            }
+                        } else {
+                            result = Ok(Some(false));
+                            done = true;
+                        }
                     }
-                    self.buf.data[self.pos..new_pos].copy_from_slice(&input[..len]);
-                    self.pos = new_pos;
-                    self.reader.consume(len);
-                    if done {
-                        return Ok(Some(true));
-                    }
-                    // Otherwise the `loop` repeats and reads the next chunk.
                 }
                 Err(e) => {
                     if e.kind() != io::ErrorKind::Interrupted {
-                        return Err(Error::from(e));
+                        result = Err(Error::from(e));
+                        done = true;
                     }
-                    // Retry on `Interrupted`; the `loop` repeats.
+                    // On `Interrupted` leave `done` false so the `while` retries.
                 }
             }
         }
+        result
     }
 
     fn decode_prefix_diff(&mut self) -> Result<i16> {
@@ -261,45 +267,72 @@ impl<R: BufRead> Decoder<R> {
         let mut found_nul =
             self.pos > 0 && self.buf.get(self.pos - 1).is_some_and(|b| *b == b'\x00');
         if found_nul {
-            self.copy_shared()?;
+            match self.copy_shared() {
+                Ok(_) => {}
+                Err(e) => return Err(e),
+            }
         }
 
         let mut got_input = false;
-        loop {
-            match self.read_to_nul()? {
-                None | Some(false) => break,
-                Some(true) => {
-                    got_input = true;
+        let mut eof = false;
+        let mut decode_result: Result<()> = Ok(());
+        while !eof && decode_result.is_ok() {
+            match self.read_to_nul() {
+                Ok(opt) => {
+                    if opt == Some(true) {
+                        got_input = true;
+                    } else {
+                        eof = true;
+                    }
+                }
+                Err(e) => {
+                    decode_result = Err(e);
                 }
             }
 
-            self.buf.allow_resize = !found_nul;
-            found_nul = true;
+            if !eof && decode_result.is_ok() {
+                self.buf.allow_resize = !found_nul;
+                found_nul = true;
 
-            let diff = isize::from(self.decode_prefix_diff()?);
-            self.shared_len = self
-                .shared_len
-                .checked_add(diff)
-                .ok_or(Error::SharedOverflow {
-                    shared_len: self.shared_len,
-                    diff,
-                })?;
+                match self.decode_prefix_diff() {
+                    Ok(diff) => {
+                        let diff = isize::from(diff);
+                        match self
+                            .shared_len
+                            .checked_add(diff)
+                            .ok_or(Error::SharedOverflow {
+                                shared_len: self.shared_len,
+                                diff,
+                            }) {
+                            Ok(new_shared_len) => self.shared_len = new_shared_len,
+                            Err(e) => decode_result = Err(e),
+                        }
+                    }
+                    Err(e) => decode_result = Err(e),
+                }
 
-            if !self.copy_shared()? {
-                break;
+                if !eof && decode_result.is_ok() {
+                    match self.copy_shared() {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            eof = true;
+                        }
+                        Err(e) => decode_result = Err(e),
+                    }
+                }
             }
         }
 
-        let newline = {
-            let Some(view) = self.buf.get(..self.pos) else {
-                return if got_input {
-                    Err(Error::MissingNewline)
-                } else {
-                    Ok(&[])
-                };
+        decode_result?;
+
+        let Some(view) = self.buf.get(..self.pos) else {
+            return if got_input {
+                Err(Error::MissingNewline)
+            } else {
+                Ok(&[])
             };
-            memchr::memrchr(b'\n', view)
         };
+        let newline = memchr::memrchr(b'\n', view);
 
         match newline {
             Some(newline) => {
@@ -314,10 +347,10 @@ impl<R: BufRead> Decoder<R> {
                 if !got_input && !found_nul && self.pos > item_start {
                     return Err(Error::MissingNul);
                 }
-                Ok(self
-                    .buf
-                    .get(item_start..self.partial_entry_start)
-                    .ok_or(Error::MissingNewline)?)
+                match self.buf.get(item_start..self.partial_entry_start) {
+                    Some(slice) => Ok(slice),
+                    None => Err(Error::MissingNewline),
+                }
             }
             None if !got_input => {
                 // EOF after a clean entry boundary: residual last-path bytes
