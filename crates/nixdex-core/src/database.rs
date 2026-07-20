@@ -2754,6 +2754,204 @@ mod tests {
         assert_eq!(hits[0].0.name(), "hello-2.12");
     }
 
+    // Differential test: sidecar-pruned `search_results` must return exactly the
+    // same (store_path, path) set as a full-scan regex over the same literal
+    // substring. The ngram sidecar narrows by *package* ordinal, so this exercises
+    // that package ordinals in the sidecar indexes align with the decoder's
+    // per-frame `current_ordinal` (incl. multi-frame `frame_starts` threading).
+    #[test]
+    fn sidecar_search_matches_full_scan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+
+        let make_sp = |hash: &str, name: &str, attr: &str| {
+            StorePath::new(
+                "/nix/store".into(),
+                hash.into(),
+                name.into(),
+                Origin {
+                    attr: attr.into(),
+                    output: "out".into(),
+                    toplevel: true,
+                    system: Some("x86_64-linux".into()),
+                },
+            )
+        };
+        let hello = make_sp("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "hello-2.12", "hello");
+        let coreutils = make_sp("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "coreutils-9.5", "coreutils");
+        let grep = make_sp("cccccccccccccccccccccccccccccccc", "grep-3.11", "grep");
+
+        // Filler so the raw database is large enough to span multiple zstd frames,
+        // which is the path that exercises `frame_map`/`frame_starts` alignment.
+        let filler: Vec<(Bytes, FileTree)> = (0..60)
+            .map(|i| {
+                (
+                    Bytes::from(format!("tool{i}").into_bytes()),
+                    FileTree::regular(64472, true),
+                )
+            })
+            .collect();
+
+        let hello_tree = FileTree::directory(vec![
+            (
+                Bytes::from_static(b"bin"),
+                FileTree::directory(
+                    std::iter::once((
+                        Bytes::from_static(b"hello"),
+                        FileTree::regular(64472, true),
+                    ))
+                    .chain(filler.iter().cloned())
+                    .collect(),
+                ),
+            ),
+            (
+                Bytes::from_static(b"lib"),
+                FileTree::directory(vec![(
+                    Bytes::from_static(b"hello.a"),
+                    FileTree::regular(64472, false),
+                )]),
+            ),
+            (
+                Bytes::from_static(b"share"),
+                FileTree::directory(vec![(
+                    Bytes::from_static(b"doc"),
+                    FileTree::directory(vec![(
+                        Bytes::from_static(b"hello"),
+                        FileTree::directory(vec![(
+                            Bytes::from_static(b"README"),
+                            FileTree::regular(64472, false),
+                        )]),
+                    )]),
+                )]),
+            ),
+        ]);
+        let coreutils_tree = FileTree::directory(vec![
+            (
+                Bytes::from_static(b"bin"),
+                FileTree::directory(
+                    std::iter::once((Bytes::from_static(b"ls"), FileTree::regular(64472, true)))
+                        .chain(std::iter::once((
+                            Bytes::from_static(b"cat"),
+                            FileTree::regular(64472, true),
+                        )))
+                        .chain(filler.iter().cloned())
+                        .collect(),
+                ),
+            ),
+            (
+                Bytes::from_static(b"lib"),
+                FileTree::directory(vec![(
+                    Bytes::from_static(b"libc.so"),
+                    FileTree::regular(64472, false),
+                )]),
+            ),
+            (
+                Bytes::from_static(b"share"),
+                FileTree::directory(vec![(
+                    Bytes::from_static(b"man"),
+                    FileTree::directory(vec![(
+                        Bytes::from_static(b"man1"),
+                        FileTree::directory(vec![(
+                            Bytes::from_static(b"ls.1"),
+                            FileTree::regular(64472, false),
+                        )]),
+                    )]),
+                )]),
+            ),
+        ]);
+        let grep_tree = FileTree::directory(vec![
+            (
+                Bytes::from_static(b"bin"),
+                FileTree::directory(
+                    std::iter::once((Bytes::from_static(b"grep"), FileTree::regular(64472, true)))
+                        .chain(filler.iter().cloned())
+                        .collect(),
+                ),
+            ),
+            (
+                Bytes::from_static(b"lib"),
+                FileTree::directory(vec![(
+                    Bytes::from_static(b"libgrep.a"),
+                    FileTree::regular(64472, false),
+                )]),
+            ),
+            (
+                Bytes::from_static(b"share"),
+                FileTree::directory(vec![(
+                    Bytes::from_static(b"man"),
+                    FileTree::directory(vec![(
+                        Bytes::from_static(b"man1"),
+                        FileTree::directory(vec![(
+                            Bytes::from_static(b"grep.1"),
+                            FileTree::regular(64472, false),
+                        )]),
+                    )]),
+                )]),
+            ),
+        ]);
+
+        {
+            let mut writer = Writer::create(&db_path, 3).expect("create");
+            writer.add(&hello, &hello_tree, b"").expect("add");
+            writer.add(&coreutils, &coreutils_tree, b"").expect("add");
+            writer.add(&grep, &grep_tree, b"").expect("add");
+            writer.finish().expect("finish");
+        }
+
+        generate_sidecars(&db_path).expect("sidecars");
+
+        let reader = Reader::open(&db_path).expect("reader");
+        assert!(reader.frame_starts.is_some(), "expected frame_starts sidecar");
+
+        let normalize =
+            |results: Vec<(StorePath, FileTreeEntry)>| -> Vec<(String, Vec<u8>)> {
+                let mut v: Vec<(String, Vec<u8>)> = results
+                    .into_iter()
+                    .map(|(sp, e)| (sp.name().to_string(), e.path.to_vec()))
+                    .collect();
+                v.sort();
+                v
+            };
+
+        for pat in [
+            "bin", "lib", "share", "hello", "grep", "man1", "README", "/bin", "libc", "hello.a",
+        ] {
+            // Full-scan baseline: every entry whose path contains the literal substring.
+            let re = Regex::new(&regex::escape(pat)).expect("regex");
+            let baseline = reader
+                .search_entries(&re, None, None, None, None)
+                .expect("baseline search");
+
+            // Sidecar-pruned equivalent via `search_results`.
+            let options = SearchOptions {
+                database: dir.path().to_path_buf(),
+                pattern: regex::escape(pat),
+                hash: None,
+                package_pattern: None,
+                exact_basename: None,
+                exact_path: None,
+                path_prefix: None,
+                literal_pattern: Some(pat.into()),
+                file_type: &[],
+                mode: SearchMode::Minimal,
+                json: false,
+                limit: None,
+                count: false,
+                sort: SearchSort::None,
+                min_size: None,
+                max_size: None,
+                exclude_fhs: false,
+            };
+            let pruned = search_results(&options).expect("sidecar search");
+
+            assert_eq!(
+                normalize(pruned),
+                normalize(baseline),
+                "sidecar pruning diverged from full scan for literal {pat:?}"
+            );
+        }
+    }
+
     #[test]
     fn filter_prefix_skips_non_matching() {
         let dir = tempfile::tempdir().expect("tempdir");
