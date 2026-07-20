@@ -100,6 +100,7 @@ pub fn search_database_results(
 mod tests {
     use super::bounded_zstd_decode;
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn bounded_zstd_decode_honors_limit() {
         let original = vec![b'a'; 1024 * 1024];

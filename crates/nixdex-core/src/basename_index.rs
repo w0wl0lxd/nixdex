@@ -496,6 +496,7 @@ fn parse_name_ranges(bytes: &[u8]) -> Result<Vec<(usize, usize)>> {
 mod tests {
     use super::*;
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn basename_of_paths() {
         assert_eq!(basename_of(b"/bin/ls"), b"ls");
@@ -504,6 +505,7 @@ mod tests {
         assert_eq!(basename_of(b"/bin/"), b"");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn build_and_query_exact_basename() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -545,6 +547,7 @@ mod tests {
         assert_eq!(ls_ordinals, vec![0, 2]); // coreutils (0), busybox (2)
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn open_missing_sidecar_is_missing_error() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -552,6 +555,7 @@ mod tests {
         assert!(matches!(err, Error::Missing { .. }));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn parse_name_ranges_rejects_empty_name() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -571,6 +575,7 @@ mod tests {
         assert!(err.to_string().contains("empty package name"));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn parse_name_ranges_rejects_excessive_count() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -590,6 +595,7 @@ mod tests {
         assert!(err.to_string().contains("package name count too large"));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn read_ordinals_at_rejects_excessive_count() {
         let mut postings = Vec::new();
@@ -604,6 +610,7 @@ mod tests {
         assert!(err.to_string().contains("too many ordinals"));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn lookup_basename_empty_index() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -617,6 +624,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn lookup_basename_multiple_matches() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -637,6 +645,7 @@ mod tests {
         assert_eq!(results.len(), 5);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn open_missing_fst_sidecar() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -649,6 +658,7 @@ mod tests {
         assert!(err.to_string().contains(FST_FILE));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn open_missing_postings_sidecar() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -661,6 +671,7 @@ mod tests {
         assert!(err.to_string().contains(POSTINGS_FILE));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn open_missing_names_sidecar() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -673,6 +684,7 @@ mod tests {
         assert!(err.to_string().contains(NAMES_FILE));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn oversized_fst_sidecar_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -690,6 +702,7 @@ mod tests {
         assert!(err.to_string().contains("too large"));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn oversized_postings_sidecar_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -708,6 +721,7 @@ mod tests {
         assert!(err.to_string().contains("too large"));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn build_and_query_basename_prefix() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -742,6 +756,7 @@ mod tests {
         assert!(ls.contains(&0));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn basename_of_edge_cases() {
         assert_eq!(basename_of(b""), b"");
@@ -753,6 +768,7 @@ mod tests {
         assert_eq!(basename_of(b"//double"), b"double");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn record_package_ordinal_overflow() {
         let mut builder = BasenameIndexBuilder::new();
