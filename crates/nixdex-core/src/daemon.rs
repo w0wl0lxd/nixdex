@@ -72,6 +72,30 @@ fn read_snapshot(index_state: &IndexState) -> Option<IndexSnapshot> {
     }
 }
 
+/// How aggressively the daemon loads secondary indexes into memory.
+///
+/// Both modes keep the (mmap-backed) database reader resident for the lifetime
+/// of the process. The difference is whether the heavy `entry`/`ngram` secondary
+/// indexes are built eagerly at load (`Resident`, the default) or deferred until
+/// they are first needed (`Lru`). `Lru` lowers startup cost and resident memory
+/// at the price of slower first queries that fall back to full scans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IndexCacheMode {
+    /// Build all secondary indexes eagerly at load.
+    #[default]
+    Resident,
+    /// Defer the heavy entry/ngram indexes; build them lazily on first use.
+    Lru,
+}
+
+impl IndexCacheMode {
+    /// Whether the heavy `entry`/`ngram` secondary indexes should be generated.
+    #[must_use]
+    pub fn include_heavy(self) -> bool {
+        matches!(self, Self::Resident)
+    }
+}
+
 /// Configuration for a prebuilt-index daemon.
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
@@ -86,6 +110,8 @@ pub struct DaemonConfig {
     /// Bearer token required for the `POST /reload` admin endpoint.
     /// If unset, `/reload` is only accepted from loopback addresses.
     pub admin_token: Option<String>,
+    /// How aggressively secondary indexes are loaded into memory.
+    pub index_cache_mode: IndexCacheMode,
 }
 
 impl Default for DaemonConfig {
@@ -96,6 +122,7 @@ impl Default for DaemonConfig {
             local_database: None,
             local_refresh_interval: std::time::Duration::from_secs(3600),
             admin_token: None,
+            index_cache_mode: IndexCacheMode::Resident,
         }
     }
 }
@@ -144,7 +171,7 @@ pub async fn run(config: &DaemonConfig) -> Result<()> {
         local_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            load_and_store_index(local, &index_state);
+            load_and_store_index(local, &index_state, config.index_cache_mode.include_heavy());
             log_daemon_start_local(config, local);
             tokio::select! {
                 _ = local_interval.tick() => {
@@ -191,6 +218,7 @@ pub async fn run(config: &DaemonConfig) -> Result<()> {
         &mut interval,
         &mut reload_rx,
         http_handle,
+        config.index_cache_mode.include_heavy(),
     )
     .await
 }
@@ -232,17 +260,30 @@ async fn run_daemon_loop(
     interval: &mut tokio::time::Interval,
     reload_rx: &mut tokio::sync::mpsc::Receiver<()>,
     http_handle: tokio::task::JoinHandle<Result<()>>,
+    include_heavy: bool,
 ) -> Result<()> {
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                handle_refresh_tick(prebuilt_config, cache_dir, index_state).await;
+                handle_refresh_tick(
+                    prebuilt_config,
+                    cache_dir,
+                    index_state,
+                    include_heavy,
+                )
+                .await;
             }
             result = wait_signal() => {
                 match result {
                     Ok(SignalAction::Reload) => {
                         tracing::info!("received reload signal; refreshing prebuilt index");
-                        handle_refresh_tick(prebuilt_config, cache_dir, index_state).await;
+                        handle_refresh_tick(
+                    prebuilt_config,
+                    cache_dir,
+                    index_state,
+                    include_heavy,
+                )
+                .await;
                     }
                     Ok(SignalAction::Shutdown) => {
                         http_handle.abort();
@@ -257,7 +298,13 @@ async fn run_daemon_loop(
             }
             Some(()) = reload_rx.recv() => {
                 tracing::info!("received /reload request; refreshing prebuilt index");
-                handle_refresh_tick(prebuilt_config, cache_dir, index_state).await;
+                handle_refresh_tick(
+                    prebuilt_config,
+                    cache_dir,
+                    index_state,
+                    include_heavy,
+                )
+                .await;
             }
         }
     }
@@ -316,24 +363,29 @@ async fn handle_refresh_tick(
     prebuilt_config: &PrebuiltConfig,
     cache_dir: &std::path::Path,
     index_state: &IndexState,
+    include_heavy: bool,
 ) {
     tracing::info!("checking for prebuilt index update");
     match refresh_prebuilt(prebuilt_config, cache_dir).await {
-        Ok(()) => load_and_store_index(cache_dir, index_state),
+        Ok(()) => load_and_store_index(cache_dir, index_state, include_heavy),
         Err(err) => tracing::error!(error = %err, "prebuilt refresh failed"),
     }
 }
 
 #[cfg(feature = "daemon")]
 #[allow(clippy::cognitive_complexity)]
-fn load_and_store_index(cache_dir: &std::path::Path, index_state: &IndexState) {
+fn load_and_store_index(
+    cache_dir: &std::path::Path,
+    index_state: &IndexState,
+    include_heavy: bool,
+) {
     let index_dir = if cache_dir.join("files").exists() {
         cache_dir.to_path_buf()
     } else {
         cache_dir.join("current")
     };
 
-    if !ensure_sidecars(&index_dir) {
+    if !ensure_sidecars(&index_dir, include_heavy) {
         return;
     }
 
@@ -384,12 +436,12 @@ fn load_and_store_index(cache_dir: &std::path::Path, index_state: &IndexState) {
 }
 
 #[cfg(feature = "daemon")]
-fn ensure_sidecars(index_dir: &std::path::Path) -> bool {
+fn ensure_sidecars(index_dir: &std::path::Path, include_heavy: bool) -> bool {
     let files_path = index_dir.join("files");
     let packages_json = index_dir.join("packages.json");
     if files_path.is_file()
         && !packages_json.is_file()
-        && let Err(err) = crate::database::generate_sidecars(&files_path)
+        && let Err(err) = crate::database::generate_sidecars_mode(&files_path, include_heavy)
     {
         tracing::warn!(
             error = %err,
@@ -691,6 +743,12 @@ async fn nix_locate_handler(
             None => crate::database::SearchSort::None,
         };
 
+        let literal_pattern = if params.regex {
+            None
+        } else {
+            Some(params.pattern.clone())
+        };
+
         let options = crate::database::SearchOptions {
             database: database_dir,
             pattern,
@@ -699,6 +757,7 @@ async fn nix_locate_handler(
             exact_basename,
             exact_path,
             path_prefix,
+            literal_pattern,
             file_type: &file_type,
             mode: crate::database::SearchMode::Full {
                 color: false,

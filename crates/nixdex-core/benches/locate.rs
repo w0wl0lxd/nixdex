@@ -4,13 +4,14 @@ use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use regex::bytes::Regex;
 
-use nixdex_core::database::{Reader, SearchMode, SearchOptions, SearchSort};
-use nixdex_core::files::FileTree;
-use nixdex_core::generate_sidecars;
+use nixdex_core::database::{
+    Reader, SearchMode, SearchOptions, SearchSort, generate_sidecars, search_results,
+};
+use nixdex_core::entry_index::EntryIndex;
+use nixdex_core::files::{FileTree, FileType};
 use nixdex_core::store_path::{Origin, StorePath};
 
 const DB_ENV_VAR: &str = "NIXDEX_BENCH_DB";
-
 const PACKAGE_COUNTS: [usize; 3] = [100, 1_000, 5_000];
 const FILES_PER_PACKAGE: usize = 10;
 
@@ -101,6 +102,69 @@ fn open_baseline(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_locate_search(c: &mut Criterion) {
+    let path = db_files_path(1_000);
+    let reader = Reader::open(&path).expect("open database");
+    let pattern = Regex::new("bin/ls").expect("regex");
+
+    c.bench_function("locate search warm", |b| {
+        b.iter(|| {
+            let hits = reader
+                .search_entries(&pattern, None, None, None, None)
+                .expect("search");
+            black_box(hits);
+        });
+    });
+}
+
+fn bench_locate_entry_lookup(c: &mut Criterion) {
+    let path = db_files_path(1_000);
+    let dir = path.parent().expect("db dir");
+    generate_sidecars(&path).expect("generate sidecars");
+
+    let index = EntryIndex::open(dir).expect("open entry index");
+
+    c.bench_function("locate entry lookup (basename->store paths)", |b| {
+        b.iter(|| {
+            let entries = index.lookup_entries(b"ls").expect("lookup");
+            black_box(entries);
+        });
+    });
+}
+
+fn bench_locate_ngram_search(c: &mut Criterion) {
+    let path = db_files_path(1_000);
+    let dir = path.parent().expect("db dir");
+    generate_sidecars(&path).expect("generate sidecars");
+
+    let options = SearchOptions {
+        database: dir.to_path_buf(),
+        pattern: String::from("bin/ls"),
+        hash: None,
+        package_pattern: None,
+        exact_basename: None,
+        exact_path: None,
+        path_prefix: None,
+        literal_pattern: Some(String::from("bin/ls")),
+        file_type: &[FileType::Regular { executable: false }],
+        mode: SearchMode::Minimal,
+        json: false,
+        limit: None,
+        count: false,
+        sort: SearchSort::None,
+        min_size: None,
+        max_size: None,
+        exclude_fhs: false,
+    };
+
+    c.bench_function("locate search via ngram index", |b| {
+        b.iter(|| {
+            let hits = search_results(&options).expect("search");
+            black_box(hits);
+        });
+    });
+}
+
 fn search_entries_baseline(c: &mut Criterion) {
     let mut group = c.benchmark_group("locate_search_entries");
     group.sample_size(50);
@@ -156,6 +220,7 @@ fn search_results_baseline(c: &mut Criterion) {
                 exact_basename: exact_basename.map(String::from),
                 exact_path: None,
                 path_prefix: None,
+                literal_pattern: None,
                 file_type: &[],
                 mode: SearchMode::Minimal,
                 json: false,
@@ -168,8 +233,8 @@ fn search_results_baseline(c: &mut Criterion) {
             };
             group.bench_with_input(BenchmarkId::new(label, count), &opts, |b, opts| {
                 b.iter(|| {
-                    let hits = nixdex_core::search_database_results(black_box(opts))
-                        .expect("search results");
+                    let hits =
+                        nixdex_core::search_database_results(black_box(opts)).expect("search results");
                     black_box(hits);
                 });
             });
@@ -181,6 +246,9 @@ fn search_results_baseline(c: &mut Criterion) {
 criterion_group!(
     benches,
     open_baseline,
+    bench_locate_search,
+    bench_locate_entry_lookup,
+    bench_locate_ngram_search,
     search_entries_baseline,
     search_results_baseline
 );
