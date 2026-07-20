@@ -312,8 +312,9 @@ impl BasenameIndex {
     pub fn lookup_basename_prefix_ordinals(&self, prefix: &[u8]) -> Result<Vec<u32>> {
         // FST automata operate on UTF-8 byte strings; a non-UTF-8 prefix can
         // never match the valid UTF-8 keys stored in the index.
-        let prefix = std::str::from_utf8(prefix)
-            .map_err(|_| Error::Fst("non-UTF-8 basename prefix".into()))?;
+        let Ok(prefix) = std::str::from_utf8(prefix) else {
+            return Ok(Vec::new());
+        };
 
         let mut matched = RoaringBitmap::new();
         let mut stream = self
@@ -323,9 +324,7 @@ impl BasenameIndex {
 
         while let Some((_key, cookie)) = stream.next() {
             let ordinals = read_ordinals_at(&self.postings, cookie)?;
-            for ord in ordinals {
-                matched.insert(ord);
-            }
+            matched.extend(ordinals);
         }
 
         Ok(matched.iter().collect())

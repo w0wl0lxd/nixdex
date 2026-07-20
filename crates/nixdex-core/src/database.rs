@@ -12,7 +12,7 @@
 
 use std::fs::{self, File};
 use std::io;
-use std::io::{Read, Seek, Write};
+use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 
 use byteorder::{LittleEndian, WriteBytesExt};
@@ -1506,9 +1506,10 @@ fn search_frame_decoder<R: std::io::BufRead>(
                     found_without_package.clear();
                 }
             } else {
-                // No package footer in this block yet; carry entries forward.
-                // If this is the final block, the loop below will error out.
-                continue;
+                // No package footer in this block yet. Fall through to the path
+                // scan so entries whose footer is in a later block are carried
+                // forward instead of being skipped. If this is the final block,
+                // the end-of-loop check below will report a missing footer.
             }
         }
 
@@ -1650,15 +1651,11 @@ fn decompress_frame_threaded(compressed: &[u8]) -> std::result::Result<Vec<u8>, 
                 Vec::with_capacity(size)
             }
             Ok(None) => {
-                let mut decoder =
-                    zstd::stream::read::Decoder::new(std::io::Cursor::new(compressed))?;
-                decoder.window_log_max(crate::ZSTD_WINDOW_LOG_MAX)?;
-                let mut buf = Vec::with_capacity(1 << 20);
-                decoder.read_to_end(&mut buf).map_err(Error::Io)?;
-                if buf.len() > crate::MAX_ZSTD_FRAME_BYTES {
-                    return Err(Error::Corrupt("zstd decompressed size exceeds limit"));
-                }
-                return Ok(buf);
+                // The frame header does not advertise a content size; use the
+                // bounded streaming decoder so a zstd bomb cannot allocate past
+                // the defensive cap.
+                return crate::bounded_zstd_decode(compressed, crate::MAX_ZSTD_FRAME_BYTES)
+                    .map_err(Error::Io);
             }
             Err(_) => return Err(Error::Corrupt("invalid zstd frame header")),
         };
