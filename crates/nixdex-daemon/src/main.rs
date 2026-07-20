@@ -49,6 +49,30 @@ struct Args {
     /// If unset, `/reload` is only accepted from loopback addresses.
     #[arg(long, env = "NIXDEX_ADMIN_TOKEN")]
     admin_token: Option<String>,
+
+    /// Index cache mode: `resident` builds sidecar indexes eagerly at load,
+    /// `lru` defers them until first needed.
+    #[arg(long, value_enum, default_value_t = IndexCacheModeArg::Resident)]
+    index_cache_mode: IndexCacheModeArg,
+}
+
+/// Index cache mode selected on the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Default)]
+enum IndexCacheModeArg {
+    /// Build sidecar indexes eagerly at load.
+    #[default]
+    Resident,
+    /// Build sidecar indexes lazily on first use.
+    Lru,
+}
+
+impl From<IndexCacheModeArg> for nixdex_core::daemon::IndexCacheMode {
+    fn from(value: IndexCacheModeArg) -> Self {
+        match value {
+            IndexCacheModeArg::Resident => Self::Resident,
+            IndexCacheModeArg::Lru => Self::Lru,
+        }
+    }
 }
 
 #[tokio::main]
@@ -78,6 +102,7 @@ async fn main() -> color_eyre::Result<()> {
         local_database: args.database,
         local_refresh_interval: Duration::from_secs(args.interval),
         admin_token: args.admin_token,
+        index_cache_mode: args.index_cache_mode.into(),
     };
 
     match nixdex_core::daemon::run(&config).await {

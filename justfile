@@ -75,5 +75,11 @@ benchmark-search DB='':
 benchmark-index-compare RUNS='5':
     ./scripts/benchmark-index-comparison.sh '{{RUNS}}'
 
+# p99 latency gate for the resident-daemon search path. With no real DB it
+# exercises the synthetic fixture (regression guard); pass a real `files` index
+# DB path via DB=... to gate against production-scale data.
+benchmark-p99 DB='':
+    ./scripts/p99-guard.sh '{{DB}}'
+
 benchmark-index NIXPKGS='<nixpkgs>' MODE='eval' RUNS='1':
     ./scripts/benchmark-index.sh '{{NIXPKGS}}' '{{MODE}}' '{{RUNS}}'
