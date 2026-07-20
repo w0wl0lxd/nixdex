@@ -631,10 +631,13 @@ fn find_command_providers(
     cmd: &str,
     db_dir: &std::path::Path,
 ) -> color_eyre::Result<Vec<nixdex_core::StorePath>> {
-    let command = std::path::Path::new(cmd)
+    let command = match std::path::Path::new(cmd)
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or(cmd);
+    {
+        Some(name) => name,
+        None => cmd,
+    };
 
     // Prefer a running daemon for a sub-millisecond response.
     if let Some(providers) = daemon_command_lookup(command) {
@@ -702,7 +705,11 @@ fn daemon_command_lookup(
     use std::net::TcpStream;
 
     let addr = std::env::var("NIXDEX_DAEMON_ADDR").unwrap_or_else(|_| "127.0.0.1:3750".to_string());
-    let mut stream = TcpStream::connect(addr).ok()?;
+    let mut stream = if let Ok(socket_addr) = addr.parse::<std::net::SocketAddr>() {
+        TcpStream::connect_timeout(&socket_addr, std::time::Duration::from_millis(100)).ok()?
+    } else {
+        TcpStream::connect(addr).ok()?
+    };
     stream
         .set_read_timeout(Some(std::time::Duration::from_millis(150)))
         .ok()?;
@@ -730,7 +737,10 @@ fn daemon_command_lookup(
     for p in providers {
         let attr = p.get("attr")?.as_str()?.to_string();
         let output = p.get("output")?.as_str()?.to_string();
-        let toplevel = p.get("toplevel").and_then(|v| v.as_bool()).unwrap_or(false);
+        let toplevel = match p.get("toplevel").and_then(sonic_rs::Value::as_bool) {
+            Some(b) => b,
+            None => false,
+        };
         out.push(nixdex_core::command_index::CommandProvider {
             attr,
             output,
