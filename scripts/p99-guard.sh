@@ -51,7 +51,8 @@ TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 # Build the locate benchmark binary directly; in some build roots the artifact
 # is written without the executable bit, so fix permissions before running.
 cargo build --release --bench locate
-BENCH_BIN=$(find "$TARGET_DIR/release/deps" -maxdepth 1 -name 'locate-*' -type f ! -name '*.d' | head -1)
+BENCH_BIN=$(find "$TARGET_DIR/release/deps" -maxdepth 1 -name 'locate-*' -type f ! -name '*.d' \
+  -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
 if [[ -z "$BENCH_BIN" ]]; then
   echo "error: could not locate locate benchmark binary under $TARGET_DIR/release/deps" >&2
   exit 1
