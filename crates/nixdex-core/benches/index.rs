@@ -4,12 +4,13 @@ use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use regex::bytes::Regex;
 
-use nixdex_core::database::{PathMatcher, Reader, Writer};
+use nixdex_core::database::{Reader, Writer};
 use nixdex_core::files::FileTree;
 use nixdex_core::generate_sidecars;
 use nixdex_core::store_path::{Origin, StorePath};
 
 const PACKAGE_COUNTS: [usize; 3] = [100, 1_000, 5_000];
+const SIDECAR_COUNTS: [usize; 3] = [100, 1_000, 2_500];
 const FILES_PER_PACKAGE: usize = 10;
 
 fn make_package_tree() -> FileTree {
@@ -98,8 +99,7 @@ fn bench_reader_open(c: &mut Criterion) {
 fn bench_reader_search(c: &mut Criterion) {
     let mut group = c.benchmark_group("index_reader_search");
     group.sample_size(50);
-    let re = Regex::new("program").expect("regex");
-    let matcher = PathMatcher::regex(re).expect("matcher");
+    let matcher = Regex::new("program").expect("regex");
     for count in PACKAGE_COUNTS {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("files");
@@ -122,7 +122,7 @@ fn bench_reader_search(c: &mut Criterion) {
 fn bench_generate_sidecars(c: &mut Criterion) {
     let mut group = c.benchmark_group("index_generate_sidecars");
     group.sample_size(30);
-    for count in PACKAGE_COUNTS {
+    for count in SIDECAR_COUNTS {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("files");
         let paths = make_dataset(count);
