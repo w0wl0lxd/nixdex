@@ -78,5 +78,17 @@ harness = false
 name = "basename_index"
 harness = false
 
+[[bench]]
+name = "entry_index"
+harness = false
+
+[[bench]]
+name = "path_index"
+harness = false
+
+[[bench]]
+name = "ngram_index"
+harness = false
+
 [lints]
 workspace = true
