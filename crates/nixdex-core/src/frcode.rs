@@ -5,7 +5,7 @@
 
 use std::cmp;
 use std::io::{self, BufRead, Write};
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 
 use thiserror::Error;
 
@@ -103,11 +103,7 @@ impl Deref for ResizableBuf {
     }
 }
 
-impl DerefMut for ResizableBuf {
-    fn deref_mut(&mut self) -> &mut [u8] {
-        &mut self.data
-    }
-}
+
 
 /// Decoder for the frcode format. Yields blocks of decoded entries.
 pub struct Decoder<R> {
@@ -185,44 +181,38 @@ impl<R: BufRead> Decoder<R> {
     /// Read until NUL. Returns `Ok(Some(true))` when a NUL was found,
     /// `Ok(Some(false))` when the output buffer is full, and `Ok(None)` on EOF
     /// with no further input.
+    #[allow(clippy::indexing_slicing)]
     fn read_to_nul(&mut self) -> Result<Option<bool>> {
         loop {
-            let (done, len) = {
-                let &mut Self {
-                    ref mut reader,
-                    ref mut buf,
-                    ref mut pos,
-                    ..
-                } = self;
-                let input = match reader.fill_buf() {
-                    Ok(data) => data,
-                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(Error::from(e)),
-                };
+            match self.reader.fill_buf() {
+                Ok(input) => {
+                    if input.is_empty() {
+                        return Ok(None);
+                    }
 
-                if input.is_empty() {
-                    return Ok(None);
-                }
+                    let (done, len) = match memchr::memchr(b'\x00', input) {
+                        Some(i) => (true, i + 1),
+                        None => (false, input.len()),
+                    };
 
-                let (done, len) = match memchr::memchr(b'\x00', input) {
-                    Some(i) => (true, i + 1),
-                    None => (false, input.len()),
-                };
-
-                let new_pos = *pos + len;
-                if !buf.ensure_len(new_pos) {
-                    return Ok(Some(false));
+                    let new_pos = self.pos + len;
+                    if !self.buf.ensure_len(new_pos) {
+                        return Ok(Some(false));
+                    }
+                    self.buf.data[self.pos..new_pos].copy_from_slice(&input[..len]);
+                    self.pos = new_pos;
+                    self.reader.consume(len);
+                    if done {
+                        return Ok(Some(true));
+                    }
+                    // Otherwise the `loop` repeats and reads the next chunk.
                 }
-                if let (Some(src), Some(dst)) = (input.get(..len), buf.data.get_mut(*pos..new_pos))
-                {
-                    dst.copy_from_slice(src);
+                Err(e) => {
+                    if e.kind() != io::ErrorKind::Interrupted {
+                        return Err(Error::from(e));
+                    }
+                    // Retry on `Interrupted`; the `loop` repeats.
                 }
-                *pos = new_pos;
-                (done, len)
-            };
-            self.reader.consume(len);
-            if done {
-                return Ok(Some(true));
             }
         }
     }
@@ -254,7 +244,7 @@ impl<R: BufRead> Decoder<R> {
     /// # Errors
     ///
     /// Returns an error when the stream is corrupt or I/O fails.
-    pub fn decode(&mut self) -> Result<&mut [u8]> {
+    pub fn decode(&mut self) -> Result<&[u8]> {
         let end = self.pos;
         self.pos = 0;
 
@@ -307,7 +297,7 @@ impl<R: BufRead> Decoder<R> {
                 return if got_input {
                     Err(Error::MissingNewline)
                 } else {
-                    Ok(&mut [])
+                    Ok(&[])
                 };
             };
             memchr::memrchr(b'\n', view)
@@ -319,22 +309,22 @@ impl<R: BufRead> Decoder<R> {
                 // If no new input was read and the only newlines live before
                 // `item_start`, we are at EOF with residual prefix state.
                 if !got_input && newline < item_start {
-                    return Ok(&mut []);
+                    return Ok(&[]);
                 }
                 // A line must contain a terminating NUL for the metadata;
                 // otherwise we cannot locate the path.
                 if !got_input && !found_nul && self.pos > item_start {
                     return Err(Error::MissingNul);
                 }
-                match self.buf.get_mut(item_start..self.partial_entry_start) {
-                    Some(slice) => Ok(slice),
-                    None => Err(Error::MissingNewline),
-                }
+                Ok(self
+                    .buf
+                    .get(item_start..self.partial_entry_start)
+                    .ok_or(Error::MissingNewline)?)
             }
             None if !got_input => {
                 // EOF after a clean entry boundary: residual last-path bytes
                 // have no newline, and no new data arrived.
-                Ok(&mut [])
+                Ok(&[])
             }
             None => Err(Error::MissingNewline),
         }
@@ -382,7 +372,9 @@ impl<W: Write> Encoder<W> {
     }
 
     fn encode_diff(&mut self, diff: i16) -> io::Result<()> {
-        let [low, high] = diff.to_le_bytes();
+        let bytes = diff.to_le_bytes();
+        let low = bytes[0];
+        let high = bytes[1];
         if diff.abs() < i16::from(i8::MAX) {
             self.writer.write_all(&[low])?;
         } else {
