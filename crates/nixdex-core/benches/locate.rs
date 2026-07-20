@@ -236,8 +236,8 @@ fn search_results_baseline(c: &mut Criterion) {
             };
             group.bench_with_input(BenchmarkId::new(label, count), &opts, |b, opts| {
                 b.iter(|| {
-                    let hits =
-                        nixdex_core::search_database_results(black_box(opts)).expect("search results");
+                    let hits = nixdex_core::search_database_results(black_box(opts))
+                        .expect("search results");
                     black_box(hits);
                 });
             });

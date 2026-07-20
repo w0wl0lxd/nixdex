@@ -37,7 +37,11 @@ pub use store_path::{Origin, StorePath};
 pub const CACHE_URL: &str = "https://cache.nixos.org";
 
 /// Maximum uncompressed size accepted from a single zstd frame (defensive cap).
-pub(crate) const MAX_ZSTD_FRAME_BYTES: usize = 512 * 1024 * 1024;
+///
+/// Version 1 prebuilt indexes from upstream `nix-index-database` decompress to
+/// well over 1 GiB, so the cap must allow a full upstream database. It still
+/// protects against zstd bombs because it is bounded by `MAX_DATABASE_BYTES`.
+pub(crate) const MAX_ZSTD_FRAME_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 /// Maximum back-reference window log for zstd decoders (defensive cap).
 ///
