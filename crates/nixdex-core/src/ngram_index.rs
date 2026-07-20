@@ -395,7 +395,7 @@ mod tests {
         let index = NgramIndex::open(dir.path()).expect("open");
 
         // Both pkg0 and pkg1 contain "firefox" (share trigrams fir/ire/ref/efo/fox).
-        let mut candidates = index
+        let candidates = index
             .candidate_ordinals("firefox")
             .expect("candidates")
             .expect("some");

@@ -62,6 +62,7 @@ quanta = "0.12"
 
 # Fuzzy matching for package search
 frizbee = "0.10"
+fuzzy-matcher = "0.3.7"
 
 # Error handling
 thiserror = "2"

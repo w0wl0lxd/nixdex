@@ -1,8 +1,8 @@
 use bytes::Bytes;
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use regex::bytes::Regex;
 
-use nixdex_core::database::{search_results, Reader, SearchMode, SearchOptions, SearchSort};
+use nixdex_core::database::{Reader, SearchMode, SearchOptions, SearchSort, search_results};
 use nixdex_core::entry_index::EntryIndex;
 use nixdex_core::files::{FileTree, FileType};
 use nixdex_core::store_path::{Origin, StorePath};
@@ -182,6 +182,7 @@ fn search_results_baseline(c: &mut Criterion) {
             pattern: pattern.to_string(),
             hash: None,
             package_pattern: None,
+            literal_pattern: None,
             exact_basename: exact_basename.map(String::from),
             exact_path: None,
             path_prefix: None,
