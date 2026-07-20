@@ -1641,6 +1641,7 @@ dependencies = [
  "indicatif",
  "memchr",
  "mmap-guard",
+ "once_cell",
  "papaya",
  "postcard",
  "proptest",

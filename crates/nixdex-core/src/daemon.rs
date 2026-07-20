@@ -1,17 +1,20 @@
 //! Background daemon support for keeping the nixdex index up to date.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use crate::basename_index::BasenameIndex;
-use crate::database::Reader;
-use crate::errors::Result;
-use crate::prebuilt::{self, PrebuiltConfig};
-use indexmap::IndexSet;
+use crate::prebuilt::PrebuiltConfig;
 
+#[cfg(feature = "daemon")]
+use {
+    crate::basename_index::BasenameIndex, crate::database::Reader, crate::errors::Result,
+    crate::prebuilt, indexmap::IndexSet, std::sync::Arc,
+};
+
+#[cfg(feature = "daemon")]
 /// Maximum length (in bytes) of an HTTP query pattern.
 const MAX_PATTERN_BYTES: usize = 1024;
 
+#[cfg(feature = "daemon")]
 /// Maximum number of results returned by daemon endpoints.
 const MAX_RESULT_LIMIT: usize = 10_000;
 
@@ -405,6 +408,14 @@ fn load_and_store_index(
             return;
         }
     };
+
+    // Warm the version 1 frcode cache for long-running daemon usage. This pays
+    // the one-time zstd decompression cost at load time so subsequent searches
+    // scan an in-memory frcode stream instead of decompressing on every query.
+    if let Err(err) = reader.prefetch_v1() {
+        tracing::warn!(error = %err, path = %files_path.display(), "failed to prefetch v1 frcode cache");
+        return;
+    }
 
     let package_db = {
         let packages_json = index_dir.join("packages.json");
