@@ -156,6 +156,10 @@ pub enum Error {
     /// Path secondary index is missing or unreadable.
     #[error("path index: {0}")]
     PathIndex(#[from] crate::path_index::Error),
+
+    /// Command-provider secondary index is missing or unreadable.
+    #[error("command index: {0}")]
+    CommandIndex(#[from] crate::command_index::Error),
 }
 
 /// Convenience alias for this module.
@@ -175,6 +179,8 @@ pub struct Writer {
     boundaries: Vec<usize>,
     /// Optional basename index accumulated during `add`.
     basename_index: BasenameIndexBuilder,
+    /// Optional command-provider index accumulated during `add`.
+    command_index: crate::command_index::CommandIndexBuilder,
     /// Optional path index accumulated during `add`.
     path_index: PathIndexBuilder,
     /// Open file handle for streaming frame writes.
@@ -261,6 +267,7 @@ impl Writer {
             raw: Vec::new(),
             boundaries: Vec::new(),
             basename_index: BasenameIndexBuilder::new(),
+            command_index: crate::command_index::CommandIndexBuilder::new(),
             path_index: PathIndexBuilder::new(),
             file: Some(file),
             frame_lengths: Vec::new(),
@@ -317,6 +324,16 @@ impl Writer {
         let label = format!("{}.{}", path.origin().attr, path.origin().output);
         let paths: Vec<Vec<u8>> = entries.iter().map(|e| e.path.clone()).collect();
         let ordinal = self.basename_index.record_package(label, paths.clone())?;
+
+        // Record command candidates in the command-provider index.
+        self.command_index
+            .record_package(
+                path.origin().attr.clone(),
+                path.origin().output.clone(),
+                path.origin().toplevel,
+                paths.clone(),
+            )
+            .map_err(Error::CommandIndex)?;
 
         // Record full paths in the path index using the same ordinal
         self.path_index.record_package(ordinal, paths)?;
@@ -488,6 +505,7 @@ impl Writer {
                     self.basename_index.write_sidecars(dir)?;
                     write_attrs_sidecar(dir, &self.attrs)?;
                     self.path_index.write_sidecars(dir)?;
+                    self.command_index.write_sidecars(dir)?;
                     if let Some(redb) = self.redb.take() {
                         redb.finish()
                             .map_err(|err| Error::Io(std::io::Error::other(err.to_string())))?;
@@ -539,6 +557,7 @@ impl Writer {
             self.basename_index.write_sidecars(dir)?;
             write_attrs_sidecar(dir, &self.attrs)?;
             self.path_index.write_sidecars(dir)?;
+            self.command_index.write_sidecars(dir)?;
             if let Some(redb) = self.redb.take() {
                 redb.finish()
                     .map_err(|err| Error::Io(std::io::Error::other(err.to_string())))?;
@@ -1473,6 +1492,16 @@ pub struct SearchOptions<'a> {
     pub exclude_fhs: bool,
 }
 
+/// Resident secondary indexes supplied by the daemon to avoid re-opening
+/// sidecars on every request. `None` for a given field means the caller should
+/// open the sidecar from disk (the CLI path).
+pub struct ResidentIndexes<'a> {
+    /// Resident path index, if available.
+    pub path_index: Option<&'a crate::path_index::PathIndex>,
+    /// Resident basename index, if available.
+    pub basename_index: Option<&'a crate::basename_index::BasenameIndex>,
+}
+
 /// Resolve the set of candidate package ordinals from the basename secondary index.
 ///
 /// Errors are logged and treated as a full-scan fallback; `None` is returned
@@ -1481,22 +1510,31 @@ pub struct SearchOptions<'a> {
 fn resolve_package_ordinals(
     index_file: &Path,
     exact_basename: Option<&str>,
+    resident: Option<&BasenameIndex>,
 ) -> Option<RoaringBitmap> {
     let base = exact_basename?;
     let dir = index_file.parent()?;
     if dir.as_os_str().is_empty() {
         return None;
     }
-    match BasenameIndex::open(dir) {
-        Ok(index) => match index.lookup_basename_ordinals(base.as_bytes()) {
-            Ok(ordinals) => Some(ordinals.into_iter().collect()),
+    let opened;
+    let index: &BasenameIndex = match resident {
+        Some(idx) => idx,
+        None => match BasenameIndex::open(dir) {
+            Ok(idx) => {
+                opened = idx;
+                &opened
+            }
             Err(err) => {
                 if sidecars_exist(dir) {
                     tracing::warn!(%err, "basename index sidecars unreadable; falling back to full scan");
                 }
-                None
+                return None;
             }
         },
+    };
+    match index.lookup_basename_ordinals(base.as_bytes()) {
+        Ok(ordinals) => Some(ordinals.into_iter().collect()),
         Err(err) => {
             if sidecars_exist(dir) {
                 tracing::warn!(%err, "basename index sidecars unreadable; falling back to full scan");
@@ -1515,20 +1553,28 @@ fn resolve_path_ordinals(
     index_file: &Path,
     exact_path: Option<&str>,
     path_prefix: Option<&str>,
+    resident: Option<&crate::path_index::PathIndex>,
 ) -> Option<RoaringBitmap> {
     let dir = index_file.parent()?;
     if dir.as_os_str().is_empty() {
         return None;
     }
 
-    let index = match PathIndex::open(dir) {
-        Ok(idx) => idx,
-        Err(err) => {
-            if path_sidecars_exist(dir) {
-                tracing::warn!(%err, "path index sidecars unreadable; falling back to full scan");
+    let opened;
+    let index: &crate::path_index::PathIndex = match resident {
+        Some(idx) => idx,
+        None => match crate::path_index::PathIndex::open(dir) {
+            Ok(idx) => {
+                opened = idx;
+                &opened
             }
-            return None;
-        }
+            Err(err) => {
+                if path_sidecars_exist(dir) {
+                    tracing::warn!(%err, "path index sidecars unreadable; falling back to full scan");
+                }
+                return None;
+            }
+        },
     };
 
     // Try exact path lookup first
@@ -1814,8 +1860,10 @@ fn compile_search_regex(pattern: &str, kind: &str) -> crate::Result<Regex> {
 /// # Errors
 ///
 /// Returns an error if the database cannot be read or the pattern is invalid.
+#[allow(clippy::cognitive_complexity)]
 pub fn search_results(
     options: &SearchOptions<'_>,
+    resident: Option<ResidentIndexes<'_>>,
 ) -> crate::Result<Vec<(crate::StorePath, crate::files::FileTreeEntry)>> {
     let index_file = options.database.join("files");
 
@@ -1825,15 +1873,24 @@ pub fn search_results(
         None => None,
     };
 
+    let (resident_path, resident_basename) = match resident {
+        Some(r) => (r.path_index, r.basename_index),
+        None => (None, None),
+    };
+
     // Resolve ordinals from basename index (for exact basename queries)
-    let basename_ordinals =
-        resolve_package_ordinals(&index_file, options.exact_basename.as_deref());
+    let basename_ordinals = resolve_package_ordinals(
+        &index_file,
+        options.exact_basename.as_deref(),
+        resident_basename,
+    );
 
     // Resolve ordinals from path index (for rooted/prefix queries)
     let path_ordinals = resolve_path_ordinals(
         &index_file,
         options.exact_path.as_deref(),
         options.path_prefix.as_deref(),
+        resident_path,
     );
 
     // Combine ordinals from both sources if both are present
@@ -1939,7 +1996,7 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
     // Compile the path pattern once with defensive size limits for both the
     // search and the output pass (highlighting, grouping).
     let path_pattern = compile_search_regex(&options.pattern, "path")?;
-    let results = search_results(options)?;
+    let results = search_results(options, None)?;
 
     // Track printed attrs for --minimal de-duplication (ordered set).
     let mut printed_attrs: IndexSet<String> = IndexSet::new();
@@ -2001,6 +2058,7 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
     // Scan all frames to extract package paths and build secondary indexes.
     let mut builder = BasenameIndexBuilder::new();
     let mut path_builder = PathIndexBuilder::new();
+    let mut command_builder = crate::command_index::CommandIndexBuilder::new();
     let mut all_package_labels: Vec<String> = Vec::new();
     let mut all_package_meta: Vec<PackageMeta> = Vec::new();
     let mut all_package_attrs: Vec<(String, String, String)> = Vec::new();
@@ -2019,6 +2077,7 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
                 compressed,
                 &mut builder,
                 &mut path_builder,
+                &mut command_builder,
                 &mut all_package_labels,
                 &mut all_package_meta,
                 &mut all_package_attrs,
@@ -2043,6 +2102,7 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
                 &raw,
                 &mut builder,
                 &mut path_builder,
+                &mut command_builder,
                 &mut all_package_labels,
                 &mut all_package_meta,
                 &mut all_package_attrs,
@@ -2057,6 +2117,9 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
     path_builder
         .write_sidecars(db_dir)
         .map_err(Error::PathIndex)?;
+    command_builder
+        .write_sidecars(db_dir)
+        .map_err(Error::CommandIndex)?;
 
     // Write frame_map sidecar if we have v2 frame data.
     if let (Some(frame_map), Some(_frame_starts)) = (&reader.frame_map, &reader.frame_starts) {
@@ -2099,6 +2162,7 @@ fn scan_decoder_for_packages<R: std::io::BufRead>(
     decoder: &mut frcode::Decoder<R>,
     builder: &mut BasenameIndexBuilder,
     path_builder: &mut PathIndexBuilder,
+    command_builder: &mut crate::command_index::CommandIndexBuilder,
     all_package_labels: &mut Vec<String>,
     all_package_meta: &mut Vec<PackageMeta>,
     all_package_attrs: &mut Vec<(String, String, String)>,
@@ -2136,15 +2200,18 @@ fn scan_decoder_for_packages<R: std::io::BufRead>(
                         description: None,
                         main_program: None,
                     });
-                    all_package_attrs.push((attr, output, pkg.hash().to_string()));
+                    all_package_attrs.push((attr.clone(), output.clone(), pkg.hash().to_string()));
 
                     let paths = std::mem::take(&mut current_paths);
                     let ordinal = builder
                         .record_package(label, paths.clone())
                         .map_err(Error::SecondaryIndex)?;
                     path_builder
-                        .record_package(ordinal, paths)
+                        .record_package(ordinal, paths.clone())
                         .map_err(Error::PathIndex)?;
+                    command_builder
+                        .record_package(attr.clone(), output.clone(), pkg.origin().toplevel, paths)
+                        .map_err(Error::CommandIndex)?;
                 }
             } else {
                 // File entry: extract path.
@@ -2166,6 +2233,7 @@ fn scan_frame_for_packages(
     raw: &[u8],
     builder: &mut BasenameIndexBuilder,
     path_builder: &mut PathIndexBuilder,
+    command_builder: &mut crate::command_index::CommandIndexBuilder,
     all_package_labels: &mut Vec<String>,
     all_package_meta: &mut Vec<PackageMeta>,
     all_package_attrs: &mut Vec<(String, String, String)>,
@@ -2175,6 +2243,7 @@ fn scan_frame_for_packages(
         &mut decoder,
         builder,
         path_builder,
+        command_builder,
         all_package_labels,
         all_package_meta,
         all_package_attrs,
@@ -2189,6 +2258,7 @@ fn scan_frame_stream_for_packages(
     compressed: &[u8],
     builder: &mut BasenameIndexBuilder,
     path_builder: &mut PathIndexBuilder,
+    command_builder: &mut crate::command_index::CommandIndexBuilder,
     all_package_labels: &mut Vec<String>,
     all_package_meta: &mut Vec<PackageMeta>,
     all_package_attrs: &mut Vec<(String, String, String)>,
@@ -2201,6 +2271,7 @@ fn scan_frame_stream_for_packages(
         &mut decoder,
         builder,
         path_builder,
+        command_builder,
         all_package_labels,
         all_package_meta,
         all_package_attrs,

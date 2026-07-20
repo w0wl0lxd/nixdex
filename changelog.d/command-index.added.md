@@ -1,0 +1,2 @@
+- Add a command-provider secondary index (FST map + postings + provider table sidecars) so command-not-found lookups resolve providers without reading the `files` blob or the `redb` path index.
+- Add `nixdex which` (`--minimal`/`--all`) to resolve the packages that provide an executable, and wire it into `command-not-found.sh`.

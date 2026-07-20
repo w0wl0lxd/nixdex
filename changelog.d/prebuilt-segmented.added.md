@@ -1,0 +1,3 @@
+- Add parallel segmented `Range` downloads for prebuilt indexes: split the file into concurrent `Range` segments (bounded by `--max-connections`) with a serial single-stream fallback when the server does not honor `Range`.
+- Tune the prebuilt HTTP client for bulk transfer: HTTP/2 adaptive flow-control windows, `TCP_NODELAY`, and a larger per-host idle connection pool.
+- Add `--max-connections` (CLI) and `--prebuilt-max-connections` (`index`) to bound concurrent prebuilt segment downloads.

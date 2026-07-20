@@ -87,6 +87,9 @@ impl FetcherBuilder {
             .user_agent(concat!("nixdex/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(connect_timeout)
             .timeout(self.timeout)
+            .http2_adaptive_window(true)
+            .tcp_nodelay(true)
+            .pool_max_idle_per_host(32)
             .build()
             .map_err(|err| Error::Request(err.to_string()))?;
         Ok(Fetcher {
