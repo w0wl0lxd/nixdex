@@ -14,6 +14,9 @@ WARMUP="${WARMUP:-3}"
 MIN_RUNS="${MIN_RUNS:-5}"
 OUT_MD="${OUT_MD:-/tmp/nixdex-bench-locate.md}"
 
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
 cargo build --release --bin nixdex
 NIXDEX="$(realpath "${CARGO_TARGET_DIR:-target}/release/nixdex")"
 
@@ -45,8 +48,13 @@ rm -f "$OUT_MD"
 } >"$OUT_MD"
 
 for entry in "${QUERIES[@]}"; do
-  pattern="${entry%%:*}"
-  flags="${entry##*:}"
+  if [[ "$entry" == *":"* ]]; then
+    pattern="${entry%%:*}"
+    flags="${entry##*:}"
+  else
+    pattern="$entry"
+    flags=""
+  fi
 
   nixdex_cmd="\"$NIXDEX\" locate -d \"$DB_DIR\""
   nixlocate_cmd="nix-locate -d \"$DB_DIR\""
@@ -65,22 +73,24 @@ for entry in "${QUERIES[@]}"; do
   echo "## Pattern: '$pattern' (flags=$flags)" >>"$OUT_MD"
   echo "" >>"$OUT_MD"
 
+  QUERY_MD="$(mktemp -p "$TMP_DIR" bench-locate-query-XXXXXX.md)"
+
   if command -v nix-locate >/dev/null 2>&1; then
     hyperfine \
       --warmup "$WARMUP" \
       --min-runs "$MIN_RUNS" \
-      --export-markdown /tmp/bench-locate-query.md \
+      --export-markdown "$QUERY_MD" \
       "$nixdex_cmd" \
       "$nixlocate_cmd"
   else
     hyperfine \
       --warmup "$WARMUP" \
       --min-runs "$MIN_RUNS" \
-      --export-markdown /tmp/bench-locate-query.md \
+      --export-markdown "$QUERY_MD" \
       "$nixdex_cmd"
   fi
 
-  cat /tmp/bench-locate-query.md >>"$OUT_MD"
+  cat "$QUERY_MD" >>"$OUT_MD"
   echo "" >>"$OUT_MD"
 done
 
