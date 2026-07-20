@@ -1287,7 +1287,7 @@ fn search_frame_decoder<R: std::io::BufRead>(
             break;
         }
 
-        let block: &[u8] = &*block;
+        let block: &[u8] = block;
         let mut pos = 0;
 
         // `end_pos` is block-local, so the cache must be reset for each new
@@ -2654,7 +2654,7 @@ fn scan_decoder_for_packages<R: std::io::BufRead>(
             break;
         }
 
-        let block: &[u8] = &*block;
+        let block: &[u8] = block;
         let mut line_start = 0;
         for end in memchr::memchr_iter(b'\n', block).chain(std::iter::once(block.len())) {
             let line = block
