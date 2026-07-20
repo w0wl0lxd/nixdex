@@ -2805,6 +2805,7 @@ mod tests {
         )])
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn writer_reader_roundtrip_and_search() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2867,6 +2868,7 @@ mod tests {
         search(&options).expect("search ok");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn filter_prefix_skips_non_matching() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2895,6 +2897,7 @@ mod tests {
         assert!(hits.is_empty());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn format_grouped_numbers() {
         assert_eq!(format_grouped(0), "0");
@@ -2904,18 +2907,21 @@ mod tests {
         assert_eq!(format_grouped(1_000_000), "1,000,000");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn compile_search_regex_rejects_oversized_patterns() {
         let long = "a".repeat(MAX_PATTERN_BYTES + 1);
         assert!(compile_search_regex(&long, "path").is_err());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn compile_search_regex_accepts_valid_patterns() {
         let re = compile_search_regex(r"bin/hello", "path").unwrap();
         assert!(re.is_match(b"/bin/hello"));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn writer_builds_fst_sidecar_queryable_by_basename() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2967,6 +2973,7 @@ mod tests {
         assert!(none.is_empty());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn writer_builds_path_index_queryable_by_full_path() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3030,6 +3037,7 @@ mod tests {
         assert!(missing.is_empty());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn v2_writer_reader_roundtrip_and_search() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3069,6 +3077,7 @@ mod tests {
         assert!(dir.path().join("files.basename.fst").is_file());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn v2_multiple_packages_yield_per_cpu_frames() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3142,6 +3151,7 @@ mod tests {
         assert!(frame_count >= 1 && frame_count <= num_cpus.max(2));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn v2_selective_search_by_ordinals() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3202,6 +3212,7 @@ mod tests {
         assert!(hits.iter().any(|(_, e)| e.path == b"/bin/cat"));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn v2_corrupt_seek_table_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3228,6 +3239,7 @@ mod tests {
         assert!(matches!(err, Error::Corrupt(_)));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn v2_seek_table_smaller_than_header_plus_trailer_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3248,6 +3260,7 @@ mod tests {
         assert!(matches!(err, Error::Corrupt(_)));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn add_skips_entries_with_forbidden_bytes() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3303,6 +3316,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn v1_sidecar_literal_prefix_search() {
         let dir = tempfile::tempdir().expect("tempdir");
