@@ -536,4 +536,25 @@ mod tests {
             .collect();
         assert_eq!(ordinals, vec![0]);
     }
+
+    #[test]
+    fn slash_in_pattern_and_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut builder = NgramIndexBuilder::new();
+        builder
+            .record_package(0, vec![b"/bin/ls".to_vec()])
+            .expect("pkg0");
+        builder
+            .record_package(1, vec![b"/bin/cat".to_vec()])
+            .expect("pkg1");
+        builder.write_sidecars(dir.path()).expect("write");
+
+        let index = NgramIndex::open(dir.path()).expect("open");
+        let candidates = index
+            .candidate_ordinals("bin/ls")
+            .expect("candidates")
+            .expect("some");
+        let ordinals: Vec<u32> = candidates.iter().collect();
+        assert_eq!(ordinals, vec![0]);
+    }
 }

@@ -1,17 +1,20 @@
 //! Background daemon support for keeping the nixdex index up to date.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use crate::basename_index::BasenameIndex;
-use crate::database::Reader;
-use crate::errors::Result;
-use crate::prebuilt::{self, PrebuiltConfig};
-use indexmap::IndexSet;
+use crate::prebuilt::PrebuiltConfig;
 
+#[cfg(feature = "daemon")]
+use {
+    crate::basename_index::BasenameIndex, crate::database::Reader, crate::errors::Result,
+    crate::prebuilt, indexmap::IndexSet, std::sync::Arc,
+};
+
+#[cfg(feature = "daemon")]
 /// Maximum length (in bytes) of an HTTP query pattern.
 const MAX_PATTERN_BYTES: usize = 1024;
 
+#[cfg(feature = "daemon")]
 /// Maximum number of results returned by daemon endpoints.
 const MAX_RESULT_LIMIT: usize = 10_000;
 
@@ -406,6 +409,14 @@ fn load_and_store_index(
         }
     };
 
+    // Warm the version 1 frcode cache for long-running daemon usage. This pays
+    // the one-time zstd decompression cost at load time so subsequent searches
+    // scan an in-memory frcode stream instead of decompressing on every query.
+    if let Err(err) = reader.prefetch_v1() {
+        tracing::warn!(error = %err, path = %files_path.display(), "failed to prefetch v1 frcode cache");
+        return;
+    }
+
     let package_db = {
         let packages_json = index_dir.join("packages.json");
         if packages_json.exists() {
@@ -670,8 +681,8 @@ async fn nix_locate_handler(
         ));
     }
 
-    let database_dir = match read_snapshot(&index_state) {
-        Some(snapshot) => snapshot.database_dir,
+    let (database_dir, reader) = match read_snapshot(&index_state) {
+        Some(snapshot) => (snapshot.database_dir, snapshot.reader),
         None => {
             return Err(json_error(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -732,6 +743,7 @@ async fn nix_locate_handler(
 
     // CPU-bound search: use spawn_blocking to avoid blocking the tokio runtime.
     let search_task = tokio::task::spawn_blocking(move || {
+        let index_file = database_dir.join("files");
         let file_type: Vec<crate::FileType> = if params.file_type.is_empty() {
             crate::ALL_FILE_TYPES.to_vec()
         } else {
@@ -775,9 +787,11 @@ async fn nix_locate_handler(
             exclude_fhs: params.exclude_fhs,
         };
 
-        crate::search_database_results(&options).map_err(|e| match e {
-            crate::Error::Parse(_) => format!("bad_request: {e}"),
-            _ => format!("search error: {e:?}"),
+        crate::database::search_results_with_reader(&reader, &index_file, &options).map_err(|e| {
+            match e {
+                crate::Error::Parse(_) => format!("bad_request: {e}"),
+                _ => format!("search error: {e:?}"),
+            }
         })
     });
 

@@ -32,6 +32,7 @@ indicatif = { workspace = true }
 indexmap = { workspace = true }
 ahash = { workspace = true }
 papaya = { workspace = true }
+once_cell = "1.21.4"
 scc = { workspace = true }
 quanta = { workspace = true }
 byteorder = { workspace = true }
@@ -75,6 +76,18 @@ harness = false
 
 [[bench]]
 name = "basename_index"
+harness = false
+
+[[bench]]
+name = "entry_index"
+harness = false
+
+[[bench]]
+name = "path_index"
+harness = false
+
+[[bench]]
+name = "ngram_index"
 harness = false
 
 [lints]

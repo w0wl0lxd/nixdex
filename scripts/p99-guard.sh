@@ -4,18 +4,18 @@ set -euo pipefail
 # p99 latency gate for the resident-daemon search path.
 #
 # Two modes:
-#   1. No DB argument (default / CI): run the `locate` criterion bench on the
-#      synthetic fixture. Every bench's mean latency must stay under the gate.
+#   1. No DB argument (default / CI): run the `locate` Criterion bench in
+#      --quick mode. Every benchmark's mean latency must stay under the gate.
 #      This is a regression guard for the entry-index + ngram-index hot paths.
 #   2. DB=<path> provided: run `nixdex locate` against a real `files` index db
-#      and assert hyperfine p99 < 100ms for a representative query set. Requires
+#      and assert hyperfine p99 < 50ms for a representative query set. Requires
 #      a resident daemon (or warm local index) for meaningful warm numbers.
 #
 # Usage:
 #   scripts/p99-guard.sh            # synthetic regression gate
-#   scripts/p99-guard.sh /path/db  # real-DB p99 gate (DB is the index dir)
+#   scripts/p99-guard.sh /path/db   # real-DB p99 gate (DB is the index dir)
 
-GATE_NS=100000000 # 100ms in nanoseconds
+GATE_NS=50000000 # 50ms in nanoseconds
 
 DB="${1:-}"
 
@@ -47,26 +47,53 @@ if [[ -n "$DB" ]]; then
 fi
 
 echo "=== p99 guard: synthetic fixture regression gate ==="
-OUT=$(cargo bench --bench locate 2>&1)
-echo "$OUT" | sed -n '1,200p'
-
-# Parse every `time: [lo mean hi]` line and keep the worst mean.
-if ! echo "$OUT" | grep -q 'time:'; then
-  echo "error: no bench timing captured (did 'cargo bench --bench locate' fail?)" >&2
+TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+# Build the locate benchmark binary directly; in some build roots the artifact
+# is written without the executable bit, so fix permissions before running.
+cargo build --release --bench locate
+BENCH_BIN=$(find "$TARGET_DIR/release/deps" -maxdepth 1 -name 'locate-*' -type f ! -name '*.d' | head -1)
+if [[ -z "$BENCH_BIN" ]]; then
+  echo "error: could not locate locate benchmark binary under $TARGET_DIR/release/deps" >&2
   exit 1
 fi
-WORST=0
-while IFS= read -r mean; do
-  ns=${mean%.*}
-  # criterion prints ns/µs/ms; normalize to ns.
-  case "$mean" in
-  *ms) ns=$(python3 -c "print(int(float('${mean%ms}')*1_000_000))") ;;
-  *us) ns=$(python3 -c "print(int(float('${mean%us}')*1000))") ;;
-  *ns) ns=$ns ;;
-  *s) ns=$(python3 -c "print(int(float('${mean%s}')*1_000_000_000))") ;;
-  esac
-  if ((ns > WORST)); then WORST=$ns; fi
-done < <(echo "$OUT" | grep -oE 'time:\s+\[[0-9.]+ (ns|us|ms|s) [0-9.]+ (ns|us|ms|s) [0-9.]+ (ns|us|ms|s)\]' | grep -oE '[0-9.]+ (ns|us|ms|s)' | sed -n '2p')
+chmod +x "$BENCH_BIN"
+OUT=$("$BENCH_BIN" --bench --quick 2>&1)
+echo "$OUT" | sed -n '1,200p'
+
+# Parse every `time: [lo mean hi]` line, normalize the mean to ns, and keep the worst.
+PY=$(cat <<'PY'
+import re, sys
+
+text = sys.stdin.read()
+pattern = re.compile(
+    r'time:\s+\[([\d.]+)\s+(\S+)\s+([\d.]+)\s+(\S+)\s+([\d.]+)\s+(\S+)\]'
+)
+factors = {
+    'ns': 1,
+    'us': 1_000,
+    '\u00b5s': 1_000,
+    'ms': 1_000_000,
+    's': 1_000_000_000,
+}
+worst = 0
+for m in pattern.finditer(text):
+    mean_val = float(m.group(3))
+    unit = m.group(4)
+    factor = factors.get(unit, 0)
+    if factor == 0:
+        continue
+    ns = int(mean_val * factor)
+    if ns > worst:
+        worst = ns
+print(worst)
+PY
+)
+WORST=$(echo "$OUT" | python3 -c "$PY")
+
+if ! [[ "$WORST" =~ ^[0-9]+$ ]]; then
+  echo "error: no bench timing captured (did the locate benchmark fail?)" >&2
+  exit 1
+fi
 
 echo "worst mean latency: ${WORST}ns (gate ${GATE_NS}ns)"
 if ((WORST > GATE_NS)); then
