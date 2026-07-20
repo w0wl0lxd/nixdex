@@ -15,12 +15,13 @@ fn nix_index_default_db_dir() -> &'static OsStr {
         .as_os_str()
 }
 
-fn main() -> color_eyre::Result<()> {
+#[tokio::main]
+async fn main() -> color_eyre::Result<()> {
     let mut cmd = nixdex_cli::locate::Opts::command();
     cmd = cmd.mut_arg("database", |arg| {
         arg.default_value_os(nix_index_default_db_dir())
     });
     let matches = cmd.get_matches();
     let opts = nixdex_cli::locate::Opts::from_arg_matches(&matches)?;
-    nixdex_cli::locate::run(opts)
+    nixdex_cli::locate::run(opts).await
 }

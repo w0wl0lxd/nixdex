@@ -9,7 +9,7 @@ use clap::Parser;
 use color_eyre::eyre::WrapErr;
 use tracing_subscriber::EnvFilter;
 
-use nixdex_core::database::{SearchMode, SearchOptions, SearchSort, literal_pattern_for};
+use nixdex_core::database::{SearchMode, SearchOptions, SearchSort};
 use nixdex_core::{ALL_FILE_TYPES, FileType};
 
 /// Resolve the default nixdex database directory.
@@ -148,6 +148,12 @@ pub struct Opts {
     /// Exclude results from FHS-style packages (`-fhs` / `-usr-target`).
     #[arg(long)]
     pub exclude_fhs: bool,
+
+    /// Disable the resident daemon and run a local search directly. The daemon
+    /// keeps the index resident for warm sub-100ms queries; without it each
+    /// invocation reloads the index from disk.
+    #[arg(long)]
+    pub no_daemon: bool,
 }
 
 /// Processed form of the CLI options ready for the core search API.
@@ -177,12 +183,11 @@ fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
     let as_regex = matches.regex;
 
     // Plain (non-anchored, non-regex) patterns can use a fast substring search.
-    let literal_pattern = literal_pattern_for(
-        &matches.pattern,
-        as_regex,
-        matches.at_root,
-        matches.whole_name,
-    );
+    let literal_pattern = if matches.regex || matches.at_root || matches.whole_name || matches.pattern.is_empty() {
+        None
+    } else {
+        Some(matches.pattern.clone())
+    };
 
     let exact_basename = if !matches.regex && matches.whole_name && !matches.pattern.is_empty() {
         // The FST is an exact-basename index. It is only safe to use when the
@@ -285,23 +290,40 @@ fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
 }
 
 /// Run a file lookup against the nixdex database.
-pub fn run(matches: Opts) -> color_eyre::Result<()> {
+///
+/// Prefers a resident daemon (auto-spawning one if none is listening) for warm
+/// sub-100ms queries, and falls back to a local search on any daemon failure.
+pub async fn run(matches: Opts) -> color_eyre::Result<()> {
     let _ = color_eyre::install().ok();
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .try_init();
+
+    if !matches.no_daemon && !crate::daemon_client::daemon_disabled() {
+        match locate_via_daemon(&matches).await {
+            Ok(lines) => {
+                for line in lines {
+                    println!("{line}");
+                }
+                return Ok(());
+            }
+            Err(err) => {
+                eprintln!("nix-locate: daemon unavailable ({err}); falling back to local search");
+            }
+        }
+    }
 
     let args = process_args(matches)?;
 
     let options = SearchOptions {
         database: args.database,
         pattern: args.pattern,
-        literal_pattern: args.literal_pattern,
         hash: args.hash,
         package_pattern: args.package_pattern,
         exact_basename: args.exact_basename,
         exact_path: args.exact_path,
         path_prefix: args.path_prefix,
+        literal_pattern: args.literal_pattern,
         file_type: &args.file_type,
         mode: args.mode,
         json: args.json,
@@ -315,6 +337,74 @@ pub fn run(matches: Opts) -> color_eyre::Result<()> {
 
     nixdex_core::search_database(&options).wrap_err("nix-locate failed")?;
     Ok(())
+}
+
+/// Query the resident daemon, spawning one if necessary, and return rendered
+/// output lines. Returns `Err` if no daemon is available or the request fails,
+/// so the caller can fall back to a local search.
+async fn locate_via_daemon(opts: &Opts) -> Result<Vec<String>, crate::daemon_client::DaemonError> {
+    let addr = crate::daemon_client::resolve_addr();
+    let client = crate::daemon_client::ensure_client(&opts.database, &addr, "resident").await;
+    let query = daemon_query(opts);
+    let response = client.locate(&query).await?;
+    Ok(crate::daemon_client::render(
+        &response,
+        opts.json,
+        opts.minimal,
+    ))
+}
+
+/// Build the `/nix-locate` query parameters from the CLI options.
+fn daemon_query(opts: &Opts) -> Vec<(String, String)> {
+    let mut q: Vec<(String, String)> = vec![
+        ("pattern".into(), opts.pattern.clone()),
+        ("regex".into(), opts.regex.to_string()),
+        ("at_root".into(), opts.at_root.to_string()),
+        ("whole_name".into(), opts.whole_name.to_string()),
+        ("minimal".into(), opts.minimal.to_string()),
+        ("count".into(), opts.count.to_string()),
+        ("exclude_fhs".into(), opts.exclude_fhs.to_string()),
+    ];
+    if let Some(p) = &opts.package {
+        q.push(("package".into(), p.clone()));
+    }
+    if let Some(h) = &opts.hash {
+        q.push(("hash".into(), h.clone()));
+    }
+    if let Some(types) = file_type_chars(opts.r#type.as_ref()) {
+        q.push(("type".into(), types));
+    }
+    if let Some(l) = opts.limit {
+        q.push(("limit".into(), l.to_string()));
+    }
+    if let Some(s) = &opts.sort {
+        q.push(("sort".into(), s.clone()));
+    }
+    if let Some(m) = opts.min_size {
+        q.push(("min_size".into(), m.to_string()));
+    }
+    if let Some(m) = opts.max_size {
+        q.push(("max_size".into(), m.to_string()));
+    }
+    q
+}
+
+/// Map the `--type` selection to the single-character codes the daemon expects.
+fn file_type_chars(types: Option<&Vec<FileType>>) -> Option<String> {
+    let types = types?;
+    if types.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for t in types {
+        match t {
+            FileType::Regular { executable: false } => out.push('r'),
+            FileType::Regular { executable: true } => out.push('x'),
+            FileType::Directory => out.push('d'),
+            FileType::Symlink => out.push('s'),
+        }
+    }
+    Some(out)
 }
 
 #[cfg(test)]
