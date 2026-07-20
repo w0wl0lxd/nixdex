@@ -367,6 +367,12 @@ impl PathEntryIndex {
 
     /// Return the full path bytes for a `path-id`.
     pub fn path_bytes(&self, path_id: u32) -> IndexResult<&[u8]> {
+        let count = read_u32_le(&self.offsets, OFFSETS_MAGIC.len() + 4)?;
+        if path_id >= count {
+            return Err(IndexError::Corrupt(format!(
+                "path-id {path_id} >= count {count}"
+            )));
+        }
         // Offsets file: magic (4) + version (4) + count (4) + offsets[]
         let off = read_u32_le(
             &self.offsets,
@@ -471,6 +477,16 @@ fn validate_entries_header(entries: &[u8]) -> IndexResult<()> {
         return Err(IndexError::Corrupt(format!(
             "entries version {ver}, expected {SIDE_VERSION}"
         )));
+    }
+    let count = read_u32_le(entries, ENTRIES_MAGIC.len() + 4)?;
+    let min_len = ENTRIES_MAGIC.len()
+        + 8
+        + (usize::try_from(count)
+            .map_err(|_| IndexError::Corrupt("entry count overflow".into()))?
+            + 1)
+            * 4;
+    if entries.len() < min_len {
+        return Err(IndexError::Corrupt("entries file truncated".into()));
     }
     Ok(())
 }

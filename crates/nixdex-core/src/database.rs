@@ -647,6 +647,11 @@ pub struct Reader {
 }
 
 impl Reader {
+    /// Maximum number of path-level trigram candidates we will materialise
+    /// before falling back to a full frcode scan. Keeps very common trigrams
+    /// (e.g. "bin") from decoding thousands of paths.
+    const PATH_TRIGRAM_CANDIDATE_LIMIT: u64 = 1000;
+
     /// Opens a nix-index / nixdex database located at the given path.
     ///
     /// # Errors
@@ -974,6 +979,7 @@ impl Reader {
     /// literal substring, or the trigram candidate set is empty. Otherwise returns
     /// `Ok(Some(results))` with all matching `(StorePath, FileTreeEntry)` pairs,
     /// pre-filtered by `package_pattern`, `hash`, and `should_include_match`.
+    #[allow(clippy::cognitive_complexity)]
     pub fn search_path_trigram(
         &self,
         pattern: &str,
@@ -1000,6 +1006,14 @@ impl Reader {
 
         if candidates.is_empty() {
             return Ok(Some(Vec::new()));
+        }
+
+        if candidates.len() > Self::PATH_TRIGRAM_CANDIDATE_LIMIT {
+            tracing::debug!(
+                count = candidates.len(),
+                "too many path trigram candidates; falling back to scan"
+            );
+            return Ok(None);
         }
 
         let needle = pattern.as_bytes();

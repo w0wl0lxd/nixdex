@@ -244,9 +244,7 @@ impl PathTrigramIndex {
         for cookie in &cookies {
             let ids = read_ids_at(&self.postings, *cookie)?;
             let mut bm = RoaringBitmap::new();
-            for id in ids {
-                bm.insert(id);
-            }
+            bm.extend(ids);
             lists.push(bm);
         }
 
