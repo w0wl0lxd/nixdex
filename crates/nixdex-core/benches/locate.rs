@@ -181,13 +181,14 @@ fn search_entries_baseline(c: &mut Criterion) {
         group.throughput(Throughput::Elements((count * FILES_PER_PACKAGE) as u64));
         for (label, pattern) in patterns {
             let re = Regex::new(pattern).expect("valid regex");
+            let matcher = PathMatcher::regex(re).expect("matcher");
             group.bench_with_input(
                 BenchmarkId::new(label, count),
-                &(&reader, &re),
-                |b, &(reader, re)| {
+                &(&reader, matcher),
+                |b, (reader, matcher)| {
                     b.iter(|| {
                         let hits = reader
-                            .search_entries(black_box(re), None, None, None, None)
+                            .search_entries(black_box(matcher), None, None, None, None)
                             .expect("search");
                         black_box(hits);
                     });
@@ -212,9 +213,11 @@ fn search_results_baseline(c: &mut Criterion) {
         let dir = db_dir_for(count);
         group.throughput(Throughput::Elements((count * FILES_PER_PACKAGE) as u64));
         for (label, pattern, exact_basename) in queries {
+            let literal_pattern = label.starts_with("literal").then(|| pattern.to_string());
             let opts = SearchOptions {
                 database: dir.clone(),
                 pattern: pattern.to_string(),
+                literal_pattern,
                 hash: None,
                 package_pattern: None,
                 exact_basename: exact_basename.map(String::from),

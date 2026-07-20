@@ -1,0 +1,1 @@
+- Open `zstd::stream::read::Decoder` with `with_buffer` / `single_frame` for `&[u8]` inputs, avoiding an extra `BufReader` layer, the `Cursor` wrapper, and an unnecessary multi-frame scan during database locate operations.

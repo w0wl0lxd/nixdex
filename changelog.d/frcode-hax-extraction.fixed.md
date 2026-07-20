@@ -1,0 +1,1 @@
+- Make `frcode::Decoder::decode` return `&[u8]` instead of `&mut [u8]`, remove `ResizableBuf`'s `DerefMut` impl, and rewrite `read_to_nul` without `continue`, so the module can be extracted by hax without hitting unsupported `&mut` returns or `continue` in loops.

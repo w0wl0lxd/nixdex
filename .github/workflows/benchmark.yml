@@ -5,7 +5,7 @@ on:
   # caught, but only when files that can affect benchmarked code change.
   # Heavy full index benchmarks stay on off-peak scheduled runs.
   pull_request:
-    paths:
+    paths: &benchmark_paths
       - 'crates/nixdex-core/**'
       - 'crates/nixdex-cli/**'
       - 'crates/nixdex/**'
@@ -17,16 +17,7 @@ on:
       - '.github/workflows/benchmark.yml'
   push:
     branches: [main, master]
-    paths:
-      - 'crates/nixdex-core/**'
-      - 'crates/nixdex-cli/**'
-      - 'crates/nixdex/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'criterion.toml'
-      - 'scripts/benchmark-*.sh'
-      - 'justfile'
-      - '.github/workflows/benchmark.yml'
+    paths: *benchmark_paths
   # Run benchmarks off-peak on a dedicated runner schedule to reduce
   # resource contention and get stable wall-clock numbers.
   schedule:
