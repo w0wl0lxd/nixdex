@@ -681,8 +681,8 @@ async fn nix_locate_handler(
         ));
     }
 
-    let database_dir = match read_snapshot(&index_state) {
-        Some(snapshot) => snapshot.database_dir,
+    let (database_dir, reader) = match read_snapshot(&index_state) {
+        Some(snapshot) => (snapshot.database_dir, snapshot.reader),
         None => {
             return Err(json_error(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -743,6 +743,7 @@ async fn nix_locate_handler(
 
     // CPU-bound search: use spawn_blocking to avoid blocking the tokio runtime.
     let search_task = tokio::task::spawn_blocking(move || {
+        let index_file = database_dir.join("files");
         let file_type: Vec<crate::FileType> = if params.file_type.is_empty() {
             crate::ALL_FILE_TYPES.to_vec()
         } else {
@@ -786,9 +787,11 @@ async fn nix_locate_handler(
             exclude_fhs: params.exclude_fhs,
         };
 
-        crate::search_database_results(&options).map_err(|e| match e {
-            crate::Error::Parse(_) => format!("bad_request: {e}"),
-            _ => format!("search error: {e:?}"),
+        crate::database::search_results_with_reader(&reader, &index_file, &options).map_err(|e| {
+            match e {
+                crate::Error::Parse(_) => format!("bad_request: {e}"),
+                _ => format!("search error: {e:?}"),
+            }
         })
     });
 

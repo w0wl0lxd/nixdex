@@ -180,8 +180,7 @@ fn search_entries_baseline(c: &mut Criterion) {
         let reader = Reader::open(&path).expect("open database");
         group.throughput(Throughput::Elements((count * FILES_PER_PACKAGE) as u64));
         for (label, pattern) in patterns {
-            let re = Regex::new(pattern).expect("valid regex");
-            let matcher = PathMatcher::regex(re).expect("matcher");
+            let matcher = Regex::new(pattern).expect("valid regex");
             group.bench_with_input(
                 BenchmarkId::new(label, count),
                 &(&reader, matcher),
@@ -223,7 +222,6 @@ fn search_results_baseline(c: &mut Criterion) {
                 exact_basename: exact_basename.map(String::from),
                 exact_path: None,
                 path_prefix: None,
-                literal_pattern: None,
                 file_type: &[],
                 mode: SearchMode::Minimal,
                 json: false,

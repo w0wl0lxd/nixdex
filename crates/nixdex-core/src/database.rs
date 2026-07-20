@@ -2228,7 +2228,28 @@ pub fn search_results(
     options: &SearchOptions<'_>,
 ) -> crate::Result<Vec<(crate::StorePath, crate::files::FileTreeEntry)>> {
     let index_file = options.database.join("files");
+    let reader = Reader::open(&index_file).map_err(|source| crate::Error::ReadDatabase {
+        path: index_file.clone(),
+        source: Box::new(source),
+    })?;
+    search_results_with_reader(&reader, &index_file, options)
+}
 
+/// Like [`search_results`], but uses an already-opened [`Reader`].
+///
+/// This lets long-running holders such as the resident daemon reuse the same
+/// mmap-backed reader (and any cached decoded frames) across queries instead of
+/// paying the open/decompression cost on every request.
+///
+/// # Errors
+///
+/// Returns an error if the pattern is invalid or the search fails.
+#[allow(clippy::cognitive_complexity)]
+pub fn search_results_with_reader(
+    reader: &Reader,
+    index_file: &Path,
+    options: &SearchOptions<'_>,
+) -> crate::Result<Vec<(crate::StorePath, crate::files::FileTreeEntry)>> {
     let path_pattern = compile_search_regex(&options.pattern, "path")?;
     let package_re = match &options.package_pattern {
         Some(pat) => Some(compile_search_regex(pat, "package")?),
@@ -2236,12 +2257,11 @@ pub fn search_results(
     };
 
     // Resolve ordinals from basename index (for exact basename queries)
-    let basename_ordinals =
-        resolve_package_ordinals(&index_file, options.exact_basename.as_deref());
+    let basename_ordinals = resolve_package_ordinals(index_file, options.exact_basename.as_deref());
 
     // Resolve ordinals from path index (for rooted/prefix queries)
     let path_ordinals = resolve_path_ordinals(
-        &index_file,
+        index_file,
         options.exact_path.as_deref(),
         options.path_prefix.as_deref(),
     );
@@ -2256,7 +2276,7 @@ pub fn search_results(
 
     // Narrow the candidate set further with the trigram inverted index when the
     // query is a literal substring. An empty intersection means nothing matches.
-    let ngram_ordinals = resolve_ngram_ordinals(&index_file, options.literal_pattern.as_deref());
+    let ngram_ordinals = resolve_ngram_ordinals(index_file, options.literal_pattern.as_deref());
 
     let package_ordinals: Option<RoaringBitmap> = match (base_ordinals, ngram_ordinals) {
         (Some(b), Some(ng)) => Some(b & &ng),
@@ -2271,11 +2291,6 @@ pub fn search_results(
     {
         return Ok(Vec::new());
     }
-
-    let reader = Reader::open(&index_file).map_err(|source| crate::Error::ReadDatabase {
-        path: index_file.clone(),
-        source: Box::new(source),
-    })?;
 
     // Try redb index for exact-path lookups when available.
     // Apply the same package/hash filters the full scan would use.
@@ -2315,7 +2330,7 @@ pub fn search_results(
                 package_ordinals.as_ref(),
             )
             .map_err(|source| crate::Error::ReadDatabase {
-                path: index_file,
+                path: index_file.to_path_buf(),
                 source: Box::new(source),
             })?;
     }
