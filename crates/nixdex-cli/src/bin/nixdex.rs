@@ -356,6 +356,30 @@ struct DaemonOpts {
     /// If unset, `/reload` is only accepted from loopback addresses.
     #[arg(long, env = "NIXDEX_ADMIN_TOKEN")]
     admin_token: Option<String>,
+
+    /// How aggressively secondary indexes are loaded. `resident` (default)
+    /// builds all secondary indexes eagerly at startup; `lru` defers the heavy
+    /// entry/ngram indexes so first queries fall back to full scans.
+    #[arg(long, value_enum, default_value_t = IndexCacheModeArg::Resident)]
+    index_cache_mode: IndexCacheModeArg,
+}
+
+/// CLI surface for [`nixdex_core::daemon::IndexCacheMode`].
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum IndexCacheModeArg {
+    /// Build all secondary indexes eagerly at startup.
+    Resident,
+    /// Defer the heavy entry/ngram indexes.
+    Lru,
+}
+
+impl From<IndexCacheModeArg> for nixdex_core::daemon::IndexCacheMode {
+    fn from(value: IndexCacheModeArg) -> Self {
+        match value {
+            IndexCacheModeArg::Resident => Self::Resident,
+            IndexCacheModeArg::Lru => Self::Lru,
+        }
+    }
 }
 
 fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
@@ -536,11 +560,7 @@ fn run_stats(opts: StatsOpts) -> color_eyre::Result<()> {
 }
 
 fn run_which(opts: WhichOpts) -> color_eyre::Result<()> {
-    let files = opts.database.join("files");
-    let reader = nixdex_core::database::Reader::open(&files)
-        .wrap_err_with(|| format!("failed to open index at {}", files.display()))?;
-
-    let providers = find_command_providers(&opts.cmd, &reader)?;
+    let providers = find_command_providers(&opts.cmd, &opts.database)?;
     let Some(first) = providers.first() else {
         color_eyre::eyre::bail!("no package found for command '{}'", opts.cmd);
     };
@@ -606,14 +626,51 @@ fn run_generate_sidecars(opts: GenerateSidecarsOpts) -> color_eyre::Result<()> {
 
 fn find_command_providers(
     cmd: &str,
-    reader: &nixdex_core::database::Reader,
+    db_dir: &std::path::Path,
 ) -> color_eyre::Result<Vec<nixdex_core::StorePath>> {
-    let full_path = if cmd.starts_with('/') {
+    let target = if cmd.starts_with('/') {
         cmd.to_string()
     } else {
         format!("/bin/{cmd}")
     };
-    let pattern = format!("^{}$", regex::escape(&full_path));
+    let basename = match std::path::Path::new(&target)
+        .file_name()
+        .and_then(|s| s.to_str())
+    {
+        Some(s) => s,
+        None => cmd,
+    };
+
+    // Fast path: entry-level basename index (no frame decoding).
+    if let Ok(index) = nixdex_core::entry_index::EntryIndex::open(db_dir)
+        && let Ok(hits) = index.lookup_entries(basename.as_bytes())
+    {
+        let mut providers: Vec<nixdex_core::StorePath> = hits
+            .into_iter()
+            .filter(|(_, entry)| {
+                entry.path.as_slice() == target.as_bytes()
+                    && (entry.node.is_executable()
+                        || matches!(entry.node, nixdex_core::files::FileNode::Symlink { .. }))
+            })
+            .map(|(store_path, _)| store_path)
+            .collect();
+
+        // Prefer top-level packages over non-toplevel matches.
+        providers.sort_by(|a, b| match (a.origin().toplevel, b.origin().toplevel) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.cmp(b),
+        });
+        providers.dedup();
+        return Ok(providers);
+    }
+
+    // Fallback: full scan through the frame decoder.
+    let files = db_dir.join("files");
+    let reader = nixdex_core::database::Reader::open(&files)
+        .wrap_err_with(|| format!("failed to open index at {}", files.display()))?;
+
+    let pattern = format!("^{}$", regex::escape(&target));
     let re = regex::bytes::Regex::new(&pattern).wrap_err("invalid path pattern")?;
 
     let results = reader
@@ -658,11 +715,7 @@ fn run_command_not_found(opts: CommandNotFoundOpts) -> color_eyre::Result<()> {
         );
     }
 
-    let files = opts.database.join("files");
-    let reader = nixdex_core::database::Reader::open(&files)
-        .wrap_err_with(|| format!("failed to open index at {}", files.display()))?;
-
-    let providers = find_command_providers(&opts.cmd, &reader)?;
+    let providers = find_command_providers(&opts.cmd, &opts.database)?;
     let comma = comma_available();
 
     // For execution we only need the command basename; an absolute path like
@@ -950,6 +1003,7 @@ async fn run_daemon(opts: DaemonOpts) -> color_eyre::Result<()> {
         local_database: opts.database,
         local_refresh_interval: std::time::Duration::from_secs(opts.interval),
         admin_token: opts.admin_token,
+        index_cache_mode: opts.index_cache_mode.into(),
     };
 
     nixdex_core::daemon::run(&config)
@@ -992,7 +1046,7 @@ async fn main() -> color_eyre::Result<()> {
         Cmd::GenerateMan(opts) => run_generate_man(opts),
         Cmd::GenerateCompletions(opts) => run_generate_completions(opts),
         Cmd::Index(index_opts) => index::run(index_opts).await,
-        Cmd::Locate(locate_opts) => locate::run(locate_opts),
+        Cmd::Locate(locate_opts) => locate::run(locate_opts).await,
         Cmd::Which(which_opts) => run_which(which_opts),
         Cmd::Update(update_opts) => run_update(update_opts).await,
         Cmd::GenerateSidecars(opts) => run_generate_sidecars(opts),
