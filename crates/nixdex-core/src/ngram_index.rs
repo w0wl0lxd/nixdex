@@ -135,10 +135,11 @@ impl NgramIndexBuilder {
 
         // BTreeMap keeps trigrams sorted — required by `fst::MapBuilder`.
         let mut cookies: Vec<([u8; 3], u64)> = Vec::with_capacity(self.trigrams.len());
+        let mut buf = Vec::new();
         for (trigram, bitmap) in &self.trigrams {
             let cookie = u64::try_from(raw.len())
                 .map_err(|_| Error::Corrupt("postings cookie overflow".into()))?;
-            let mut buf = Vec::new();
+            buf.clear();
             bitmap
                 .serialize_into(&mut buf)
                 .map_err(|e| Error::Corrupt(format!("serialize trigram bitmap: {e}")))?;
@@ -301,9 +302,12 @@ impl NgramIndex {
 
         // Intersect the smallest posting first; short-circuit once the candidate
         // set becomes empty (nothing can match).
-        entries.sort_by_key(|&(_, header)| header);
-        let mut acc = read_bitmap_at(&self.postings, entries.remove(0).0, self.version)?;
-        for (cookie, _) in entries {
+        entries.sort_by_key(|&(_, header)| std::cmp::Reverse(header));
+        let Some((first, _)) = entries.pop() else {
+            return Ok(Some(RoaringBitmap::new()));
+        };
+        let mut acc = read_bitmap_at(&self.postings, first, self.version)?;
+        while let Some((cookie, _)) = entries.pop() {
             let bm = read_bitmap_at(&self.postings, cookie, self.version)?;
             acc &= bm;
             if acc.is_empty() {
