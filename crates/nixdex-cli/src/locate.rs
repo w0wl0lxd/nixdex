@@ -183,12 +183,11 @@ fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
     let as_regex = matches.regex;
 
     // Plain (non-anchored, non-regex) patterns can use a fast substring search.
-    let literal_pattern =
-        if matches.regex || matches.at_root || matches.whole_name || matches.pattern.is_empty() {
-            None
-        } else {
-            Some(matches.pattern.clone())
-        };
+    let literal_pattern = if matches.regex || matches.at_root || matches.whole_name || matches.pattern.is_empty() {
+        None
+    } else {
+        Some(matches.pattern.clone())
+    };
 
     let exact_basename = if !matches.regex && matches.whole_name && !matches.pattern.is_empty() {
         // The FST is an exact-basename index. It is only safe to use when the
