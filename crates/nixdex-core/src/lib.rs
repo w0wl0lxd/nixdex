@@ -6,12 +6,14 @@ pub mod basename_index;
 pub mod cache_dir;
 pub mod daemon;
 pub mod database;
+pub mod entry_index;
 pub mod errors;
 pub mod files;
 pub mod frcode;
 pub mod hydra;
 pub mod index;
 pub mod listings;
+pub mod ngram_index;
 pub mod nixpkgs;
 pub mod package_search;
 pub mod path_cache;
@@ -92,8 +94,7 @@ pub fn search_database(options: &database::SearchOptions<'_>) -> Result<()> {
 pub fn search_database_results(
     options: &database::SearchOptions<'_>,
 ) -> Result<Vec<(StorePath, crate::files::FileTreeEntry)>> {
-    let path_matcher = database::path_matcher_for(options)?;
-    database::search_results(options, &path_matcher)
+    database::search_results(options)
 }
 
 #[cfg(test)]
