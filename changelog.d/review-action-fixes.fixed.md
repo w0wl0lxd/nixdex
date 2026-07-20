@@ -1,0 +1,2 @@
+- Fixed review items: `search_frame_decoder` no longer skips footerless continuation blocks, zstd `Ok(None)` frames use the bounded streaming decoder, and `basename_index` returns an empty list for non-UTF-8 prefixes.
+- Pinned all version-tagged GitHub Actions to their latest release SHAs and added `persist-credentials: false` to checkout steps.

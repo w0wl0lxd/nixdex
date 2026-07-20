@@ -21,7 +21,9 @@ jobs:
     timeout-minutes: 45
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: hacspec/hax-actions@6c734302f9a0434cf590e0ba18c9dd9b28fc6659
         with:
           hax_reference: cargo-hax-v0.3.7
@@ -29,7 +31,7 @@ jobs:
         working-directory: crates/nixdex-core
         run: cargo hax into -i '-** +nixdex_core::frcode::**' fstar
       - name: Upload F* extraction
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: hax-fstar-extraction
           path: crates/nixdex-core/proofs/fstar/extraction/
