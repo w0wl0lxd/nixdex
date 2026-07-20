@@ -107,7 +107,8 @@ jobs:
               ai_strings = re.findall(r"(?m)^\s*'([^']*)'", m.group(1))
               ai_patterns = [re.compile(p, re.I) for p in ai_strings]
           else:
-              ai_patterns = []
+              print('Error: Could not parse AI_ATTR_PATTERNS from hook script.', file=sys.stderr)
+              sys.exit(1)
 
           try:
               shas = subprocess.check_output(['git', 'log', '--format=%H', f'{base}..{head}']).decode().splitlines()
