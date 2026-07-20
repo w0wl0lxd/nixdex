@@ -103,8 +103,6 @@ impl Deref for ResizableBuf {
     }
 }
 
-
-
 /// Decoder for the frcode format. Yields blocks of decoded entries.
 pub struct Decoder<R> {
     reader: R,
