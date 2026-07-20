@@ -249,6 +249,11 @@ struct WhichOpts {
     /// Print the result(s) as JSON.
     #[arg(long)]
     json: bool,
+
+    /// Print one bare `attr.output` per line (compatible with the legacy
+    /// `nix-locate --minimal` output used by the command-not-found hook).
+    #[arg(long)]
+    minimal: bool,
 }
 
 /// Options for `nixdex update`.
@@ -273,6 +278,10 @@ struct UpdateOpts {
     /// Download the `-small` prebuilt variant.
     #[arg(long)]
     small: bool,
+
+    /// Maximum concurrent connections used to download the prebuilt index.
+    #[arg(long, default_value_t = nixdex_core::prebuilt::DEFAULT_MAX_CONNECTIONS)]
+    max_connections: usize,
 }
 
 /// Options for `nixdex generate-sidecars`.
@@ -335,6 +344,10 @@ struct DaemonOpts {
     /// Use the -small variant of the prebuilt index.
     #[arg(long)]
     small: bool,
+
+    /// Maximum concurrent connections used to download the prebuilt index.
+    #[arg(long, default_value_t = nixdex_core::prebuilt::DEFAULT_MAX_CONNECTIONS)]
+    max_connections: usize,
 
     /// Cache directory for prebuilt indexes.
     #[arg(long)]
@@ -536,14 +549,23 @@ fn run_stats(opts: StatsOpts) -> color_eyre::Result<()> {
 }
 
 fn run_which(opts: WhichOpts) -> color_eyre::Result<()> {
-    let files = opts.database.join("files");
-    let reader = nixdex_core::database::Reader::open(&files)
-        .wrap_err_with(|| format!("failed to open index at {}", files.display()))?;
-
-    let providers = find_command_providers(&opts.cmd, &reader)?;
+    let providers = find_command_providers(&opts.cmd, &opts.database)?;
     let Some(first) = providers.first() else {
         color_eyre::eyre::bail!("no package found for command '{}'", opts.cmd);
     };
+
+    if opts.minimal {
+        let fmt =
+            |sp: &nixdex_core::StorePath| format!("{}.{}", sp.origin().attr, sp.origin().output);
+        if opts.all {
+            for provider in &providers {
+                println!("{}", fmt(provider));
+            }
+        } else {
+            println!("{}", fmt(first));
+        }
+        return Ok(());
+    }
 
     if opts.json {
         let output = if opts.all {
@@ -585,6 +607,7 @@ async fn run_update(opts: UpdateOpts) -> color_eyre::Result<()> {
         small: opts.small,
         cache_dir: opts.database.clone(),
         refresh_interval: std::time::Duration::ZERO,
+        max_connections: opts.max_connections,
     };
     let dest = opts.database.join("files");
 
@@ -606,8 +629,142 @@ fn run_generate_sidecars(opts: GenerateSidecarsOpts) -> color_eyre::Result<()> {
 
 fn find_command_providers(
     cmd: &str,
-    reader: &nixdex_core::database::Reader,
+    db_dir: &std::path::Path,
 ) -> color_eyre::Result<Vec<nixdex_core::StorePath>> {
+    let command = std::path::Path::new(cmd)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(cmd);
+
+    // Prefer a running daemon for a sub-millisecond response.
+    if let Some(providers) = daemon_command_lookup(command) {
+        return Ok(finalize_providers(providers));
+    }
+
+    match nixdex_core::command_index::CommandIndex::open(db_dir) {
+        Ok(index) => {
+            let providers = index
+                .lookup_command(command.as_bytes())
+                .map_err(|err| color_eyre::eyre::eyre!("command index lookup failed: {err}"))?;
+            Ok(finalize_providers(providers))
+        }
+        Err(nixdex_core::command_index::Error::Missing { .. }) => {
+            // Indexes built without the command sidecar fall back to a full scan.
+            find_command_providers_scan(cmd, db_dir)
+        }
+        Err(err) => {
+            // Unreadable sidecar: behave as "no providers" rather than failing.
+            eprintln!("warning: command index unreadable: {err}");
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// Convert command providers into `StorePath`s and sort/dedup, preferring
+/// top-level packages.
+fn finalize_providers(
+    providers: Vec<nixdex_core::command_index::CommandProvider>,
+) -> Vec<nixdex_core::StorePath> {
+    let mut store_paths: Vec<nixdex_core::StorePath> = providers
+        .into_iter()
+        .map(|p| {
+            nixdex_core::StorePath::new(
+                String::new(),
+                String::new(),
+                String::new(),
+                nixdex_core::Origin {
+                    attr: p.attr,
+                    output: p.output,
+                    toplevel: p.toplevel,
+                    system: None,
+                },
+            )
+        })
+        .collect();
+    // Prefer top-level packages over non-toplevel matches.
+    store_paths.sort_by(|a, b| match (a.origin().toplevel, b.origin().toplevel) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.cmp(b),
+    });
+    store_paths.dedup();
+    store_paths
+}
+
+/// Query a running `nixdex-daemon` for command providers over a synchronous
+/// HTTP/1.1 connection (no tokio/axum/reqwest dependency, so startup stays
+/// well under a millisecond). Returns `None` when no daemon is reachable or the
+/// response cannot be parsed, letting the caller fall back to the cold sidecar.
+fn daemon_command_lookup(
+    command: &str,
+) -> Option<Vec<nixdex_core::command_index::CommandProvider>> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let addr = std::env::var("NIXDEX_DAEMON_ADDR").unwrap_or_else(|_| "127.0.0.1:3750".to_string());
+    let mut stream = TcpStream::connect(addr).ok()?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(150)))
+        .ok()?;
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_millis(150)))
+        .ok()?;
+
+    let path = format!("/command?name={}", http_query_escape(command));
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAccept: application/json\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).ok()?;
+
+    let sep = resp.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let body = resp.get(sep + 4..)?;
+
+    let parsed: sonic_rs::Value = sonic_rs::from_slice(body).ok()?;
+    use sonic_rs::{JsonContainerTrait, JsonValueTrait};
+    let providers = parsed.get("providers")?.as_array()?;
+
+    let mut out = Vec::with_capacity(providers.len());
+    for p in providers {
+        let attr = p.get("attr")?.as_str()?.to_string();
+        let output = p.get("output")?.as_str()?.to_string();
+        let toplevel = p.get("toplevel").and_then(|v| v.as_bool()).unwrap_or(false);
+        out.push(nixdex_core::command_index::CommandProvider {
+            attr,
+            output,
+            toplevel,
+        });
+    }
+    Some(out)
+}
+
+/// Minimal percent-encoding for an HTTP query parameter.
+fn http_query_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(char::from(b));
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Full-scan fallback used when the command sidecar is absent.
+///
+/// This is the original `Reader`-based implementation and is retained only for
+/// compatibility with prebuilt indexes that predate the command index.
+fn find_command_providers_scan(
+    cmd: &str,
+    db_dir: &std::path::Path,
+) -> color_eyre::Result<Vec<nixdex_core::StorePath>> {
+    let files = db_dir.join("files");
+    let reader = nixdex_core::database::Reader::open(&files)
+        .wrap_err_with(|| format!("failed to open index at {}", files.display()))?;
     let full_path = if cmd.starts_with('/') {
         cmd.to_string()
     } else {
@@ -658,11 +815,7 @@ fn run_command_not_found(opts: CommandNotFoundOpts) -> color_eyre::Result<()> {
         );
     }
 
-    let files = opts.database.join("files");
-    let reader = nixdex_core::database::Reader::open(&files)
-        .wrap_err_with(|| format!("failed to open index at {}", files.display()))?;
-
-    let providers = find_command_providers(&opts.cmd, &reader)?;
+    let providers = find_command_providers(&opts.cmd, &opts.database)?;
     let comma = comma_available();
 
     // For execution we only need the command basename; an absolute path like
@@ -945,6 +1098,7 @@ async fn run_daemon(opts: DaemonOpts) -> color_eyre::Result<()> {
             small: opts.small,
             cache_dir,
             refresh_interval: std::time::Duration::from_secs(opts.interval),
+            max_connections: opts.max_connections,
         },
         http_addr: opts.http_addr,
         local_database: opts.database,

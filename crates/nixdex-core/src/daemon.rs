@@ -42,6 +42,10 @@ struct IndexSnapshot {
     database_dir: PathBuf,
     /// Loaded basename index.
     basename: Arc<BasenameIndex>,
+    /// Loaded path index.
+    path_index: Arc<crate::path_index::PathIndex>,
+    /// Loaded command-provider index.
+    command_index: Arc<crate::command_index::CommandIndex>,
     /// Loaded database reader.
     reader: Arc<Reader>,
     /// Loaded package metadata database, if present.
@@ -345,6 +349,22 @@ fn load_and_store_index(cache_dir: &std::path::Path, index_state: &IndexState) {
         }
     };
 
+    let path_index = match crate::path_index::PathIndex::open(&index_dir) {
+        Ok(index) => index,
+        Err(err) => {
+            tracing::warn!(error = %err, path = %index_dir.display(), "failed to load path index");
+            return;
+        }
+    };
+
+    let command_index = match crate::command_index::CommandIndex::open(&index_dir) {
+        Ok(index) => index,
+        Err(err) => {
+            tracing::warn!(error = %err, path = %index_dir.display(), "failed to load command index");
+            return;
+        }
+    };
+
     let files_path = index_dir.join("files");
     let reader = match Reader::open(&files_path) {
         Ok(reader) => reader,
@@ -372,6 +392,8 @@ fn load_and_store_index(cache_dir: &std::path::Path, index_state: &IndexState) {
     let snapshot = IndexSnapshot {
         database_dir: index_dir.clone(),
         basename: Arc::new(basename),
+        path_index: Arc::new(path_index),
+        command_index: Arc::new(command_index),
         reader: Arc::new(reader),
         package_db,
     };
@@ -531,6 +553,7 @@ async fn run_http_server(addr: &str, index_state: Arc<IndexState>) -> Result<()>
         .route("/locate", get(locate_handler))
         .route("/nix-locate", get(nix_locate_handler))
         .route("/search", get(search_handler))
+        .route("/command", get(command_handler))
         .with_state(index_state);
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -618,8 +641,12 @@ async fn nix_locate_handler(
         ));
     }
 
-    let database_dir = match read_snapshot(&index_state) {
-        Some(snapshot) => snapshot.database_dir,
+    let (database_dir, resident_path, resident_basename) = match read_snapshot(&index_state) {
+        Some(snapshot) => (
+            snapshot.database_dir,
+            Some(std::sync::Arc::clone(&snapshot.path_index)),
+            Some(std::sync::Arc::clone(&snapshot.basename)),
+        ),
         None => {
             return Err(json_error(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -714,7 +741,12 @@ async fn nix_locate_handler(
             exclude_fhs: params.exclude_fhs,
         };
 
-        crate::search_database_results(&options).map_err(|e| match e {
+        let resident = crate::database::ResidentIndexes {
+            path_index: resident_path.as_deref(),
+            basename_index: resident_basename.as_deref(),
+        };
+
+        crate::search_database_results(&options, Some(resident)).map_err(|e| match e {
             crate::Error::Parse(_) => format!("bad_request: {e}"),
             _ => format!("search error: {e:?}"),
         })
@@ -1209,6 +1241,85 @@ struct SearchResponse {
     count: Option<usize>,
     names: Option<Vec<String>>,
     results: Vec<crate::PackageMeta>,
+}
+
+/// Query parameters for `GET /command`.
+#[cfg(feature = "daemon")]
+#[derive(serde::Deserialize)]
+struct CommandParams {
+    /// Command name to look up (e.g. `git`).
+    name: String,
+}
+
+/// A single package that provides a command.
+#[cfg(feature = "daemon")]
+#[derive(Serialize)]
+struct CommandProviderResponse {
+    attr: String,
+    output: String,
+    toplevel: bool,
+}
+
+/// Response for `GET /command`.
+#[cfg(feature = "daemon")]
+#[derive(Serialize)]
+struct CommandResponse {
+    command: String,
+    providers: Vec<CommandProviderResponse>,
+}
+
+/// HTTP handler for `GET /command`.
+///
+/// Resolves the (resident) command-provider index in well under a millisecond;
+/// it never touches the `files` blob or the `redb` reader.
+#[cfg(feature = "daemon")]
+async fn command_handler(
+    State(index_state): State<Arc<IndexState>>,
+    axum::extract::Query(params): axum::extract::Query<CommandParams>,
+) -> std::result::Result<
+    axum::Json<CommandResponse>,
+    (axum::http::StatusCode, axum::Json<ErrorResponse>),
+> {
+    index_state.requests_total.fetch_add(1, Ordering::Relaxed);
+
+    if params.name.is_empty() {
+        return Err(json_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "missing 'name' parameter",
+        ));
+    }
+
+    let name = params.name;
+    let Some(snapshot) = read_snapshot(&index_state) else {
+        return Err(json_error(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "no index loaded",
+        ));
+    };
+
+    let providers = snapshot
+        .command_index
+        .lookup_command(name.as_bytes())
+        .map_err(|err| {
+            json_error(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                err.to_string(),
+            )
+        })?;
+
+    let providers = providers
+        .into_iter()
+        .map(|p| CommandProviderResponse {
+            attr: p.attr,
+            output: p.output,
+            toplevel: p.toplevel,
+        })
+        .collect();
+
+    Ok(axum::Json(CommandResponse {
+        command: name,
+        providers,
+    }))
 }
 
 #[cfg(test)]

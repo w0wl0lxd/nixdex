@@ -204,6 +204,10 @@ pub struct Args {
     /// Download the `-small` prebuilt variant.
     #[arg(long)]
     pub prebuilt_small: bool,
+
+    /// Maximum concurrent connections used to download the prebuilt index.
+    #[arg(long, default_value_t = nixdex_core::prebuilt::DEFAULT_MAX_CONNECTIONS)]
+    pub prebuilt_max_connections: usize,
 }
 
 /// Run the index build.
@@ -222,6 +226,7 @@ pub async fn run(args: Args) -> color_eyre::Result<()> {
             small: args.prebuilt_small,
             cache_dir: args.database.clone(),
             refresh_interval: Duration::ZERO,
+            max_connections: args.prebuilt_max_connections,
         };
         let dest = args.database.join("files");
         nixdex_core::prebuilt::download_to(&config, &dest)
