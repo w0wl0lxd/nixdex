@@ -28,7 +28,7 @@ const SIDE_VERSION: u32 = 1;
 const MAX_IDS_PER_TRIGRAM: usize = 20_000_000;
 
 /// Maximum total size of the postings sidecar (defensive cap).
-const MAX_POSTINGS_BYTES: usize = 2 << 30;
+const MAX_POSTINGS_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
 /// Maximum total size of the FST sidecar (defensive cap).
 const MAX_FST_BYTES: usize = 512 << 20;

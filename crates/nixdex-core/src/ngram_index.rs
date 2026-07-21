@@ -38,7 +38,7 @@ const MAX_ORDINALS_PER_TRIGRAM: usize = 2_000_000;
 const MAX_SERIALIZED_BYTES: usize = 1 << 28;
 
 /// Maximum total size of the postings sidecar (defensive cap).
-const MAX_POSTINGS_BYTES: usize = 1 << 30;
+const MAX_POSTINGS_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 /// Maximum total size of the FST sidecar (defensive cap).
 const MAX_FST_BYTES: usize = 512 << 20;
