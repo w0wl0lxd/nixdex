@@ -85,7 +85,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Restore prebuilt index cache
-        uses: actions/cache@4a148e2d2863fbcf79f81f4f4d5e0bf9b628618e # v4.2.0
+        uses: actions/cache@v4
         with:
           path: ~/.cache/nixdex
           key: nixdex-prebuilt-${{ runner.os }}-${{ hashFiles('crates/nixdex-core/src/prebuilt.rs') }}
