@@ -24,6 +24,10 @@ on:
     - cron: '0 3 * * *'
   workflow_dispatch:
     inputs:
+      runner-label:
+        description: 'Runner label for the locate benchmark (use a self-hosted label for isolated runs)'
+        required: true
+        default: 'ubuntu-latest'
       nixpkgs:
         description: 'nixpkgs expression or path to benchmark'
         required: true
@@ -72,6 +76,35 @@ jobs:
         with:
           name: criterion-report
           path: target/criterion/
+
+  locate-benchmark:
+    name: nixdex locate vs nix-locate
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner-label || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    env:
+      SCCACHE_DIR: /home/runner/.cache/sccache
+      SCCACHE_CACHE_SIZE: 2G
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install build tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sccache clang mold hyperfine
+          if ! command -v nix-locate >/dev/null 2>&1; then
+            sudo apt-get install -y nix-index || true
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Run locate benchmark
+        run: bash scripts/benchmark-locate.sh
+      - name: Upload locate benchmark report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: locate-benchmark-report
+          path: /tmp/nixdex-bench-locate.md
 
   index-benchmark:
     name: nixdex index benchmark
