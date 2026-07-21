@@ -31,7 +31,7 @@ const POSTINGS_MAGIC: &[u8] = b"NBEN";
 const SIDE_VERSION: u32 = 1;
 
 /// Maximum total size of the postings sidecar (defensive cap).
-const MAX_POSTINGS_BYTES: usize = 1 << 30;
+const MAX_POSTINGS_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
 /// Maximum total size of the FST sidecar (defensive cap).
 const MAX_FST_BYTES: usize = 512 << 20;
