@@ -5,7 +5,7 @@
 //! - `files.entry.postings` — cookie → `u32` blob length + postcard blob of
 //!   `Vec<EntryRecord>`
 //! - `files.entryidx.sp` — postcard-serialized `Vec<StorePath>`, indexed by the
-//!   `store_path_idx` stored inside each [`EntryRecord`]
+//!   `store_path_idx` stored inside each `EntryRecord`
 //!
 //! For `command-not-found` / `find_command_providers` we look up an exact
 //! basename, then return every `(StorePath, FileTreeEntry)` that contributes a

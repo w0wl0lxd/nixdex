@@ -1136,8 +1136,7 @@ impl Reader {
             && let Some(basename_index) = self.basename()
             && let Ok(ords) = basename_index.lookup_basename_ordinals(needle)
             && !ords.is_empty()
-        {
-        }
+        {}
 
         let mut results = Vec::new();
         let path_count = entry.path_count();
@@ -1151,7 +1150,8 @@ impl Reader {
                 break;
             }
 
-            let path_id = u32::try_from(path_id).map_err(|_| Error::Corrupt("path_id exceeds u32 range"))?;
+            let path_id =
+                u32::try_from(path_id).map_err(|_| Error::Corrupt("path_id exceeds u32 range"))?;
             let Ok(path) = entry.path_bytes(path_id) else {
                 continue;
             };
@@ -1731,7 +1731,11 @@ impl FrameMatchers {
 /// whose path matches (with `^`→`\0`), and a separate `^p\0` matcher finds the
 /// enclosing package header for each match. A `found_without_package` carry
 /// buffer handles entries whose package header is split across a block boundary.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::cognitive_complexity)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cognitive_complexity
+)]
 fn search_frame_decoder<R: std::io::BufRead>(
     decoder: &mut frcode::Decoder<R>,
     matchers: &FrameMatchers,
@@ -1782,25 +1786,24 @@ fn search_frame_decoder<R: std::io::BufRead>(
         if !found_without_package.is_empty()
             && let Some((_, ord, json_start, json_end)) = package_footers.first()
         {
-                let json = block
-                    .get(*json_start..*json_end)
-                    .ok_or(Error::Corrupt("package json slice out of bounds"))?;
-                let pkg: StorePath =
-                    sonic_rs::from_slice(json).map_err(|_| Error::StorePathParse {
-                        path: json.to_vec(),
-                    })?;
-                let label = format!("{}.{}", pkg.origin().attr, pkg.origin().output);
-                let ok = package_pattern.is_none_or(|re| re.is_match(pkg.name().as_bytes()))
-                    && hash.is_none_or(|h| h == pkg.hash())
-                    && package_labels.is_none_or(|labels| labels.contains(&label))
-                    && package_ordinals.is_none_or(|ords| ords.contains(*ord));
-                if ok {
-                    for entry in found_without_package.split_off(0) {
-                        matches.push((pkg.clone(), entry));
-                    }
-                } else {
-                    found_without_package.clear();
+            let json = block
+                .get(*json_start..*json_end)
+                .ok_or(Error::Corrupt("package json slice out of bounds"))?;
+            let pkg: StorePath = sonic_rs::from_slice(json).map_err(|_| Error::StorePathParse {
+                path: json.to_vec(),
+            })?;
+            let label = format!("{}.{}", pkg.origin().attr, pkg.origin().output);
+            let ok = package_pattern.is_none_or(|re| re.is_match(pkg.name().as_bytes()))
+                && hash.is_none_or(|h| h == pkg.hash())
+                && package_labels.is_none_or(|labels| labels.contains(&label))
+                && package_ordinals.is_none_or(|ords| ords.contains(*ord));
+            if ok {
+                for entry in found_without_package.split_off(0) {
+                    matches.push((pkg.clone(), entry));
                 }
+            } else {
+                found_without_package.clear();
+            }
         }
 
         let mut pos = 0;
@@ -1863,10 +1866,9 @@ fn search_frame_decoder<R: std::io::BufRead>(
             }
 
             if footer_idx != cached_footer_idx {
-                let footer =
-                    package_footers.get(footer_idx).ok_or(Error::Corrupt(
-                        "package footer index out of bounds",
-                    ))?;
+                let footer = package_footers
+                    .get(footer_idx)
+                    .ok_or(Error::Corrupt("package footer index out of bounds"))?;
                 let (_ord, json_start, json_end) = (footer.1, footer.2, footer.3);
                 let json = block
                     .get(json_start..json_end)
@@ -2189,11 +2191,14 @@ fn resolve_path_ordinals(
         let ords = index.lookup_prefix_ordinals(path_prefix?.as_bytes()).ok()?;
         return Some(ords.into_iter().collect());
     };
-    let ords = index.lookup_path_ordinals(path.as_bytes()).map_err(|err| {
-        if path_sidecars_exist(dir) {
-            tracing::warn!(%err, "path index exact lookup failed; falling back to full scan");
-        }
-    }).ok()?;
+    let ords = index
+        .lookup_path_ordinals(path.as_bytes())
+        .map_err(|err| {
+            if path_sidecars_exist(dir) {
+                tracing::warn!(%err, "path index exact lookup failed; falling back to full scan");
+            }
+        })
+        .ok()?;
     Some(ords.into_iter().collect())
 }
 
@@ -2232,7 +2237,9 @@ fn resolve_ngram_ordinals(reader: &Reader, literal: Option<&str>) -> Option<Roar
     if dir.as_os_str().is_empty() {
         return None;
     }
-    reader.ngram()?.candidate_ordinals(pat)
+    reader
+        .ngram()?
+        .candidate_ordinals(pat)
         .map(|bm| bm.map(|b| b.into_iter().collect()))
         .map_err(|err| {
             if ngram_sidecars_exist(dir) {
