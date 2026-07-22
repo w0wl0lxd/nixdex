@@ -3597,6 +3597,100 @@ mod tests {
     }
 
     #[test]
+    fn normalized_path_fast_path_matches_full_scan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+
+        let make_sp = |hash: &str, name: &str, attr: &str| {
+            StorePath::new(
+                "/nix/store".into(),
+                hash.into(),
+                name.into(),
+                Origin {
+                    attr: attr.into(),
+                    output: "out".into(),
+                    toplevel: true,
+                    system: Some("x86_64-linux".into()),
+                },
+            )
+        };
+        let coreutils = make_sp(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "coreutils-9.5",
+            "coreutils",
+        );
+
+        let tree = FileTree::directory(vec![
+            (
+                Bytes::from_static(b"bin"),
+                FileTree::directory(vec![
+                    (Bytes::from_static(b"ls"), FileTree::regular(64472, true)),
+                    (Bytes::from_static(b"cat"), FileTree::regular(64472, true)),
+                ]),
+            ),
+            (
+                Bytes::from_static(b"lib"),
+                FileTree::directory(vec![(
+                    Bytes::from_static(b"libc.so"),
+                    FileTree::regular(64472, false),
+                )]),
+            ),
+        ]);
+
+        {
+            let mut writer = Writer::create(&db_path, 1).expect("create");
+            writer.add(&coreutils, &tree, b"").expect("add");
+            writer.finish().expect("finish");
+        }
+        generate_sidecars(&db_path).expect("sidecars");
+
+        let reader = Reader::open(&db_path).expect("reader");
+
+        let normalize = |results: Vec<(StorePath, FileTreeEntry)>| -> Vec<Vec<u8>> {
+            let mut v: Vec<Vec<u8>> = results
+                .into_iter()
+                .map(|(_, e)| e.path)
+                .collect();
+            v.sort();
+            v
+        };
+
+        for pat in ["bin/ls", "/bin/ls", "lib/libc.so", "/lib/libc.so"] {
+            let re = Regex::new(&regex::escape(pat)).expect("regex");
+            let baseline = reader
+                .search_entries(&re, None, None, None, None)
+                .expect("baseline search");
+
+            let options = SearchOptions {
+                database: dir.path().to_path_buf(),
+                pattern: regex::escape(pat),
+                hash: None,
+                package_pattern: None,
+                exact_basename: None,
+                exact_path: None,
+                path_prefix: None,
+                literal_pattern: Some(pat.into()),
+                file_type: &[],
+                mode: SearchMode::Minimal,
+                json: false,
+                limit: None,
+                count: false,
+                sort: SearchSort::None,
+                min_size: None,
+                max_size: None,
+                exclude_fhs: false,
+            };
+            let pruned = search_results(&options).expect("sidecar search");
+
+            assert_eq!(
+                normalize(pruned),
+                normalize(baseline),
+                "sidecar pruning diverged from full scan for literal {pat:?}"
+            );
+        }
+    }
+
+    #[test]
     fn fast_path_fallbacks_for_regex_and_short_literals() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("files");
