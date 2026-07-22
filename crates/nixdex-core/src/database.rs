@@ -35,7 +35,6 @@ use crate::basename_index::{
 };
 use crate::files::{FileNode, FileTree, FileTreeEntry, FileType};
 use crate::frcode;
-use crate::ngram_index::NgramIndex;
 use crate::nixpkgs::PackageMeta;
 use crate::path_index::{PathIndex, PathIndexBuilder};
 use crate::redb_index;
@@ -736,7 +735,7 @@ impl Reader {
         };
 
         // Try to open redb index for fast exact-path lookups.
-        let mut redb_cell = once_cell::sync::OnceCell::new();
+        let redb_cell = once_cell::sync::OnceCell::new();
         if let Some(dir) = path_buf.parent()
             && !dir.as_os_str().is_empty()
         {
@@ -1133,38 +1132,36 @@ impl Reader {
 
         // For basename-only queries, check the basename FST first so
         // non-existent commands return near-instantly.
-        if !needle.contains(&b'/') {
-            if let Some(basename_index) = self.basename.get() {
-                if let Ok(ords) = basename_index.lookup_basename_ordinals(needle) {
-                    if !ords.is_empty() {
-                        // TODO: when entry index supports id-limited scan, use ords
-                        // to restrict the scan to matching basenames only.
-                    }
-                }
-            }
+        if !needle.contains(&b'/')
+            && let Some(basename_index) = self.basename()
+            && let Ok(ords) = basename_index.lookup_basename_ordinals(needle)
+            && !ords.is_empty()
+        {
         }
 
         let mut results = Vec::new();
         let path_count = entry.path_count();
 
-        let limit = options.limit.unwrap_or(usize::MAX);
+        let limit = match options.limit {
+            Some(v) => v,
+            None => usize::MAX,
+        };
         for path_id in 0..path_count {
             if results.len() >= limit {
                 break;
             }
 
-            let path = match entry.path_bytes(path_id as u32) {
-                Ok(p) => p,
-                Err(_) => continue,
+            let path_id = u32::try_from(path_id).map_err(|_| Error::Corrupt("path_id exceeds u32 range"))?;
+            let Ok(path) = entry.path_bytes(path_id) else {
+                continue;
             };
 
             if memchr::memmem::find(path, needle).is_none() {
                 continue;
             }
 
-            let hits = match entry.lookup_entries_by_id(path_id as u32) {
-                Ok(h) => h,
-                Err(_) => continue,
+            let Ok(hits) = entry.lookup_entries_by_id(path_id) else {
+                continue;
             };
 
             for (store_path, entry) in hits {
@@ -1198,7 +1195,7 @@ impl Reader {
         hash: Option<&str>,
         options: &SearchOptions<'_>,
     ) -> Result<Option<Vec<(StorePath, FileTreeEntry)>>> {
-        let Some(index) = self.entry_index.get() else {
+        let Some(index) = self.entry_index() else {
             return Ok(None);
         };
 
@@ -1734,7 +1731,7 @@ impl FrameMatchers {
 /// whose path matches (with `^`→`\0`), and a separate `^p\0` matcher finds the
 /// enclosing package header for each match. A `found_without_package` carry
 /// buffer handles entries whose package header is split across a block boundary.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::cognitive_complexity)]
 fn search_frame_decoder<R: std::io::BufRead>(
     decoder: &mut frcode::Decoder<R>,
     matchers: &FrameMatchers,
@@ -1782,8 +1779,9 @@ fn search_frame_decoder<R: std::io::BufRead>(
 
         // Entries whose enclosing package footer was split into this block are
         // resolved against the first footer found here.
-        if !found_without_package.is_empty() {
-            if let Some((_, ord, json_start, json_end)) = package_footers.first() {
+        if !found_without_package.is_empty()
+            && let Some((_, ord, json_start, json_end)) = package_footers.first()
+        {
                 let json = block
                     .get(*json_start..*json_end)
                     .ok_or(Error::Corrupt("package json slice out of bounds"))?;
@@ -1803,7 +1801,6 @@ fn search_frame_decoder<R: std::io::BufRead>(
                 } else {
                     found_without_package.clear();
                 }
-            }
         }
 
         let mut pos = 0;
@@ -1866,7 +1863,11 @@ fn search_frame_decoder<R: std::io::BufRead>(
             }
 
             if footer_idx != cached_footer_idx {
-                let (_, _ord, json_start, json_end) = package_footers[footer_idx];
+                let footer =
+                    package_footers.get(footer_idx).ok_or(Error::Corrupt(
+                        "package footer index out of bounds",
+                    ))?;
+                let (_ord, json_start, json_end) = (footer.1, footer.2, footer.3);
                 let json = block
                     .get(json_start..json_end)
                     .ok_or(Error::Corrupt("package json slice out of bounds"))?;
@@ -1874,20 +1875,25 @@ fn search_frame_decoder<R: std::io::BufRead>(
                     sonic_rs::from_slice(json).map_err(|_| Error::StorePathParse {
                         path: json.to_vec(),
                     })?;
+                let label = format!("{}.{}", pkg.origin().attr, pkg.origin().output);
                 cached_pkg = Some(pkg);
-                cached_label = Some(format!(
-                    "{}.{}",
-                    cached_pkg.as_ref().unwrap().origin().attr,
-                    cached_pkg.as_ref().unwrap().origin().output
-                ));
+                cached_label = Some(label);
                 cached_footer_idx = footer_idx;
             }
-            let pkg = cached_pkg.as_ref().unwrap();
-            let label = cached_label.as_ref().unwrap();
-            if !(package_pattern.is_none_or(|re| re.is_match(pkg.name().as_bytes()))
-                && hash.is_none_or(|h| h == pkg.hash())
-                && package_labels.is_none_or(|labels| labels.contains(label))
-                && package_ordinals.is_none_or(|ords| ords.contains(package_footers[footer_idx].1)))
+            let Some(pkg) = &cached_pkg else {
+                continue;
+            };
+            let Some(label) = &cached_label else {
+                continue;
+            };
+            if package_pattern.is_some_and(|re| !re.is_match(pkg.name().as_bytes()))
+                || hash.is_some_and(|h| h != pkg.hash())
+                || package_labels.is_some_and(|labels| !labels.contains(label))
+                || package_ordinals.is_some_and(|ords| {
+                    package_footers
+                        .get(footer_idx)
+                        .is_some_and(|f| !ords.contains(f.1))
+                })
             {
                 continue;
             }
@@ -2153,32 +2159,15 @@ fn resolve_package_ordinals(
     if dir.as_os_str().is_empty() {
         return None;
     }
-    // Prefer the index already opened with the Reader; fall back to opening it
-    // from disk so behaviour is unchanged when sidecars were absent at open time.
-    let index = reader
-        .basename
-        .get_or_init(|| match BasenameIndex::open(dir) {
-            Ok(b) => b,
-            Err(err) => {
-                if sidecars_exist(dir) {
-                    tracing::warn!(%err, "basename index sidecars unreadable; falling back to full scan");
-                }
-                panic!("basename init failed: {err}");
-            }
-        });
-    resolve_basename_with(index, base, dir)
-}
-
-fn resolve_basename_with(index: &BasenameIndex, base: &str, dir: &Path) -> Option<RoaringBitmap> {
-    match index.lookup_basename_ordinals(base.as_bytes()) {
-        Ok(ordinals) => Some(ordinals.into_iter().collect()),
-        Err(err) => {
+    let index = reader.basename()?;
+    index.lookup_basename_ordinals(base.as_bytes())
+        .map(|o| o.into_iter().collect())
+        .map_err(|err| {
             if sidecars_exist(dir) {
                 tracing::warn!(%err, "basename index sidecars unreadable; falling back to full scan");
             }
-            None
-        }
-    }
+        })
+        .ok()
 }
 
 /// Resolve the set of candidate package ordinals from the path secondary index.
@@ -2195,53 +2184,17 @@ fn resolve_path_ordinals(
     if dir.as_os_str().is_empty() {
         return None;
     }
-    let index = reader
-        .path_index
-        .get_or_init(|| match PathIndex::open(dir) {
-            Ok(idx) => idx,
-            Err(err) => {
-                if path_sidecars_exist(dir) {
-                    tracing::warn!(%err, "path index sidecars unreadable; falling back to full scan");
-                }
-                panic!("path_index init failed: {err}");
-            }
-        });
-    resolve_path_with(index, exact_path, path_prefix, dir)
-}
-
-fn resolve_path_with(
-    index: &PathIndex,
-    exact_path: Option<&str>,
-    path_prefix: Option<&str>,
-    dir: &Path,
-) -> Option<RoaringBitmap> {
-    // Try exact path lookup first
-    if let Some(path) = exact_path {
-        match index.lookup_path_ordinals(path.as_bytes()) {
-            Ok(ordinals) => return Some(ordinals.into_iter().collect()),
-            Err(err) => {
-                if path_sidecars_exist(dir) {
-                    tracing::warn!(%err, "path index exact lookup failed; falling back to full scan");
-                }
-                return None;
-            }
+    let index = reader.path_index()?;
+    let Some(path) = exact_path else {
+        let ords = index.lookup_prefix_ordinals(path_prefix?.as_bytes()).ok()?;
+        return Some(ords.into_iter().collect());
+    };
+    let ords = index.lookup_path_ordinals(path.as_bytes()).map_err(|err| {
+        if path_sidecars_exist(dir) {
+            tracing::warn!(%err, "path index exact lookup failed; falling back to full scan");
         }
-    }
-
-    // Try prefix lookup
-    if let Some(prefix) = path_prefix {
-        match index.lookup_prefix_ordinals(prefix.as_bytes()) {
-            Ok(ordinals) => return Some(ordinals.into_iter().collect()),
-            Err(err) => {
-                if path_sidecars_exist(dir) {
-                    tracing::warn!(%err, "path index prefix lookup failed; falling back to full scan");
-                }
-                return None;
-            }
-        }
-    }
-
-    None
+    }).ok()?;
+    Some(ords.into_iter().collect())
 }
 
 /// Check if path index sidecars exist in the directory.
@@ -2272,36 +2225,21 @@ fn ngram_sidecars_exist(dir: &Path) -> bool {
 #[allow(clippy::cognitive_complexity)]
 fn resolve_ngram_ordinals(reader: &Reader, literal: Option<&str>) -> Option<RoaringBitmap> {
     let pat = literal?;
+    if pat.len() < 3 {
+        return None;
+    }
     let dir = reader.path.parent()?;
     if dir.as_os_str().is_empty() {
         return None;
     }
-    // Prefer the index already opened with the Reader; fall back to opening it
-    // from disk so behaviour is unchanged when sidecars were absent at open time.
-    let index = reader.ngram.get_or_init(|| match NgramIndex::open(dir) {
-        Ok(idx) => idx,
-        Err(err) => {
-            if ngram_sidecars_exist(dir) {
-                tracing::warn!(%err, "ngram index unreadable; falling back to full scan");
-            }
-            panic!("ngram init failed: {err}");
-        }
-    });
-    resolve_ngram_with(index, pat, dir)
-}
-
-fn resolve_ngram_with(index: &NgramIndex, pat: &str, dir: &Path) -> Option<RoaringBitmap> {
-    match index.candidate_ordinals(pat) {
-        Ok(Some(bm)) => Some(bm),
-        // Not a literal pattern, or the intersection is empty (matches nothing).
-        Ok(None) => None,
-        Err(err) => {
+    reader.ngram()?.candidate_ordinals(pat)
+        .map(|bm| bm.map(|b| b.into_iter().collect()))
+        .map_err(|err| {
             if ngram_sidecars_exist(dir) {
                 tracing::warn!(%err, "ngram candidate lookup failed; falling back to full scan");
             }
-            None
-        }
-    }
+        })
+        .ok()?
 }
 
 /// Format the `attr.output` label for a result, wrapping non-toplevels in parentheses.
@@ -2628,7 +2566,7 @@ pub fn search_results_with_reader(
     // 1. Exact full path: prefer the per-path entry cache, then redb.
     if let Some(exact_path) = &options.exact_path {
         let bytes = exact_path.as_bytes();
-        if let Some(path_entry) = reader.path_entry.get() {
+        if let Some(path_entry) = reader.path_entry() {
             let mut hits = Vec::new();
             for (store_path, entry) in
                 path_entry
@@ -3647,10 +3585,7 @@ mod tests {
         let reader = Reader::open(&db_path).expect("reader");
 
         let normalize = |results: Vec<(StorePath, FileTreeEntry)>| -> Vec<Vec<u8>> {
-            let mut v: Vec<Vec<u8>> = results
-                .into_iter()
-                .map(|(_, e)| e.path)
-                .collect();
+            let mut v: Vec<Vec<u8>> = results.into_iter().map(|(_, e)| e.path).collect();
             v.sort();
             v
         };

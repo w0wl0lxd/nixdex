@@ -62,7 +62,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y sccache clang mold
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Run SearchDb criterion benchmark
         run: cargo bench --bench search
@@ -85,7 +85,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Restore prebuilt index cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cache/nixdex
           key: nixdex-prebuilt-${{ runner.os }}-${{ hashFiles('crates/nixdex-core/src/prebuilt.rs') }}
@@ -99,7 +99,7 @@ jobs:
           cargo install --locked --path /tmp/nix-index 2>&1 | tail -10
           command -v nix-locate && nix-locate --version
           rm -rf /tmp/nix-index
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Run locate benchmark
         run: bash scripts/benchmark-locate.sh
@@ -130,7 +130,7 @@ jobs:
       - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
         with:
           nix_path: nixpkgs=channel:nixos-unstable
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Build and run index benchmark
         run: |

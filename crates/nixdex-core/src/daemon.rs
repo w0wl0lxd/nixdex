@@ -741,7 +741,6 @@ async fn nix_locate_handler(
 
     let package_pattern = params.package.clone();
 
-
     // CPU-bound search: use spawn_blocking to avoid blocking the tokio runtime.
     let search_task = tokio::task::spawn_blocking(move || {
         let index_file = database_dir.join("files");
