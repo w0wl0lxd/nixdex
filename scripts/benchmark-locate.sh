@@ -37,7 +37,9 @@ if [[ ! -f "$DB_DIR/files" ]]; then
 fi
 
 if ! command -v nix-locate >/dev/null 2>&1; then
-  echo "warning: nix-locate not found; only nixdex will be benchmarked" >&2
+  echo "error: nix-locate not found; cannot run comparison benchmark" >&2
+  echo "Ensure nix-index is installed on the runner before running this script." >&2
+  exit 1
 fi
 
 QUERIES=(

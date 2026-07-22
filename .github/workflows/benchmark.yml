@@ -91,13 +91,14 @@ jobs:
           key: nixdex-prebuilt-${{ runner.os }}-${{ hashFiles('crates/nixdex-core/src/prebuilt.rs') }}
           restore-keys: |
             nixdex-prebuilt-${{ runner.os }}-
-      - name: Install build tooling
+      - name: Install build tooling and nix-locate
         run: |
           sudo apt-get update
           sudo apt-get install -y sccache clang mold hyperfine
-          if ! command -v nix-locate >/dev/null 2>&1; then
-            sudo apt-get install -y nix-index || true
-          fi
+          git clone --depth=1 https://github.com/nix-community/nix-index.git /tmp/nix-index
+          cargo install --locked --path /tmp/nix-index 2>&1 | tail -10
+          command -v nix-locate && nix-locate --version
+          rm -rf /tmp/nix-index
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Run locate benchmark
