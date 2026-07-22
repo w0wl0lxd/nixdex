@@ -656,7 +656,7 @@ impl Reader {
     /// Maximum number of path-level trigram candidates we will materialise
     /// before falling back to a full frcode scan. Keeps very common trigrams
     /// (e.g. "bin") from decoding thousands of paths.
-    const PATH_TRIGRAM_CANDIDATE_LIMIT: u64 = 1000;
+    const PATH_TRIGRAM_CANDIDATE_LIMIT: u64 = 100_000;
 
     /// Opens a nix-index / nixdex database located at the given path.
     ///
@@ -843,8 +843,7 @@ impl Reader {
     #[must_use]
     pub fn path_trigram(&self) -> Option<&crate::path_trigram_index::PathTrigramIndex> {
         Self::open_sidecar(&self.path_trigram, self.path.parent(), |dir| {
-            crate::path_trigram_index::PathTrigramIndex::open(dir)
-                .map_err(Error::PathTrigramIndex)
+            crate::path_trigram_index::PathTrigramIndex::open(dir).map_err(Error::PathTrigramIndex)
         })
     }
 
@@ -1040,10 +1039,10 @@ impl Reader {
         hash: Option<&str>,
         options: &SearchOptions<'_>,
     ) -> Result<Option<Vec<(StorePath, FileTreeEntry)>>> {
-        let Some(trigram) = self.path_trigram.get() else {
+        let Some(trigram) = self.path_trigram() else {
             return Ok(None);
         };
-        let Some(entry) = self.path_entry.get() else {
+        let Some(entry) = self.path_entry() else {
             return Ok(None);
         };
 
@@ -1065,7 +1064,6 @@ impl Reader {
                 return Ok(None);
             }
         };
-
 
         if candidates.is_empty() {
             return Ok(Some(Vec::new()));
@@ -1127,7 +1125,7 @@ impl Reader {
         hash: Option<&str>,
         options: &SearchOptions<'_>,
     ) -> Result<Option<Vec<(StorePath, FileTreeEntry)>>> {
-        let Some(entry) = self.path_entry.get() else {
+        let Some(entry) = self.path_entry() else {
             return Ok(None);
         };
 
@@ -1877,7 +1875,11 @@ fn search_frame_decoder<R: std::io::BufRead>(
                         path: json.to_vec(),
                     })?;
                 cached_pkg = Some(pkg);
-                cached_label = Some(format!("{}.{}", cached_pkg.as_ref().unwrap().origin().attr, cached_pkg.as_ref().unwrap().origin().output));
+                cached_label = Some(format!(
+                    "{}.{}",
+                    cached_pkg.as_ref().unwrap().origin().attr,
+                    cached_pkg.as_ref().unwrap().origin().output
+                ));
                 cached_footer_idx = footer_idx;
             }
             let pkg = cached_pkg.as_ref().unwrap();
@@ -2167,11 +2169,7 @@ fn resolve_package_ordinals(
     resolve_basename_with(index, base, dir)
 }
 
-fn resolve_basename_with(
-    index: &BasenameIndex,
-    base: &str,
-    dir: &Path,
-) -> Option<RoaringBitmap> {
+fn resolve_basename_with(index: &BasenameIndex, base: &str, dir: &Path) -> Option<RoaringBitmap> {
     match index.lookup_basename_ordinals(base.as_bytes()) {
         Ok(ordinals) => Some(ordinals.into_iter().collect()),
         Err(err) => {
@@ -2280,17 +2278,15 @@ fn resolve_ngram_ordinals(reader: &Reader, literal: Option<&str>) -> Option<Roar
     }
     // Prefer the index already opened with the Reader; fall back to opening it
     // from disk so behaviour is unchanged when sidecars were absent at open time.
-    let index = reader
-        .ngram
-        .get_or_init(|| match NgramIndex::open(dir) {
-            Ok(idx) => idx,
-            Err(err) => {
-                if ngram_sidecars_exist(dir) {
-                    tracing::warn!(%err, "ngram index unreadable; falling back to full scan");
-                }
-                panic!("ngram init failed: {err}");
+    let index = reader.ngram.get_or_init(|| match NgramIndex::open(dir) {
+        Ok(idx) => idx,
+        Err(err) => {
+            if ngram_sidecars_exist(dir) {
+                tracing::warn!(%err, "ngram index unreadable; falling back to full scan");
             }
-        });
+            panic!("ngram init failed: {err}");
+        }
+    });
     resolve_ngram_with(index, pat, dir)
 }
 
@@ -2756,7 +2752,6 @@ pub fn search_results_with_reader(
                 source: Box::new(source),
             })?;
     }
-
 
     match options.sort {
         SearchSort::None => {}
