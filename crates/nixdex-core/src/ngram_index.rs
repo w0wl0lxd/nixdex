@@ -225,10 +225,9 @@ impl NgramIndex {
         })
     }
 
-    /// Candidate package ordinals for a LITERAL pattern.
+    /// Candidate package ordinals for a pattern.
     ///
-    /// Returns `Ok(None)` if the pattern is shorter than 3 bytes (no trigram) or
-    /// looks like a regex (contains `. * + ? ( ) [ ] { } | ^ $ \`). Otherwise
+    /// Returns `Ok(None)` if the pattern is shorter than 3 bytes. Otherwise
     /// extracts the pattern's trigrams, intersects their posting lists (AND), and
     /// returns `Some(bitmap)`. An empty intersection yields an empty bitmap
     /// (meaning: matches nothing).
@@ -243,36 +242,10 @@ impl NgramIndex {
     fn candidate_ordinals_inner(&self, pattern: &str) -> Result<Option<RoaringBitmap>> {
         let bytes = pattern.as_bytes();
 
-        // Too short to have a trigram.
         if bytes.len() < 3 {
             return Ok(None);
         }
 
-        // Regex-like characters disqualify the pattern as a literal.
-        if bytes.iter().any(|&b| {
-            matches!(
-                b,
-                b'.' | b'*'
-                    | b'+'
-                    | b'?'
-                    | b'('
-                    | b')'
-                    | b'['
-                    | b']'
-                    | b'{'
-                    | b'}'
-                    | b'|'
-                    | b'^'
-                    | b'$'
-                    | b'\\'
-            )
-        }) {
-            return Ok(None);
-        }
-
-        // Collect all distinct trigrams of the pattern, recording each posting's
-        // leading `u32` header (v1: ordinal count, v2: serialized byte length) so
-        // we can intersect smallest-first without materializing every list up front.
         let mut entries: Vec<(u64, u32)> = Vec::new();
         let mut seen = IndexSet::new();
         for i in 0..bytes.len().saturating_sub(2) {
@@ -495,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn regex_like_pattern_returns_none() {
+    fn nonmatching_special_chars_produce_empty_candidates() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut builder = NgramIndexBuilder::new();
         builder
@@ -508,14 +481,15 @@ mod tests {
             index
                 .candidate_ordinals("firefo*")
                 .expect("candidates")
-                .is_none(),
-            "glob should return None"
+                .is_some_and(|bm| bm.is_empty()),
+            "glob should produce empty candidates"
         );
         assert!(
             index
                 .candidate_ordinals("fire.ox")
                 .expect("candidates")
-                .is_none()
+                .is_some_and(|bm| bm.is_empty()),
+            "non-matching literal should produce empty candidates"
         );
     }
 
