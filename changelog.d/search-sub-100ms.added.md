@@ -1,0 +1,4 @@
+- Add entry-level basename index (`entry_index`) and trigram inverted path index (`ngram_index`) sidecars for sub-100ms `nix-locate` / `command-not-found` / package-search lookups against a warm resident daemon.
+- `nix-locate` now auto-spawns a local daemon when none is listening and queries it over HTTP, falling back to a local scan with `--no-daemon` / `NIXDEX_NO_DAEMON=1`.
+- Add `IndexCacheMode` (`resident` / `lru`) controlling whether heavy sidecar indexes are built eagerly at load or deferred until first use.
+- Add `nixdex-core` benchmarks for entry-lookup and ngram-search, plus a `benchmark-p99` CI guard (`scripts/p99-guard.sh`) enforcing a 100ms p99 budget.

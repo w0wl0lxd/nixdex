@@ -58,8 +58,28 @@ rail-validate:
 validate: secrets fmt check clippy test changelog-check
 
 benchmark:
-    cargo bench --bench search
-    @echo "Run 'just benchmark-index <nixpkgs> [eval|full] [runs]' for a full index build benchmark."
+    cargo bench --benches
+    @echo ""
+    @echo "Shell-level comparisons:"
+    @echo "  just benchmark-index-compare      # nixdex vs nix-index on a tiny set"
+    @echo "  just benchmark-locate [DB_DIR]    # nixdex vs nix-locate"
+    @echo "  just benchmark-search [DB_DIR]    # nixdex search"
+    @echo "  just benchmark-index <nixpkgs> [eval|full] [runs]  # nixdex index build"
+
+benchmark-locate DB='':
+    ./scripts/benchmark-locate.sh "{{DB}}"
+
+benchmark-search DB='':
+    ./scripts/benchmark-search.sh "{{DB}}"
+
+benchmark-index-compare RUNS='5':
+    ./scripts/benchmark-index-comparison.sh '{{RUNS}}'
+
+# p99 latency gate for the resident-daemon search path. With no real DB it
+# exercises the synthetic fixture (regression guard); pass a real `files` index
+# DB path via DB=... to gate against production-scale data.
+benchmark-p99 DB='':
+    ./scripts/p99-guard.sh '{{DB}}'
 
 benchmark-index NIXPKGS='<nixpkgs>' MODE='eval' RUNS='1':
     ./scripts/benchmark-index.sh '{{NIXPKGS}}' '{{MODE}}' '{{RUNS}}'

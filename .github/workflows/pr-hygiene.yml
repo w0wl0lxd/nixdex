@@ -25,6 +25,9 @@ jobs:
     name: conventional title + no AI slop
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Check PR title (Conventional Commits)
         uses: actions/github-script@v7
         with:
@@ -76,38 +79,44 @@ jobs:
             }
 
       - name: Check commits on the PR
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const number = context.payload.pull_request.number;
-            const commits = await github.paginate(github.rest.pulls.listCommits, {
-              owner, repo, pull_number: number, per_page: 100,
-            });
-            const conv = /^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?(!)?: .+/;
-            const ai = [
-              /Generated with/i,
-              /Co-[Aa]uthored-[Bb]y:.*(Devin|Claude|Cursor|Copilot|Codex|Anthropic)/i,
-              /🤖/,
-              /agent@devin/i,
-              /devin-ai-integration/i,
-            ];
-            const failures = [];
-            for (const c of commits) {
-              const msg = c.commit.message || '';
-              const subject = msg.split('\n')[0];
-              const author = `${c.commit.author?.name || ''} <${c.commit.author?.email || ''}>`;
-              if (!conv.test(subject)) {
-                failures.push(`${c.sha.slice(0,7)} non-conventional: ${subject}`);
-              }
-              for (const re of ai) {
-                if (re.test(msg) || re.test(author)) {
-                  failures.push(`${c.sha.slice(0,7)} AI attribution: ${subject}`);
-                  break;
-                }
-              }
-            }
-            if (failures.length) {
-              core.setFailed('Commit hygiene failures:\n' + failures.join('\n'));
-            }
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 - <<'PY'
+          import os, re, subprocess, sys
+
+          base = os.environ['BASE_SHA']
+          head = os.environ['HEAD_SHA']
+
+          conv = re.compile(r'^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?(!)?: .+')
+          ai_patterns = [
+              re.compile(r'Generated with', re.I),
+              re.compile(r'Co-[Aa]uthored-[Bb]y:.*(Devin|Claude|Cursor|Copilot|Codex|Anthropic)', re.I),
+              re.compile(r'🤖'),
+              re.compile(r'agent@devin', re.I),
+              re.compile(r'devin-ai-integration', re.I),
+          ]
+
+          try:
+              shas = subprocess.check_output(['git', 'log', '--format=%H', f'{base}..{head}']).decode().splitlines()
+          except subprocess.CalledProcessError as e:
+              print(f'Failed to list commits: {e}', file=sys.stderr)
+              sys.exit(1)
+
+          failures = []
+          for sha in shas:
+              msg = subprocess.check_output(['git', 'log', '-1', '--format=%s%n%b', sha]).decode()
+              author = subprocess.check_output(['git', 'log', '-1', '--format=%an <%ae>', sha]).decode()
+              subject = msg.splitlines()[0] if msg.splitlines() else ''
+              if not conv.match(subject):
+                  failures.append(f'{sha[:7]} non-conventional: {subject}')
+              for pat in ai_patterns:
+                  if pat.search(msg) or pat.search(author):
+                      failures.append(f'{sha[:7]} AI attribution: {subject}')
+                      break
+
+          if failures:
+              print('\n'.join(failures))
+              sys.exit(1)
+          PY
