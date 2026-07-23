@@ -1,0 +1,1 @@
+- Resolve all clippy errors and warnings in `database.rs`: replace disallowed `unwrap_or`, unsafe `as u32` casts, `unwrap()` on `Option`, indexing panics, and `panic!` in `get_or_init` with safe alternatives; collapse nested `if`/`if let` chains; inline helper functions.
