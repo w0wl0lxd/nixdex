@@ -4,6 +4,9 @@ use std::io::{self, Read};
 
 pub mod basename_index;
 pub mod cache_dir;
+#[cfg(feature = "cdc")]
+pub mod cdc;
+pub mod command_index;
 pub mod daemon;
 pub mod database;
 pub mod entry_index;
@@ -94,13 +97,17 @@ pub fn search_database(options: &database::SearchOptions<'_>) -> Result<()> {
 
 /// Search the database and return matched `(StorePath, FileTreeEntry)` pairs.
 ///
+/// `resident` lets the daemon reuse already-loaded secondary indexes instead
+/// of re-opening their sidecars on every request.
+///
 /// # Errors
 ///
 /// Returns an error if the database cannot be read or the query is unsupported.
 pub fn search_database_results(
     options: &database::SearchOptions<'_>,
+    resident: Option<database::ResidentIndexes<'_>>,
 ) -> Result<Vec<(StorePath, crate::files::FileTreeEntry)>> {
-    database::search_results(options)
+    database::search_results(options, resident)
 }
 
 #[cfg(test)]

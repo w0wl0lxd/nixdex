@@ -55,7 +55,7 @@ command_not_found_handle() {
   done < <(nixdex_db_args)
 
   local attrs
-  attrs=$(@out@/bin/nix-locate "${db_args[@]}" --minimal --no-group --type x --type s --whole-name --at-root "/bin/$cmd")
+  attrs=$(@out@/bin/nixdex which --all --minimal "/bin/$cmd" "${db_args[@]}")
   local len
   len=$(printf '%s\n' "$attrs" | grep -c .)
 

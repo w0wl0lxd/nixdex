@@ -1,20 +1,17 @@
 //! Background daemon support for keeping the nixdex index up to date.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use crate::prebuilt::PrebuiltConfig;
+use crate::basename_index::BasenameIndex;
+use crate::database::Reader;
+use crate::errors::Result;
+use crate::prebuilt::{self, PrebuiltConfig};
+use indexmap::IndexSet;
 
-#[cfg(feature = "daemon")]
-use {
-    crate::basename_index::BasenameIndex, crate::database::Reader, crate::errors::Result,
-    crate::prebuilt, indexmap::IndexSet, std::sync::Arc,
-};
-
-#[cfg(feature = "daemon")]
 /// Maximum length (in bytes) of an HTTP query pattern.
 const MAX_PATTERN_BYTES: usize = 1024;
 
-#[cfg(feature = "daemon")]
 /// Maximum number of results returned by daemon endpoints.
 const MAX_RESULT_LIMIT: usize = 10_000;
 
@@ -45,6 +42,10 @@ struct IndexSnapshot {
     database_dir: PathBuf,
     /// Loaded basename index.
     basename: Arc<BasenameIndex>,
+    /// Loaded path index.
+    path_index: Arc<crate::path_index::PathIndex>,
+    /// Loaded command-provider index.
+    command_index: Arc<crate::command_index::CommandIndex>,
     /// Loaded database reader.
     reader: Arc<Reader>,
     /// Loaded package metadata database, if present.
@@ -75,13 +76,12 @@ fn read_snapshot(index_state: &IndexState) -> Option<IndexSnapshot> {
     }
 }
 
-/// How aggressively the daemon loads secondary indexes into memory.
+/// Index loading strategy for the daemon.
 ///
 /// Both modes keep the (mmap-backed) database reader resident for the lifetime
 /// of the process. The difference is whether the heavy `entry`/`ngram` secondary
 /// indexes are built eagerly at load (`Resident`, the default) or deferred until
-/// they are first needed (`Lru`). `Lru` lowers startup cost and resident memory
-/// at the price of slower first queries that fall back to full scans.
+/// they are first needed (`Lru`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IndexCacheMode {
     /// Build all secondary indexes eagerly at load.
@@ -174,7 +174,7 @@ pub async fn run(config: &DaemonConfig) -> Result<()> {
         local_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            load_and_store_index(local, &index_state, config.index_cache_mode.include_heavy());
+            load_and_store_index(local, &index_state);
             log_daemon_start_local(config, local);
             tokio::select! {
                 _ = local_interval.tick() => {
@@ -221,7 +221,6 @@ pub async fn run(config: &DaemonConfig) -> Result<()> {
         &mut interval,
         &mut reload_rx,
         http_handle,
-        config.index_cache_mode.include_heavy(),
     )
     .await
 }
@@ -263,30 +262,17 @@ async fn run_daemon_loop(
     interval: &mut tokio::time::Interval,
     reload_rx: &mut tokio::sync::mpsc::Receiver<()>,
     http_handle: tokio::task::JoinHandle<Result<()>>,
-    include_heavy: bool,
 ) -> Result<()> {
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                handle_refresh_tick(
-                    prebuilt_config,
-                    cache_dir,
-                    index_state,
-                    include_heavy,
-                )
-                .await;
+                handle_refresh_tick(prebuilt_config, cache_dir, index_state).await;
             }
             result = wait_signal() => {
                 match result {
                     Ok(SignalAction::Reload) => {
                         tracing::info!("received reload signal; refreshing prebuilt index");
-                        handle_refresh_tick(
-                    prebuilt_config,
-                    cache_dir,
-                    index_state,
-                    include_heavy,
-                )
-                .await;
+                        handle_refresh_tick(prebuilt_config, cache_dir, index_state).await;
                     }
                     Ok(SignalAction::Shutdown) => {
                         http_handle.abort();
@@ -301,13 +287,7 @@ async fn run_daemon_loop(
             }
             Some(()) = reload_rx.recv() => {
                 tracing::info!("received /reload request; refreshing prebuilt index");
-                handle_refresh_tick(
-                    prebuilt_config,
-                    cache_dir,
-                    index_state,
-                    include_heavy,
-                )
-                .await;
+                handle_refresh_tick(prebuilt_config, cache_dir, index_state).await;
             }
         }
     }
@@ -366,29 +346,24 @@ async fn handle_refresh_tick(
     prebuilt_config: &PrebuiltConfig,
     cache_dir: &std::path::Path,
     index_state: &IndexState,
-    include_heavy: bool,
 ) {
     tracing::info!("checking for prebuilt index update");
     match refresh_prebuilt(prebuilt_config, cache_dir).await {
-        Ok(()) => load_and_store_index(cache_dir, index_state, include_heavy),
+        Ok(()) => load_and_store_index(cache_dir, index_state),
         Err(err) => tracing::error!(error = %err, "prebuilt refresh failed"),
     }
 }
 
 #[cfg(feature = "daemon")]
 #[allow(clippy::cognitive_complexity)]
-fn load_and_store_index(
-    cache_dir: &std::path::Path,
-    index_state: &IndexState,
-    include_heavy: bool,
-) {
+fn load_and_store_index(cache_dir: &std::path::Path, index_state: &IndexState) {
     let index_dir = if cache_dir.join("files").exists() {
         cache_dir.to_path_buf()
     } else {
         cache_dir.join("current")
     };
 
-    if !ensure_sidecars(&index_dir, include_heavy) {
+    if !ensure_sidecars(&index_dir) {
         return;
     }
 
@@ -396,6 +371,22 @@ fn load_and_store_index(
         Ok(index) => index,
         Err(err) => {
             tracing::warn!(error = %err, path = %index_dir.display(), "failed to load basename index");
+            return;
+        }
+    };
+
+    let path_index = match crate::path_index::PathIndex::open(&index_dir) {
+        Ok(index) => index,
+        Err(err) => {
+            tracing::warn!(error = %err, path = %index_dir.display(), "failed to load path index");
+            return;
+        }
+    };
+
+    let command_index = match crate::command_index::CommandIndex::open(&index_dir) {
+        Ok(index) => index,
+        Err(err) => {
+            tracing::warn!(error = %err, path = %index_dir.display(), "failed to load command index");
             return;
         }
     };
@@ -408,14 +399,6 @@ fn load_and_store_index(
             return;
         }
     };
-
-    // Warm the version 1 frcode cache for long-running daemon usage. This pays
-    // the one-time zstd decompression cost at load time so subsequent searches
-    // scan an in-memory frcode stream instead of decompressing on every query.
-    if let Err(err) = reader.prefetch_v1() {
-        tracing::warn!(error = %err, path = %files_path.display(), "failed to prefetch v1 frcode cache");
-        return;
-    }
 
     let package_db = {
         let packages_json = index_dir.join("packages.json");
@@ -435,6 +418,8 @@ fn load_and_store_index(
     let snapshot = IndexSnapshot {
         database_dir: index_dir.clone(),
         basename: Arc::new(basename),
+        path_index: Arc::new(path_index),
+        command_index: Arc::new(command_index),
         reader: Arc::new(reader),
         package_db,
     };
@@ -447,12 +432,12 @@ fn load_and_store_index(
 }
 
 #[cfg(feature = "daemon")]
-fn ensure_sidecars(index_dir: &std::path::Path, include_heavy: bool) -> bool {
+fn ensure_sidecars(index_dir: &std::path::Path) -> bool {
     let files_path = index_dir.join("files");
     let packages_json = index_dir.join("packages.json");
     if files_path.is_file()
         && !packages_json.is_file()
-        && let Err(err) = crate::database::generate_sidecars_mode(&files_path, include_heavy)
+        && let Err(err) = crate::database::generate_sidecars(&files_path)
     {
         tracing::warn!(
             error = %err,
@@ -594,6 +579,7 @@ async fn run_http_server(addr: &str, index_state: Arc<IndexState>) -> Result<()>
         .route("/locate", get(locate_handler))
         .route("/nix-locate", get(nix_locate_handler))
         .route("/search", get(search_handler))
+        .route("/command", get(command_handler))
         .with_state(index_state);
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -681,8 +667,12 @@ async fn nix_locate_handler(
         ));
     }
 
-    let (database_dir, reader) = match read_snapshot(&index_state) {
-        Some(snapshot) => (snapshot.database_dir, snapshot.reader),
+    let (database_dir, resident_path, resident_basename) = match read_snapshot(&index_state) {
+        Some(snapshot) => (
+            snapshot.database_dir,
+            Some(std::sync::Arc::clone(&snapshot.path_index)),
+            Some(std::sync::Arc::clone(&snapshot.basename)),
+        ),
         None => {
             return Err(json_error(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -700,14 +690,6 @@ async fn nix_locate_handler(
         regex::escape(&params.pattern)
     };
     let pattern = format!("{start_anchor}{pattern_body}{end_anchor}");
-
-    // Plain (non-anchored, non-regex) daemon patterns can use a fast substring search.
-    let literal_pattern =
-        if params.regex || params.at_root || params.whole_name || params.pattern.is_empty() {
-            None
-        } else {
-            Some(params.pattern.clone())
-        };
 
     // Determine whether the secondary indexes can answer this query exactly.
     let exact_basename = if !params.regex && params.whole_name && !params.pattern.is_empty() {
@@ -743,7 +725,6 @@ async fn nix_locate_handler(
 
     // CPU-bound search: use spawn_blocking to avoid blocking the tokio runtime.
     let search_task = tokio::task::spawn_blocking(move || {
-        let index_file = database_dir.join("files");
         let file_type: Vec<crate::FileType> = if params.file_type.is_empty() {
             crate::ALL_FILE_TYPES.to_vec()
         } else {
@@ -771,7 +752,6 @@ async fn nix_locate_handler(
             exact_basename,
             exact_path,
             path_prefix,
-            literal_pattern,
             file_type: &file_type,
             mode: crate::database::SearchMode::Full {
                 color: false,
@@ -785,13 +765,17 @@ async fn nix_locate_handler(
             min_size: params.min_size,
             max_size: params.max_size,
             exclude_fhs: params.exclude_fhs,
+            literal_pattern: (!params.regex && !params.at_root && !params.whole_name && !params.pattern.is_empty()).then(|| params.pattern.clone()),
         };
 
-        crate::database::search_results_with_reader(&reader, &index_file, &options).map_err(|e| {
-            match e {
-                crate::Error::Parse(_) => format!("bad_request: {e}"),
-                _ => format!("search error: {e:?}"),
-            }
+        let resident = crate::database::ResidentIndexes {
+            path_index: resident_path.as_deref(),
+            basename_index: resident_basename.as_deref(),
+        };
+
+        crate::search_database_results(&options, Some(resident)).map_err(|e| match e {
+            crate::Error::Parse(_) => format!("bad_request: {e}"),
+            _ => format!("search error: {e:?}"),
         })
     });
 
@@ -1284,6 +1268,85 @@ struct SearchResponse {
     count: Option<usize>,
     names: Option<Vec<String>>,
     results: Vec<crate::PackageMeta>,
+}
+
+/// Query parameters for `GET /command`.
+#[cfg(feature = "daemon")]
+#[derive(serde::Deserialize)]
+struct CommandParams {
+    /// Command name to look up (e.g. `git`).
+    name: String,
+}
+
+/// A single package that provides a command.
+#[cfg(feature = "daemon")]
+#[derive(Serialize)]
+struct CommandProviderResponse {
+    attr: String,
+    output: String,
+    toplevel: bool,
+}
+
+/// Response for `GET /command`.
+#[cfg(feature = "daemon")]
+#[derive(Serialize)]
+struct CommandResponse {
+    command: String,
+    providers: Vec<CommandProviderResponse>,
+}
+
+/// HTTP handler for `GET /command`.
+///
+/// Resolves the (resident) command-provider index in well under a millisecond;
+/// it never touches the `files` blob or the `redb` reader.
+#[cfg(feature = "daemon")]
+async fn command_handler(
+    State(index_state): State<Arc<IndexState>>,
+    axum::extract::Query(params): axum::extract::Query<CommandParams>,
+) -> std::result::Result<
+    axum::Json<CommandResponse>,
+    (axum::http::StatusCode, axum::Json<ErrorResponse>),
+> {
+    index_state.requests_total.fetch_add(1, Ordering::Relaxed);
+
+    if params.name.is_empty() {
+        return Err(json_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "missing 'name' parameter",
+        ));
+    }
+
+    let name = params.name;
+    let Some(snapshot) = read_snapshot(&index_state) else {
+        return Err(json_error(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "no index loaded",
+        ));
+    };
+
+    let providers = snapshot
+        .command_index
+        .lookup_command(name.as_bytes())
+        .map_err(|err| {
+            json_error(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                err.to_string(),
+            )
+        })?;
+
+    let providers = providers
+        .into_iter()
+        .map(|p| CommandProviderResponse {
+            attr: p.attr,
+            output: p.output,
+            toplevel: p.toplevel,
+        })
+        .collect();
+
+    Ok(axum::Json(CommandResponse {
+        command: name,
+        providers,
+    }))
 }
 
 #[cfg(test)]

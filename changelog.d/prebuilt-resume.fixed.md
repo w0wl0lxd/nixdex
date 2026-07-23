@@ -1,0 +1,2 @@
+- Fix segmented-download resume: transient `5xx`/`429` responses were misclassified as a changed resource, which deleted all segment parts and fell back to a serial download, defeating resumability and masking the resume test.
+- Fix `concat_parts` leaking segment part files (`files.tmp.part-*`) after a successful segmented download; part files are now cleaned up on all segmented-download error paths.
