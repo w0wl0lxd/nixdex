@@ -13,6 +13,7 @@ default = []
 cli = ["dep:clap"]
 daemon = ["dep:axum"]
 prebuilt = []
+cdc = ["dep:fastcdc", "dep:blake3"]
 
 [dependencies]
 tokio = { workspace = true }
@@ -49,6 +50,8 @@ axum = { version = "0.8", features = ["json"], optional = true }
 sha2 = "0.10"
 subtle = "2.6"
 redb = "4.1"
+fastcdc = { version = "3.2.1", optional = true }
+blake3 = { version = "1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -57,6 +60,7 @@ proptest = { workspace = true }
 criterion = { workspace = true }
 divan = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
+axum = "0.8"
 
 [[bench]]
 name = "search"
@@ -68,6 +72,10 @@ harness = false
 
 [[bench]]
 name = "index"
+harness = false
+
+[[bench]]
+name = "cnf"
 harness = false
 
 [[bench]]

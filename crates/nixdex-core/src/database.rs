@@ -179,6 +179,10 @@ pub enum Error {
     /// Path-level trigram index is missing or unreadable.
     #[error("path trigram index: {0}")]
     PathTrigramIndex(#[from] crate::path_trigram_index::Error),
+
+    /// Command-provider secondary index is missing or unreadable.
+    #[error("command index: {0}")]
+    CommandIndex(#[from] crate::command_index::Error),
 }
 
 /// Convenience alias for this module.
@@ -212,6 +216,8 @@ pub struct Writer {
     attrs: Vec<(String, String, String)>,
     /// Optional redb index written alongside the NIXI database.
     redb: Option<redb_index::Writer>,
+    /// Command-provider index accumulated during `add`.
+    command_index: crate::command_index::CommandIndexBuilder,
 }
 
 impl Drop for Writer {
@@ -291,6 +297,7 @@ impl Writer {
             finished: false,
             attrs: Vec::new(),
             redb,
+            command_index: crate::command_index::CommandIndexBuilder::new(),
         })
     }
 
@@ -340,6 +347,16 @@ impl Writer {
         let label = format!("{}.{}", path.origin().attr, path.origin().output);
         let paths: Vec<Vec<u8>> = entries.iter().map(|e| e.path.clone()).collect();
         let ordinal = self.basename_index.record_package(label, paths.clone())?;
+
+        // Record command candidates in the command-provider index.
+        self.command_index
+            .record_package(
+                path.origin().attr.clone(),
+                path.origin().output.clone(),
+                path.origin().toplevel,
+                paths.clone(),
+            )
+            .map_err(Error::CommandIndex)?;
 
         // Record full paths in the path index using the same ordinal
         self.path_index.record_package(ordinal, paths)?;
@@ -511,6 +528,7 @@ impl Writer {
                     self.basename_index.write_sidecars(dir)?;
                     write_attrs_sidecar(dir, &self.attrs)?;
                     self.path_index.write_sidecars(dir)?;
+                    self.command_index.write_sidecars(dir).map_err(Error::CommandIndex)?;
                     if let Some(redb) = self.redb.take() {
                         redb.finish()
                             .map_err(|err| Error::Io(std::io::Error::other(err.to_string())))?;
@@ -562,6 +580,7 @@ impl Writer {
             self.basename_index.write_sidecars(dir)?;
             write_attrs_sidecar(dir, &self.attrs)?;
             self.path_index.write_sidecars(dir)?;
+            self.command_index.write_sidecars(dir).map_err(Error::CommandIndex)?;
             if let Some(redb) = self.redb.take() {
                 redb.finish()
                     .map_err(|err| Error::Io(std::io::Error::other(err.to_string())))?;
@@ -2147,6 +2166,15 @@ pub struct SearchOptions<'a> {
     pub exclude_fhs: bool,
 }
 
+/// Pre-loaded secondary indexes that a long-running holder (e.g. the daemon)
+/// can pass in to avoid re-opening sidecars on every query.
+pub struct ResidentIndexes<'a> {
+    /// Resident path index, if available.
+    pub path_index: Option<&'a crate::path_index::PathIndex>,
+    /// Resident basename index, if available.
+    pub basename_index: Option<&'a crate::basename_index::BasenameIndex>,
+}
+
 /// Resolve the set of candidate package ordinals from the basename secondary index.
 ///
 /// Errors are logged and treated as a full-scan fallback; `None` is returned
@@ -2155,13 +2183,14 @@ pub struct SearchOptions<'a> {
 fn resolve_package_ordinals(
     reader: &Reader,
     exact_basename: Option<&str>,
+    resident: Option<&BasenameIndex>,
 ) -> Option<RoaringBitmap> {
     let base = exact_basename?;
     let dir = reader.path.parent()?;
     if dir.as_os_str().is_empty() {
         return None;
     }
-    let index = reader.basename()?;
+    let index: &BasenameIndex = resident.or_else(|| reader.basename())?;
     index.lookup_basename_ordinals(base.as_bytes())
         .map(|o| o.into_iter().collect())
         .map_err(|err| {
@@ -2181,12 +2210,13 @@ fn resolve_path_ordinals(
     reader: &Reader,
     exact_path: Option<&str>,
     path_prefix: Option<&str>,
+    resident: Option<&crate::path_index::PathIndex>,
 ) -> Option<RoaringBitmap> {
     let dir = reader.path.parent()?;
     if dir.as_os_str().is_empty() {
         return None;
     }
-    let index = reader.path_index()?;
+    let index: &crate::path_index::PathIndex = resident.or_else(|| reader.path_index())?;
     let Some(path) = exact_path else {
         let ords = index.lookup_prefix_ordinals(path_prefix?.as_bytes()).ok()?;
         return Some(ords.into_iter().collect());
@@ -2492,13 +2522,14 @@ fn compile_search_regex(pattern: &str, kind: &str) -> crate::Result<Regex> {
 #[allow(clippy::cognitive_complexity)]
 pub fn search_results(
     options: &SearchOptions<'_>,
+    resident: Option<ResidentIndexes<'_>>,
 ) -> crate::Result<Vec<(crate::StorePath, crate::files::FileTreeEntry)>> {
     let index_file = options.database.join("files");
     let reader = Reader::open(&index_file).map_err(|source| crate::Error::ReadDatabase {
         path: index_file.clone(),
         source: Box::new(source),
     })?;
-    search_results_with_reader(&reader, &index_file, options)
+    search_results_with_reader(&reader, &index_file, options, resident)
 }
 
 /// Like [`search_results`], but uses an already-opened [`Reader`].
@@ -2516,6 +2547,7 @@ pub fn search_results_with_reader(
     reader: &Reader,
     index_file: &Path,
     options: &SearchOptions<'_>,
+    resident: Option<ResidentIndexes<'_>>,
 ) -> crate::Result<Vec<(crate::StorePath, crate::files::FileTreeEntry)>> {
     let path_pattern = compile_search_regex(&options.pattern, "path")?;
     let package_re = match &options.package_pattern {
@@ -2523,14 +2555,22 @@ pub fn search_results_with_reader(
         None => None,
     };
 
+    let basename_index = resident.as_ref().and_then(|r| r.basename_index);
+    let path_index = resident.as_ref().and_then(|r| r.path_index);
+
     // Resolve ordinals from basename index (for exact basename queries)
-    let basename_ordinals = resolve_package_ordinals(reader, options.exact_basename.as_deref());
+    let basename_ordinals = resolve_package_ordinals(
+        reader,
+        options.exact_basename.as_deref(),
+        basename_index,
+    );
 
     // Resolve ordinals from path index (for rooted/prefix queries)
     let path_ordinals = resolve_path_ordinals(
         reader,
         options.exact_path.as_deref(),
         options.path_prefix.as_deref(),
+        path_index,
     );
 
     // Combine basename + path ordinals (union) into the base candidate set.
@@ -2735,7 +2775,7 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
     // Compile the path pattern once with defensive size limits for both the
     // search and the output pass (highlighting, grouping).
     let path_pattern = compile_search_regex(&options.pattern, "path")?;
-    let results = search_results(options)?;
+    let results = search_results(options, None)?;
 
     // Track printed attrs for --minimal de-duplication (ordered set).
     let mut printed_attrs: IndexSet<String> = IndexSet::new();
@@ -2796,6 +2836,7 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
 /// cache mode to defer their construction; queries fall back to full scans
 /// until the sidecars are built.
 #[cfg(feature = "daemon")]
+#[allow(dead_code)]
 pub(crate) fn generate_sidecars_mode(db_path: &Path, include_heavy: bool) -> Result<()> {
     generate_sidecars_impl(db_path, include_heavy)
 }
@@ -3263,7 +3304,7 @@ mod tests {
             exclude_fhs: false,
         };
 
-        let hits = search_results(&options).expect("search");
+        let hits = search_results(&options, None).expect("search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].1.path.as_slice(), b"/bin/hello");
         assert_eq!(hits[0].0.name(), "hello-2.12");
@@ -3460,7 +3501,7 @@ mod tests {
                 max_size: None,
                 exclude_fhs: false,
             };
-            let pruned = search_results(&options).expect("sidecar search");
+            let pruned = search_results(&options, None).expect("sidecar search");
 
             assert_eq!(
                 normalize(pruned),
@@ -3523,7 +3564,7 @@ mod tests {
             max_size: None,
             exclude_fhs: false,
         };
-        let pruned = search_results(&options).expect("entry-index search");
+        let pruned = search_results(&options, None).expect("entry-index search");
 
         let normalize = |results: Vec<(StorePath, FileTreeEntry)>| -> Vec<(String, Vec<u8>)> {
             let mut v: Vec<(String, Vec<u8>)> = results
@@ -3622,7 +3663,7 @@ mod tests {
                 max_size: None,
                 exclude_fhs: false,
             };
-            let pruned = search_results(&options).expect("sidecar search");
+            let pruned = search_results(&options, None).expect("sidecar search");
 
             assert_eq!(
                 normalize(pruned),
@@ -3705,7 +3746,7 @@ mod tests {
         let regex_baseline = reader
             .search_entries(&Regex::new("b.n").expect("regex"), None, None, None, None)
             .expect("baseline");
-        let regex_pruned = search_results(&regex_options).expect("regex search");
+        let regex_pruned = search_results(&regex_options, None).expect("regex search");
         assert_eq!(
             normalize(regex_pruned),
             normalize(regex_baseline),
@@ -3722,7 +3763,7 @@ mod tests {
         let short_baseline = reader
             .search_entries(&Regex::new("he").expect("regex"), None, None, None, None)
             .expect("baseline");
-        let short_pruned = search_results(&short_options).expect("short literal search");
+        let short_pruned = search_results(&short_options, None).expect("short literal search");
         assert_eq!(
             normalize(short_pruned),
             normalize(short_baseline),
@@ -3777,7 +3818,7 @@ mod tests {
             max_size: None,
             exclude_fhs: false,
         };
-        let pruned = search_results(&options).expect("fallback search");
+        let pruned = search_results(&options, None).expect("fallback search");
 
         let mut baseline: Vec<_> = baseline.into_iter().map(|(_, e)| e.path).collect();
         baseline.sort();

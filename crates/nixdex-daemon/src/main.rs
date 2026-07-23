@@ -26,6 +26,10 @@ struct Args {
     #[arg(long)]
     small: bool,
 
+    /// Maximum concurrent connections used to download the prebuilt index.
+    #[arg(long, default_value_t = nixdex_core::prebuilt::DEFAULT_MAX_CONNECTIONS)]
+    max_connections: usize,
+
     /// Cache directory for prebuilt indexes.
     #[arg(long)]
     cache_dir: Option<PathBuf>,
@@ -94,6 +98,7 @@ async fn main() -> color_eyre::Result<()> {
         small: args.small,
         cache_dir,
         refresh_interval: Duration::from_secs(args.interval),
+        max_connections: args.max_connections,
     };
 
     let config = nixdex_core::daemon::DaemonConfig {
