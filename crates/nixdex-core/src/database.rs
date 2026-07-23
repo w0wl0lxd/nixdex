@@ -35,7 +35,6 @@ use crate::basename_index::{
 };
 use crate::files::{FileNode, FileTree, FileTreeEntry, FileType};
 use crate::frcode;
-use crate::ngram_index::NgramIndex;
 use crate::nixpkgs::PackageMeta;
 use crate::path_index::{PathIndex, PathIndexBuilder};
 use crate::redb_index;
@@ -633,13 +632,19 @@ pub struct Reader {
     /// For each frame, the first package ordinal in that frame.
     frame_starts: Option<Vec<u32>>,
     /// Optional redb reader for fast exact-path lookups.
-    redb: Option<redb_index::Reader>,
+    redb: once_cell::sync::OnceCell<redb_index::Reader>,
     /// Optional path-level trigram index for fast literal substring queries.
-    path_trigram: Option<crate::path_trigram_index::PathTrigramIndex>,
+    path_trigram: once_cell::sync::OnceCell<crate::path_trigram_index::PathTrigramIndex>,
     /// Optional per-path entry cache for fast result materialisation.
-    path_entry: Option<crate::path_entry_index::PathEntryIndex>,
+    path_entry: once_cell::sync::OnceCell<crate::path_entry_index::PathEntryIndex>,
     /// Optional basename-based entry cache for fast `nixdex locate -w` queries.
-    entry_index: Option<crate::entry_index::EntryIndex>,
+    entry_index: once_cell::sync::OnceCell<crate::entry_index::EntryIndex>,
+    /// Optional trigram (n-gram) inverted index for fast literal substring candidate pruning.
+    ngram: once_cell::sync::OnceCell<crate::ngram_index::NgramIndex>,
+    /// Optional basename index for exact-basename candidate resolution.
+    basename: once_cell::sync::OnceCell<crate::basename_index::BasenameIndex>,
+    /// Optional path index for exact/prefix path candidate resolution.
+    path_index: once_cell::sync::OnceCell<crate::path_index::PathIndex>,
     /// Cached decompressed frcode data for version 1 databases. Version 1 uses
     /// a single large zstd frame; caching the decoded bytes lets repeated
     /// searches (in particular the daemon) avoid decompressing it every query.
@@ -650,7 +655,7 @@ impl Reader {
     /// Maximum number of path-level trigram candidates we will materialise
     /// before falling back to a full frcode scan. Keeps very common trigrams
     /// (e.g. "bin") from decoding thousands of paths.
-    const PATH_TRIGRAM_CANDIDATE_LIMIT: u64 = 1000;
+    const PATH_TRIGRAM_CANDIDATE_LIMIT: u64 = 100_000;
 
     /// Opens a nix-index / nixdex database located at the given path.
     ///
@@ -730,49 +735,17 @@ impl Reader {
         };
 
         // Try to open redb index for fast exact-path lookups.
-        let redb = if let Some(dir) = path_buf.parent()
+        let redb_cell = once_cell::sync::OnceCell::new();
+        if let Some(dir) = path_buf.parent()
             && !dir.as_os_str().is_empty()
         {
             match redb_index::Reader::open(dir) {
-                Ok(r) => Some(r),
+                Ok(r) => _ = redb_cell.set(r),
                 Err(err) => {
                     tracing::debug!(%err, "redb index unavailable; falling back to scan");
-                    None
                 }
             }
-        } else {
-            None
-        };
-
-        // Try to open the path-level trigram and entry sidecars.
-        let (path_trigram, path_entry, entry_index) = if let Some(dir) = path_buf.parent()
-            && !dir.as_os_str().is_empty()
-        {
-            let trigram = match crate::path_trigram_index::PathTrigramIndex::open(dir) {
-                Ok(t) => Some(t),
-                Err(err) => {
-                    tracing::debug!(%err, "path trigram index unavailable; falling back to scan");
-                    None
-                }
-            };
-            let path_entry = match crate::path_entry_index::PathEntryIndex::open(dir) {
-                Ok(e) => Some(e),
-                Err(err) => {
-                    tracing::debug!(%err, "path entry index unavailable; falling back to scan");
-                    None
-                }
-            };
-            let entry_index = match crate::entry_index::EntryIndex::open(dir) {
-                Ok(e) => Some(e),
-                Err(err) => {
-                    tracing::debug!(%err, "entry index unavailable; falling back to scan");
-                    None
-                }
-            };
-            (trigram, path_entry, entry_index)
-        } else {
-            (None, None, None)
-        };
+        }
 
         Ok(Self {
             path: path_buf,
@@ -781,14 +754,16 @@ impl Reader {
             frames,
             frame_map,
             frame_starts,
-            redb,
-            path_trigram,
-            path_entry,
-            entry_index,
+            redb: redb_cell,
+            path_trigram: once_cell::sync::OnceCell::new(),
+            path_entry: once_cell::sync::OnceCell::new(),
+            entry_index: once_cell::sync::OnceCell::new(),
+            ngram: once_cell::sync::OnceCell::new(),
+            basename: once_cell::sync::OnceCell::new(),
+            path_index: once_cell::sync::OnceCell::new(),
             v1_decompressed: once_cell::sync::OnceCell::new(),
         })
     }
-
     /// Return the path this reader was opened against.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -834,6 +809,81 @@ impl Reader {
             self.v1_decompressed()?;
         }
         Ok(())
+    }
+
+    fn open_sidecar<'a, T, F>(
+        cell: &'a once_cell::sync::OnceCell<T>,
+        dir: Option<&'a Path>,
+        open: F,
+    ) -> Option<&'a T>
+    where
+        F: FnOnce(&Path) -> Result<T>,
+    {
+        let dir = match dir {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => return None,
+        };
+        match cell.get_or_try_init(|| open(dir)) {
+            Ok(index) => Some(index),
+            Err(err) => {
+                tracing::debug!(%err, "sidecar unavailable; falling back to scan");
+                None
+            }
+        }
+    }
+
+    /// Returns the redb reader if available, loading it lazily on first access.
+    #[must_use]
+    pub fn redb(&self) -> Option<&redb_index::Reader> {
+        self.redb.get()
+    }
+
+    /// Returns the path-level trigram index if available, loading it lazily.
+    #[must_use]
+    pub fn path_trigram(&self) -> Option<&crate::path_trigram_index::PathTrigramIndex> {
+        Self::open_sidecar(&self.path_trigram, self.path.parent(), |dir| {
+            crate::path_trigram_index::PathTrigramIndex::open(dir).map_err(Error::PathTrigramIndex)
+        })
+    }
+
+    /// Returns the per-path entry cache if available, loading it lazily.
+    #[must_use]
+    pub fn path_entry(&self) -> Option<&crate::path_entry_index::PathEntryIndex> {
+        Self::open_sidecar(&self.path_entry, self.path.parent(), |dir| {
+            crate::path_entry_index::PathEntryIndex::open(dir).map_err(Error::PathEntryIndex)
+        })
+    }
+
+    /// Returns the basename-based entry index if available, loading it lazily.
+    #[must_use]
+    pub fn entry_index(&self) -> Option<&crate::entry_index::EntryIndex> {
+        Self::open_sidecar(&self.entry_index, self.path.parent(), |dir| {
+            crate::entry_index::EntryIndex::open(dir).map_err(Error::EntryIndex)
+        })
+    }
+
+    /// Returns the ngram inverted index if available, loading it lazily.
+    #[must_use]
+    pub fn ngram(&self) -> Option<&crate::ngram_index::NgramIndex> {
+        Self::open_sidecar(&self.ngram, self.path.parent(), |dir| {
+            crate::ngram_index::NgramIndex::open(dir).map_err(Error::NgramIndex)
+        })
+    }
+
+    /// Returns the basename index if available, loading it lazily.
+    #[must_use]
+    pub fn basename(&self) -> Option<&crate::basename_index::BasenameIndex> {
+        Self::open_sidecar(&self.basename, self.path.parent(), |dir| {
+            crate::basename_index::BasenameIndex::open(dir).map_err(Error::SecondaryIndex)
+        })
+    }
+
+    /// Returns the path index if available, loading it lazily.
+    #[must_use]
+    pub fn path_index(&self) -> Option<&crate::path_index::PathIndex> {
+        Self::open_sidecar(&self.path_index, self.path.parent(), |dir| {
+            crate::path_index::PathIndex::open(dir).map_err(Error::PathIndex)
+        })
     }
 
     /// Scan every frame in parallel, yielding `(StorePath, FileTreeEntry)` matches.
@@ -988,12 +1038,22 @@ impl Reader {
         hash: Option<&str>,
         options: &SearchOptions<'_>,
     ) -> Result<Option<Vec<(StorePath, FileTreeEntry)>>> {
-        let Some(trigram) = &self.path_trigram else {
+        let Some(trigram) = self.path_trigram() else {
             return Ok(None);
         };
-        let Some(entry) = &self.path_entry else {
+        let Some(entry) = self.path_entry() else {
             return Ok(None);
         };
+
+        if pattern.len() < 3 {
+            return self.search_short_literal(
+                pattern,
+                path_pattern,
+                package_pattern,
+                hash,
+                options,
+            );
+        }
 
         let candidates = match trigram.candidate_path_ids(pattern) {
             Ok(Some(ids)) => ids,
@@ -1043,6 +1103,86 @@ impl Reader {
         Ok(Some(results))
     }
 
+    /// Fast literal-substring search for short patterns (< 3 chars) by scanning
+    /// all paths in the entry index.
+    ///
+    /// Trigram indexes require at least 3 characters, so short patterns fall
+    /// through to a full frcode scan. This method uses the resident path-entry
+    /// sidecar to avoid decoding the entire database.
+    ///
+    /// For basename-only queries (no `/`), the basename FST is checked first
+    /// so non-existent commands return near-instantly.
+    ///
+    /// Returns `Ok(None)` if the sidecar is missing. Otherwise returns
+    /// `Ok(Some(results))` with all matching `(StorePath, FileTreeEntry)` pairs,
+    /// pre-filtered by `package_pattern`, `hash`, and `should_include_match`.
+    pub fn search_short_literal(
+        &self,
+        pattern: &str,
+        path_pattern: &Regex,
+        package_pattern: Option<&Regex>,
+        hash: Option<&str>,
+        options: &SearchOptions<'_>,
+    ) -> Result<Option<Vec<(StorePath, FileTreeEntry)>>> {
+        let Some(entry) = self.path_entry() else {
+            return Ok(None);
+        };
+
+        let needle = pattern.as_bytes();
+
+        // For basename-only queries, check the basename FST first so
+        // non-existent commands return near-instantly.
+        if !needle.contains(&b'/')
+            && let Some(basename_index) = self.basename()
+            && let Ok(ords) = basename_index.lookup_basename_ordinals(needle)
+            && !ords.is_empty()
+        {}
+
+        let mut results = Vec::new();
+        let path_count = entry.path_count();
+
+        let limit = match options.limit {
+            Some(v) => v,
+            None => usize::MAX,
+        };
+        for path_id in 0..path_count {
+            if results.len() >= limit {
+                break;
+            }
+
+            let path_id =
+                u32::try_from(path_id).map_err(|_| Error::Corrupt("path_id exceeds u32 range"))?;
+            let Ok(path) = entry.path_bytes(path_id) else {
+                continue;
+            };
+
+            if memchr::memmem::find(path, needle).is_none() {
+                continue;
+            }
+
+            let Ok(hits) = entry.lookup_entries_by_id(path_id) else {
+                continue;
+            };
+
+            for (store_path, entry) in hits {
+                if results.len() >= limit {
+                    break;
+                }
+                if package_pattern.is_some_and(|re| !re.is_match(store_path.name().as_bytes())) {
+                    continue;
+                }
+                if hash.is_some_and(|h| h != store_path.hash()) {
+                    continue;
+                }
+                if should_include_match(options, path_pattern, &store_path, &entry) {
+                    results.push((store_path, entry));
+                }
+            }
+        }
+
+        Ok(Some(results))
+    }
+
     /// Fast exact-basename search using the basename-based entry sidecar.
     ///
     /// Returns `Ok(None)` if the sidecar is missing. Otherwise returns
@@ -1055,7 +1195,7 @@ impl Reader {
         hash: Option<&str>,
         options: &SearchOptions<'_>,
     ) -> Result<Option<Vec<(StorePath, FileTreeEntry)>>> {
-        let Some(index) = &self.entry_index else {
+        let Some(index) = self.entry_index() else {
             return Ok(None);
         };
 
@@ -1591,7 +1731,11 @@ impl FrameMatchers {
 /// whose path matches (with `^`→`\0`), and a separate `^p\0` matcher finds the
 /// enclosing package header for each match. A `found_without_package` carry
 /// buffer handles entries whose package header is split across a block boundary.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cognitive_complexity
+)]
 fn search_frame_decoder<R: std::io::BufRead>(
     decoder: &mut frcode::Decoder<R>,
     matchers: &FrameMatchers,
@@ -1639,37 +1783,34 @@ fn search_frame_decoder<R: std::io::BufRead>(
 
         // Entries whose enclosing package footer was split into this block are
         // resolved against the first footer found here.
-        if !found_without_package.is_empty() {
-            if let Some((_, ord, json_start, json_end)) = package_footers.first() {
-                let json = block
-                    .get(*json_start..*json_end)
-                    .ok_or(Error::Corrupt("package json slice out of bounds"))?;
-                let pkg: StorePath =
-                    sonic_rs::from_slice(json).map_err(|_| Error::StorePathParse {
-                        path: json.to_vec(),
-                    })?;
-                let label = format!("{}.{}", pkg.origin().attr, pkg.origin().output);
-                let ok = package_pattern.is_none_or(|re| re.is_match(pkg.name().as_bytes()))
-                    && hash.is_none_or(|h| h == pkg.hash())
-                    && package_labels.is_none_or(|labels| labels.contains(&label))
-                    && package_ordinals.is_none_or(|ords| ords.contains(*ord));
-                if ok {
-                    for entry in found_without_package.split_off(0) {
-                        matches.push((pkg.clone(), entry));
-                    }
-                } else {
-                    found_without_package.clear();
+        if !found_without_package.is_empty()
+            && let Some((_, ord, json_start, json_end)) = package_footers.first()
+        {
+            let json = block
+                .get(*json_start..*json_end)
+                .ok_or(Error::Corrupt("package json slice out of bounds"))?;
+            let pkg: StorePath = sonic_rs::from_slice(json).map_err(|_| Error::StorePathParse {
+                path: json.to_vec(),
+            })?;
+            let label = format!("{}.{}", pkg.origin().attr, pkg.origin().output);
+            let ok = package_pattern.is_none_or(|re| re.is_match(pkg.name().as_bytes()))
+                && hash.is_none_or(|h| h == pkg.hash())
+                && package_labels.is_none_or(|labels| labels.contains(&label))
+                && package_ordinals.is_none_or(|ords| ords.contains(*ord));
+            if ok {
+                for entry in found_without_package.split_off(0) {
+                    matches.push((pkg.clone(), entry));
                 }
             } else {
-                // No package footer in this block yet. Fall through to the path
-                // scan so entries whose footer is in a later block are carried
-                // forward instead of being skipped. If this is the final block,
-                // the end-of-loop check below will report a missing footer.
+                found_without_package.clear();
             }
         }
 
         let mut pos = 0;
         let mut footer_idx = 0;
+        let mut cached_footer_idx = usize::MAX;
+        let mut cached_pkg: Option<StorePath> = None;
+        let mut cached_label: Option<String> = None;
         while let Some((line_start, line_end)) =
             next_matching_line(&matchers.path_matcher, block, pos)
         {
@@ -1720,30 +1861,46 @@ fn search_frame_decoder<R: std::io::BufRead>(
             };
 
             if footer_idx >= package_footers.len() {
-                // The package footer is in a later block.
                 found_without_package.push(ft_entry);
                 continue;
             }
 
-            let (_, ord, json_start, json_end) = package_footers
-                .get(footer_idx)
-                .ok_or(Error::Corrupt("package footer index out of bounds"))?;
-            let json = block
-                .get(*json_start..*json_end)
-                .ok_or(Error::Corrupt("package json slice out of bounds"))?;
-            let pkg: StorePath = sonic_rs::from_slice(json).map_err(|_| Error::StorePathParse {
-                path: json.to_vec(),
-            })?;
-            let label = format!("{}.{}", pkg.origin().attr, pkg.origin().output);
-            if !(package_pattern.is_none_or(|re| re.is_match(pkg.name().as_bytes()))
-                && hash.is_none_or(|h| h == pkg.hash())
-                && package_labels.is_none_or(|labels| labels.contains(&label))
-                && package_ordinals.is_none_or(|ords| ords.contains(*ord)))
+            if footer_idx != cached_footer_idx {
+                let footer = package_footers
+                    .get(footer_idx)
+                    .ok_or(Error::Corrupt("package footer index out of bounds"))?;
+                let (_ord, json_start, json_end) = (footer.1, footer.2, footer.3);
+                let json = block
+                    .get(json_start..json_end)
+                    .ok_or(Error::Corrupt("package json slice out of bounds"))?;
+                let pkg: StorePath =
+                    sonic_rs::from_slice(json).map_err(|_| Error::StorePathParse {
+                        path: json.to_vec(),
+                    })?;
+                let label = format!("{}.{}", pkg.origin().attr, pkg.origin().output);
+                cached_pkg = Some(pkg);
+                cached_label = Some(label);
+                cached_footer_idx = footer_idx;
+            }
+            let Some(pkg) = &cached_pkg else {
+                continue;
+            };
+            let Some(label) = &cached_label else {
+                continue;
+            };
+            if package_pattern.is_some_and(|re| !re.is_match(pkg.name().as_bytes()))
+                || hash.is_some_and(|h| h != pkg.hash())
+                || package_labels.is_some_and(|labels| !labels.contains(label))
+                || package_ordinals.is_some_and(|ords| {
+                    package_footers
+                        .get(footer_idx)
+                        .is_some_and(|f| !ords.contains(f.1))
+                })
             {
                 continue;
             }
 
-            matches.push((pkg, ft_entry));
+            matches.push((pkg.clone(), ft_entry));
         }
     }
 
@@ -1996,31 +2153,23 @@ pub struct SearchOptions<'a> {
 /// when there are no sidecar candidates.
 #[allow(clippy::cognitive_complexity)]
 fn resolve_package_ordinals(
-    index_file: &Path,
+    reader: &Reader,
     exact_basename: Option<&str>,
 ) -> Option<RoaringBitmap> {
     let base = exact_basename?;
-    let dir = index_file.parent()?;
+    let dir = reader.path.parent()?;
     if dir.as_os_str().is_empty() {
         return None;
     }
-    match BasenameIndex::open(dir) {
-        Ok(index) => match index.lookup_basename_ordinals(base.as_bytes()) {
-            Ok(ordinals) => Some(ordinals.into_iter().collect()),
-            Err(err) => {
-                if sidecars_exist(dir) {
-                    tracing::warn!(%err, "basename index sidecars unreadable; falling back to full scan");
-                }
-                None
-            }
-        },
-        Err(err) => {
+    let index = reader.basename()?;
+    index.lookup_basename_ordinals(base.as_bytes())
+        .map(|o| o.into_iter().collect())
+        .map_err(|err| {
             if sidecars_exist(dir) {
                 tracing::warn!(%err, "basename index sidecars unreadable; falling back to full scan");
             }
-            None
-        }
-    }
+        })
+        .ok()
 }
 
 /// Resolve the set of candidate package ordinals from the path secondary index.
@@ -2029,56 +2178,28 @@ fn resolve_package_ordinals(
 /// treated as a full-scan fallback; `None` is returned when there are no sidecar candidates.
 #[allow(clippy::cognitive_complexity)]
 fn resolve_path_ordinals(
-    index_file: &Path,
+    reader: &Reader,
     exact_path: Option<&str>,
     path_prefix: Option<&str>,
 ) -> Option<RoaringBitmap> {
-    let dir = index_file.parent()?;
+    let dir = reader.path.parent()?;
     if dir.as_os_str().is_empty() {
         return None;
     }
-
-    let index = match PathIndex::open(dir) {
-        Ok(idx) => idx,
-        Err(err) => {
-            if path_sidecars_exist(dir) {
-                tracing::warn!(%err, "path index sidecars unreadable; falling back to full scan");
-            }
-            return None;
-        }
+    let index = reader.path_index()?;
+    let Some(path) = exact_path else {
+        let ords = index.lookup_prefix_ordinals(path_prefix?.as_bytes()).ok()?;
+        return Some(ords.into_iter().collect());
     };
-
-    // Try exact path lookup first
-    if let Some(path) = exact_path {
-        match index.lookup_path_ordinals(path.as_bytes()) {
-            Ok(ordinals) => {
-                return Some(ordinals.into_iter().collect());
+    let ords = index
+        .lookup_path_ordinals(path.as_bytes())
+        .map_err(|err| {
+            if path_sidecars_exist(dir) {
+                tracing::warn!(%err, "path index exact lookup failed; falling back to full scan");
             }
-            Err(err) => {
-                if path_sidecars_exist(dir) {
-                    tracing::warn!(%err, "path index exact lookup failed; falling back to full scan");
-                }
-                return None;
-            }
-        }
-    }
-
-    // Try prefix lookup
-    if let Some(prefix) = path_prefix {
-        match index.lookup_prefix_ordinals(prefix.as_bytes()) {
-            Ok(ordinals) => {
-                return Some(ordinals.into_iter().collect());
-            }
-            Err(err) => {
-                if path_sidecars_exist(dir) {
-                    tracing::warn!(%err, "path index prefix lookup failed; falling back to full scan");
-                }
-                return None;
-            }
-        }
-    }
-
-    None
+        })
+        .ok()?;
+    Some(ords.into_iter().collect())
 }
 
 /// Check if path index sidecars exist in the directory.
@@ -2107,32 +2228,25 @@ fn ngram_sidecars_exist(dir: &Path) -> bool {
 /// Returns `None` when the pattern is not literal (too short / regex-like), the
 /// sidecars are absent, or they are unreadable — callers fall back to a full scan.
 #[allow(clippy::cognitive_complexity)]
-fn resolve_ngram_ordinals(index_file: &Path, literal: Option<&str>) -> Option<RoaringBitmap> {
+fn resolve_ngram_ordinals(reader: &Reader, literal: Option<&str>) -> Option<RoaringBitmap> {
     let pat = literal?;
-    let dir = index_file.parent()?;
+    if pat.len() < 3 {
+        return None;
+    }
+    let dir = reader.path.parent()?;
     if dir.as_os_str().is_empty() {
         return None;
     }
-    let index = match NgramIndex::open(dir) {
-        Ok(idx) => idx,
-        Err(err) => {
-            if ngram_sidecars_exist(dir) {
-                tracing::warn!(%err, "ngram index unreadable; falling back to full scan");
-            }
-            return None;
-        }
-    };
-    match index.candidate_ordinals(pat) {
-        Ok(Some(bm)) => Some(bm),
-        // Not a literal pattern, or the intersection is empty (matches nothing).
-        Ok(None) => None,
-        Err(err) => {
+    reader
+        .ngram()?
+        .candidate_ordinals(pat)
+        .map(|bm| bm.map(|b| b.into_iter().collect()))
+        .map_err(|err| {
             if ngram_sidecars_exist(dir) {
                 tracing::warn!(%err, "ngram candidate lookup failed; falling back to full scan");
             }
-            None
-        }
-    }
+        })
+        .ok()?
 }
 
 /// Format the `attr.output` label for a result, wrapping non-toplevels in parentheses.
@@ -2410,11 +2524,11 @@ pub fn search_results_with_reader(
     };
 
     // Resolve ordinals from basename index (for exact basename queries)
-    let basename_ordinals = resolve_package_ordinals(index_file, options.exact_basename.as_deref());
+    let basename_ordinals = resolve_package_ordinals(reader, options.exact_basename.as_deref());
 
     // Resolve ordinals from path index (for rooted/prefix queries)
     let path_ordinals = resolve_path_ordinals(
-        index_file,
+        reader,
         options.exact_path.as_deref(),
         options.path_prefix.as_deref(),
     );
@@ -2429,7 +2543,7 @@ pub fn search_results_with_reader(
 
     // Narrow the candidate set further with the trigram inverted index when the
     // query is a literal substring. An empty intersection means nothing matches.
-    let ngram_ordinals = resolve_ngram_ordinals(index_file, options.literal_pattern.as_deref());
+    let ngram_ordinals = resolve_ngram_ordinals(reader, options.literal_pattern.as_deref());
 
     let package_ordinals: Option<RoaringBitmap> = match (base_ordinals, ngram_ordinals) {
         (Some(b), Some(ng)) => Some(b & &ng),
@@ -2459,7 +2573,7 @@ pub fn search_results_with_reader(
     // 1. Exact full path: prefer the per-path entry cache, then redb.
     if let Some(exact_path) = &options.exact_path {
         let bytes = exact_path.as_bytes();
-        if let Some(path_entry) = &reader.path_entry {
+        if let Some(path_entry) = reader.path_entry() {
             let mut hits = Vec::new();
             for (store_path, entry) in
                 path_entry
@@ -2483,7 +2597,7 @@ pub fn search_results_with_reader(
             }
             results = hits;
             used_fast_path = true;
-        } else if let Some(redb) = &reader.redb {
+        } else if let Some(redb) = reader.redb.get() {
             let mut hits = Vec::new();
             match redb.exact_path_entries(bytes) {
                 Ok(Some(redb_hits)) => {
@@ -3425,6 +3539,97 @@ mod tests {
             normalize(baseline),
             "entry-index exact basename diverged from full scan"
         );
+    }
+
+    #[test]
+    fn normalized_path_fast_path_matches_full_scan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+
+        let make_sp = |hash: &str, name: &str, attr: &str| {
+            StorePath::new(
+                "/nix/store".into(),
+                hash.into(),
+                name.into(),
+                Origin {
+                    attr: attr.into(),
+                    output: "out".into(),
+                    toplevel: true,
+                    system: Some("x86_64-linux".into()),
+                },
+            )
+        };
+        let coreutils = make_sp(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "coreutils-9.5",
+            "coreutils",
+        );
+
+        let tree = FileTree::directory(vec![
+            (
+                Bytes::from_static(b"bin"),
+                FileTree::directory(vec![
+                    (Bytes::from_static(b"ls"), FileTree::regular(64472, true)),
+                    (Bytes::from_static(b"cat"), FileTree::regular(64472, true)),
+                ]),
+            ),
+            (
+                Bytes::from_static(b"lib"),
+                FileTree::directory(vec![(
+                    Bytes::from_static(b"libc.so"),
+                    FileTree::regular(64472, false),
+                )]),
+            ),
+        ]);
+
+        {
+            let mut writer = Writer::create(&db_path, 1).expect("create");
+            writer.add(&coreutils, &tree, b"").expect("add");
+            writer.finish().expect("finish");
+        }
+        generate_sidecars(&db_path).expect("sidecars");
+
+        let reader = Reader::open(&db_path).expect("reader");
+
+        let normalize = |results: Vec<(StorePath, FileTreeEntry)>| -> Vec<Vec<u8>> {
+            let mut v: Vec<Vec<u8>> = results.into_iter().map(|(_, e)| e.path).collect();
+            v.sort();
+            v
+        };
+
+        for pat in ["bin/ls", "/bin/ls", "lib/libc.so", "/lib/libc.so"] {
+            let re = Regex::new(&regex::escape(pat)).expect("regex");
+            let baseline = reader
+                .search_entries(&re, None, None, None, None)
+                .expect("baseline search");
+
+            let options = SearchOptions {
+                database: dir.path().to_path_buf(),
+                pattern: regex::escape(pat),
+                hash: None,
+                package_pattern: None,
+                exact_basename: None,
+                exact_path: None,
+                path_prefix: None,
+                literal_pattern: Some(pat.into()),
+                file_type: &[],
+                mode: SearchMode::Minimal,
+                json: false,
+                limit: None,
+                count: false,
+                sort: SearchSort::None,
+                min_size: None,
+                max_size: None,
+                exclude_fhs: false,
+            };
+            let pruned = search_results(&options).expect("sidecar search");
+
+            assert_eq!(
+                normalize(pruned),
+                normalize(baseline),
+                "sidecar pruning diverged from full scan for literal {pat:?}"
+            );
+        }
     }
 
     #[test]

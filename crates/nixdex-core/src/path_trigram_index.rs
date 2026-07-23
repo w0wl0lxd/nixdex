@@ -28,7 +28,7 @@ const SIDE_VERSION: u32 = 1;
 const MAX_IDS_PER_TRIGRAM: usize = 20_000_000;
 
 /// Maximum total size of the postings sidecar (defensive cap).
-const MAX_POSTINGS_BYTES: usize = 2 << 30;
+const MAX_POSTINGS_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
 /// Maximum total size of the FST sidecar (defensive cap).
 const MAX_FST_BYTES: usize = 512 << 20;
@@ -185,10 +185,10 @@ impl PathTrigramIndex {
         Ok(Self { map, postings })
     }
 
-    /// Candidate path-ids for a LITERAL pattern.
+    /// Candidate path-ids for a pattern.
     ///
-    /// Returns `Ok(None)` if the pattern is shorter than 3 bytes or looks like a
-    /// regex. Otherwise returns `Some(bitmap)`. An empty bitmap means no matches.
+    /// Returns `Ok(None)` if the pattern is shorter than 3 bytes. Otherwise
+    /// returns `Some(bitmap)`. An empty bitmap means no matches.
     pub fn candidate_path_ids(&self, pattern: &str) -> Result<Option<RoaringBitmap>> {
         self.candidate_path_ids_inner(pattern)
     }
@@ -197,27 +197,6 @@ impl PathTrigramIndex {
         let bytes = pattern.as_bytes();
 
         if bytes.len() < 3 {
-            return Ok(None);
-        }
-
-        if bytes.iter().any(|&b| {
-            matches!(
-                b,
-                b'.' | b'*'
-                    | b'+'
-                    | b'?'
-                    | b'('
-                    | b')'
-                    | b'['
-                    | b']'
-                    | b'{'
-                    | b'}'
-                    | b'|'
-                    | b'^'
-                    | b'$'
-                    | b'\\'
-            )
-        }) {
             return Ok(None);
         }
 
