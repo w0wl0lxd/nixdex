@@ -76,6 +76,29 @@ fn read_snapshot(index_state: &IndexState) -> Option<IndexSnapshot> {
     }
 }
 
+/// Index loading strategy for the daemon.
+///
+/// Both modes keep the (mmap-backed) database reader resident for the lifetime
+/// of the process. The difference is whether the heavy `entry`/`ngram` secondary
+/// indexes are built eagerly at load (`Resident`, the default) or deferred until
+/// they are first needed (`Lru`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IndexCacheMode {
+    /// Build all secondary indexes eagerly at load.
+    #[default]
+    Resident,
+    /// Defer the heavy entry/ngram indexes; build them lazily on first use.
+    Lru,
+}
+
+impl IndexCacheMode {
+    /// Whether the heavy `entry`/`ngram` secondary indexes should be generated.
+    #[must_use]
+    pub fn include_heavy(self) -> bool {
+        matches!(self, Self::Resident)
+    }
+}
+
 /// Configuration for a prebuilt-index daemon.
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
@@ -90,6 +113,8 @@ pub struct DaemonConfig {
     /// Bearer token required for the `POST /reload` admin endpoint.
     /// If unset, `/reload` is only accepted from loopback addresses.
     pub admin_token: Option<String>,
+    /// How aggressively secondary indexes are loaded into memory.
+    pub index_cache_mode: IndexCacheMode,
 }
 
 impl Default for DaemonConfig {
@@ -100,6 +125,7 @@ impl Default for DaemonConfig {
             local_database: None,
             local_refresh_interval: std::time::Duration::from_secs(3600),
             admin_token: None,
+            index_cache_mode: IndexCacheMode::Resident,
         }
     }
 }
@@ -739,6 +765,7 @@ async fn nix_locate_handler(
             min_size: params.min_size,
             max_size: params.max_size,
             exclude_fhs: params.exclude_fhs,
+            literal_pattern: (!params.regex && !params.at_root && !params.whole_name && !params.pattern.is_empty()).then(|| params.pattern.clone()),
         };
 
         let resident = crate::database::ResidentIndexes {

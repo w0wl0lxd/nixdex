@@ -369,6 +369,30 @@ struct DaemonOpts {
     /// If unset, `/reload` is only accepted from loopback addresses.
     #[arg(long, env = "NIXDEX_ADMIN_TOKEN")]
     admin_token: Option<String>,
+
+    /// How aggressively secondary indexes are loaded. `resident` (default)
+    /// builds all secondary indexes eagerly at startup; `lru` defers the heavy
+    /// entry/ngram indexes so first queries fall back to full scans.
+    #[arg(long, value_enum, default_value_t = IndexCacheModeArg::Resident)]
+    index_cache_mode: IndexCacheModeArg,
+}
+
+/// CLI surface for [`nixdex_core::daemon::IndexCacheMode`].
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum IndexCacheModeArg {
+    /// Build all secondary indexes eagerly at startup.
+    Resident,
+    /// Defer the heavy entry/ngram indexes.
+    Lru,
+}
+
+impl From<IndexCacheModeArg> for nixdex_core::daemon::IndexCacheMode {
+    fn from(value: IndexCacheModeArg) -> Self {
+        match value {
+            IndexCacheModeArg::Resident => Self::Resident,
+            IndexCacheModeArg::Lru => Self::Lru,
+        }
+    }
 }
 
 fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
@@ -758,7 +782,9 @@ fn http_query_escape(s: &str) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(char::from(b));
             }
-            _ => out.push_str(&format!("%{b:02X}")),
+            _ => {
+                let _ = std::fmt::Write::write_fmt(&mut out, format_args!("%{b:02X}"));
+            }
         }
     }
     out
@@ -1114,6 +1140,7 @@ async fn run_daemon(opts: DaemonOpts) -> color_eyre::Result<()> {
         local_database: opts.database,
         local_refresh_interval: std::time::Duration::from_secs(opts.interval),
         admin_token: opts.admin_token,
+        index_cache_mode: opts.index_cache_mode.into(),
     };
 
     nixdex_core::daemon::run(&config)
@@ -1156,7 +1183,7 @@ async fn main() -> color_eyre::Result<()> {
         Cmd::GenerateMan(opts) => run_generate_man(opts),
         Cmd::GenerateCompletions(opts) => run_generate_completions(opts),
         Cmd::Index(index_opts) => index::run(index_opts).await,
-        Cmd::Locate(locate_opts) => locate::run(locate_opts),
+        Cmd::Locate(locate_opts) => locate::run(locate_opts).await,
         Cmd::Which(which_opts) => run_which(which_opts),
         Cmd::Update(update_opts) => run_update(update_opts).await,
         Cmd::GenerateSidecars(opts) => run_generate_sidecars(opts),

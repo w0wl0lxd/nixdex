@@ -16,10 +16,13 @@ use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 
 use byteorder::{LittleEndian, WriteBytesExt};
+use grep::matcher::{LineMatchKind, Matcher, NoError};
+use grep::regex::RegexMatcherBuilder;
 use memchr;
 use mmap_guard;
 use rayon::prelude::*;
 use regex::bytes::{Regex, RegexBuilder};
+use regex_syntax::ast::{AssertionKind, Ast};
 use serde::Serialize;
 use sonic_rs;
 use thiserror::Error;
@@ -137,6 +140,10 @@ pub enum Error {
     #[error("invalid search pattern: {0}")]
     Regex(#[from] regex::Error),
 
+    /// ripgrep `grep` matcher compilation failed.
+    #[error("grep matcher error: {0}")]
+    Grep(String),
+
     /// Local filesystem I/O failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -156,6 +163,22 @@ pub enum Error {
     /// Path secondary index is missing or unreadable.
     #[error("path index: {0}")]
     PathIndex(#[from] crate::path_index::Error),
+
+    /// Entry-level secondary index is missing or unreadable.
+    #[error("entry index: {0}")]
+    EntryIndex(#[from] crate::entry_index::IndexError),
+
+    /// Trigram (n-gram) secondary index is missing or unreadable.
+    #[error("ngram index: {0}")]
+    NgramIndex(#[from] crate::ngram_index::Error),
+
+    /// Path-level per-entry cache is missing or unreadable.
+    #[error("path entry index: {0}")]
+    PathEntryIndex(#[from] crate::path_entry_index::IndexError),
+
+    /// Path-level trigram index is missing or unreadable.
+    #[error("path trigram index: {0}")]
+    PathTrigramIndex(#[from] crate::path_trigram_index::Error),
 
     /// Command-provider secondary index is missing or unreadable.
     #[error("command index: {0}")]
@@ -179,8 +202,6 @@ pub struct Writer {
     boundaries: Vec<usize>,
     /// Optional basename index accumulated during `add`.
     basename_index: BasenameIndexBuilder,
-    /// Optional command-provider index accumulated during `add`.
-    command_index: crate::command_index::CommandIndexBuilder,
     /// Optional path index accumulated during `add`.
     path_index: PathIndexBuilder,
     /// Open file handle for streaming frame writes.
@@ -195,6 +216,8 @@ pub struct Writer {
     attrs: Vec<(String, String, String)>,
     /// Optional redb index written alongside the NIXI database.
     redb: Option<redb_index::Writer>,
+    /// Command-provider index accumulated during `add`.
+    command_index: crate::command_index::CommandIndexBuilder,
 }
 
 impl Drop for Writer {
@@ -267,7 +290,6 @@ impl Writer {
             raw: Vec::new(),
             boundaries: Vec::new(),
             basename_index: BasenameIndexBuilder::new(),
-            command_index: crate::command_index::CommandIndexBuilder::new(),
             path_index: PathIndexBuilder::new(),
             file: Some(file),
             frame_lengths: Vec::new(),
@@ -275,6 +297,7 @@ impl Writer {
             finished: false,
             attrs: Vec::new(),
             redb,
+            command_index: crate::command_index::CommandIndexBuilder::new(),
         })
     }
 
@@ -505,7 +528,7 @@ impl Writer {
                     self.basename_index.write_sidecars(dir)?;
                     write_attrs_sidecar(dir, &self.attrs)?;
                     self.path_index.write_sidecars(dir)?;
-                    self.command_index.write_sidecars(dir)?;
+                    self.command_index.write_sidecars(dir).map_err(Error::CommandIndex)?;
                     if let Some(redb) = self.redb.take() {
                         redb.finish()
                             .map_err(|err| Error::Io(std::io::Error::other(err.to_string())))?;
@@ -557,7 +580,7 @@ impl Writer {
             self.basename_index.write_sidecars(dir)?;
             write_attrs_sidecar(dir, &self.attrs)?;
             self.path_index.write_sidecars(dir)?;
-            self.command_index.write_sidecars(dir)?;
+            self.command_index.write_sidecars(dir).map_err(Error::CommandIndex)?;
             if let Some(redb) = self.redb.take() {
                 redb.finish()
                     .map_err(|err| Error::Io(std::io::Error::other(err.to_string())))?;
@@ -628,16 +651,38 @@ pub struct Reader {
     /// For each frame, the first package ordinal in that frame.
     frame_starts: Option<Vec<u32>>,
     /// Optional redb reader for fast exact-path lookups.
-    redb: Option<redb_index::Reader>,
+    redb: once_cell::sync::OnceCell<redb_index::Reader>,
+    /// Optional path-level trigram index for fast literal substring queries.
+    path_trigram: once_cell::sync::OnceCell<crate::path_trigram_index::PathTrigramIndex>,
+    /// Optional per-path entry cache for fast result materialisation.
+    path_entry: once_cell::sync::OnceCell<crate::path_entry_index::PathEntryIndex>,
+    /// Optional basename-based entry cache for fast `nixdex locate -w` queries.
+    entry_index: once_cell::sync::OnceCell<crate::entry_index::EntryIndex>,
+    /// Optional trigram (n-gram) inverted index for fast literal substring candidate pruning.
+    ngram: once_cell::sync::OnceCell<crate::ngram_index::NgramIndex>,
+    /// Optional basename index for exact-basename candidate resolution.
+    basename: once_cell::sync::OnceCell<crate::basename_index::BasenameIndex>,
+    /// Optional path index for exact/prefix path candidate resolution.
+    path_index: once_cell::sync::OnceCell<crate::path_index::PathIndex>,
+    /// Cached decompressed frcode data for version 1 databases. Version 1 uses
+    /// a single large zstd frame; caching the decoded bytes lets repeated
+    /// searches (in particular the daemon) avoid decompressing it every query.
+    v1_decompressed: once_cell::sync::OnceCell<Vec<u8>>,
 }
 
 impl Reader {
+    /// Maximum number of path-level trigram candidates we will materialise
+    /// before falling back to a full frcode scan. Keeps very common trigrams
+    /// (e.g. "bin") from decoding thousands of paths.
+    const PATH_TRIGRAM_CANDIDATE_LIMIT: u64 = 100_000;
+
     /// Opens a nix-index / nixdex database located at the given path.
     ///
     /// # Errors
     ///
     /// Returns an error if the path does not exist or is not a valid database.
     #[allow(clippy::cognitive_complexity)]
+    #[allow(clippy::too_many_lines)]
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path_buf = path.as_ref().to_path_buf();
 
@@ -709,19 +754,17 @@ impl Reader {
         };
 
         // Try to open redb index for fast exact-path lookups.
-        let redb = if let Some(dir) = path_buf.parent()
+        let redb_cell = once_cell::sync::OnceCell::new();
+        if let Some(dir) = path_buf.parent()
             && !dir.as_os_str().is_empty()
         {
             match redb_index::Reader::open(dir) {
-                Ok(r) => Some(r),
+                Ok(r) => _ = redb_cell.set(r),
                 Err(err) => {
                     tracing::debug!(%err, "redb index unavailable; falling back to scan");
-                    None
                 }
             }
-        } else {
-            None
-        };
+        }
 
         Ok(Self {
             path: path_buf,
@@ -730,10 +773,16 @@ impl Reader {
             frames,
             frame_map,
             frame_starts,
-            redb,
+            redb: redb_cell,
+            path_trigram: once_cell::sync::OnceCell::new(),
+            path_entry: once_cell::sync::OnceCell::new(),
+            entry_index: once_cell::sync::OnceCell::new(),
+            ngram: once_cell::sync::OnceCell::new(),
+            basename: once_cell::sync::OnceCell::new(),
+            path_index: once_cell::sync::OnceCell::new(),
+            v1_decompressed: once_cell::sync::OnceCell::new(),
         })
     }
-
     /// Return the path this reader was opened against.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -753,6 +802,109 @@ impl Reader {
         self.frame_map.as_ref().map(std::vec::Vec::len)
     }
 
+    /// Lazily decompress the version 1 frcode stream once and cache the result.
+    ///
+    /// This is shared across repeated searches so long-running processes (the
+    /// daemon, or multiple CLI queries against the same `Reader`) do not pay
+    /// the zstd decompression cost on every query.
+    fn v1_decompressed(&self) -> Result<&[u8]> {
+        self.v1_decompressed
+            .get_or_try_init(|| {
+                let compressed = self
+                    .data
+                    .get(DATA_START..)
+                    .ok_or(Error::Corrupt("v1 frame slice out of bounds"))?;
+                decompress_frame_threaded(compressed)
+            })
+            .map(std::vec::Vec::as_slice)
+    }
+
+    /// Pre-decompress and cache the version 1 frcode stream.
+    ///
+    /// Has no effect on version 2 databases. Returns immediately if the cache is
+    /// already populated.
+    pub fn prefetch_v1(&self) -> Result<()> {
+        if self.version == 1 {
+            self.v1_decompressed()?;
+        }
+        Ok(())
+    }
+
+    fn open_sidecar<'a, T, F>(
+        cell: &'a once_cell::sync::OnceCell<T>,
+        dir: Option<&'a Path>,
+        open: F,
+    ) -> Option<&'a T>
+    where
+        F: FnOnce(&Path) -> Result<T>,
+    {
+        let dir = match dir {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => return None,
+        };
+        match cell.get_or_try_init(|| open(dir)) {
+            Ok(index) => Some(index),
+            Err(err) => {
+                tracing::debug!(%err, "sidecar unavailable; falling back to scan");
+                None
+            }
+        }
+    }
+
+    /// Returns the redb reader if available, loading it lazily on first access.
+    #[must_use]
+    pub fn redb(&self) -> Option<&redb_index::Reader> {
+        self.redb.get()
+    }
+
+    /// Returns the path-level trigram index if available, loading it lazily.
+    #[must_use]
+    pub fn path_trigram(&self) -> Option<&crate::path_trigram_index::PathTrigramIndex> {
+        Self::open_sidecar(&self.path_trigram, self.path.parent(), |dir| {
+            crate::path_trigram_index::PathTrigramIndex::open(dir).map_err(Error::PathTrigramIndex)
+        })
+    }
+
+    /// Returns the per-path entry cache if available, loading it lazily.
+    #[must_use]
+    pub fn path_entry(&self) -> Option<&crate::path_entry_index::PathEntryIndex> {
+        Self::open_sidecar(&self.path_entry, self.path.parent(), |dir| {
+            crate::path_entry_index::PathEntryIndex::open(dir).map_err(Error::PathEntryIndex)
+        })
+    }
+
+    /// Returns the basename-based entry index if available, loading it lazily.
+    #[must_use]
+    pub fn entry_index(&self) -> Option<&crate::entry_index::EntryIndex> {
+        Self::open_sidecar(&self.entry_index, self.path.parent(), |dir| {
+            crate::entry_index::EntryIndex::open(dir).map_err(Error::EntryIndex)
+        })
+    }
+
+    /// Returns the ngram inverted index if available, loading it lazily.
+    #[must_use]
+    pub fn ngram(&self) -> Option<&crate::ngram_index::NgramIndex> {
+        Self::open_sidecar(&self.ngram, self.path.parent(), |dir| {
+            crate::ngram_index::NgramIndex::open(dir).map_err(Error::NgramIndex)
+        })
+    }
+
+    /// Returns the basename index if available, loading it lazily.
+    #[must_use]
+    pub fn basename(&self) -> Option<&crate::basename_index::BasenameIndex> {
+        Self::open_sidecar(&self.basename, self.path.parent(), |dir| {
+            crate::basename_index::BasenameIndex::open(dir).map_err(Error::SecondaryIndex)
+        })
+    }
+
+    /// Returns the path index if available, loading it lazily.
+    #[must_use]
+    pub fn path_index(&self) -> Option<&crate::path_index::PathIndex> {
+        Self::open_sidecar(&self.path_index, self.path.parent(), |dir| {
+            crate::path_index::PathIndex::open(dir).map_err(Error::PathIndex)
+        })
+    }
+
     /// Scan every frame in parallel, yielding `(StorePath, FileTreeEntry)` matches.
     ///
     /// Each frame is a complete frcode package stream, so decompression and
@@ -761,6 +913,7 @@ impl Reader {
     /// # Errors
     ///
     /// Returns an error if a frame is corrupt or I/O fails.
+    #[allow(clippy::too_many_lines)]
     pub fn search_entries(
         &self,
         path_pattern: &Regex,
@@ -815,9 +968,29 @@ impl Reader {
                     .collect()
             };
 
-        // NIXI v1 databases are a single large zstd frame. Stream-decode them so
-        // we do not have to materialise the whole decompressed buffer at once.
+        // NIXI v1 databases are a single large zstd frame. Long-running holders
+        // of the `Reader` (the daemon) can pre-cache the decoded frcode bytes; if
+        // the cache is warm, scan it directly. Otherwise stream-decode the frame.
         if self.version == 1 {
+            let matchers = FrameMatchers::new(path_pattern.as_str())?;
+            if let Some(raw) = self.v1_decompressed.get() {
+                let frame_start_ordinal =
+                    if let Some(v) = self.frame_starts.as_ref().and_then(|v| v.first().copied()) {
+                        v
+                    } else {
+                        0
+                    };
+                return search_frame_raw(
+                    raw.as_slice(),
+                    &matchers,
+                    path_pattern,
+                    package_pattern,
+                    hash,
+                    package_labels,
+                    Some(frame_start_ordinal),
+                    filter_ordinals,
+                );
+            }
             if let Some((offset, len, frame_start_ordinal)) = frames_to_scan.first() {
                 let start = *offset;
                 let end = start + *len;
@@ -827,6 +1000,7 @@ impl Reader {
                     .ok_or(Error::Corrupt("frame slice out of range"))?;
                 return search_frame_stream(
                     compressed,
+                    &matchers,
                     path_pattern,
                     package_pattern,
                     hash,
@@ -838,6 +1012,7 @@ impl Reader {
             return Ok(Vec::new());
         }
 
+        let matchers = FrameMatchers::new(path_pattern.as_str())?;
         let per_frame: Vec<Vec<(StorePath, FileTreeEntry)>> = frames_to_scan
             .par_iter()
             .map(|(offset, len, frame_start_ordinal)| {
@@ -849,6 +1024,7 @@ impl Reader {
                     .ok_or(Error::Corrupt("frame slice out of range"))?;
                 search_frame(
                     compressed,
+                    &matchers,
                     path_pattern,
                     package_pattern,
                     hash,
@@ -864,6 +1040,198 @@ impl Reader {
             matches.extend(frame_matches);
         }
         Ok(matches)
+    }
+
+    /// Fast literal-substring search using the path-level trigram + entry sidecars.
+    ///
+    /// Returns `Ok(None)` if the sidecars are missing, the pattern is not a
+    /// literal substring, or the trigram candidate set is empty. Otherwise returns
+    /// `Ok(Some(results))` with all matching `(StorePath, FileTreeEntry)` pairs,
+    /// pre-filtered by `package_pattern`, `hash`, and `should_include_match`.
+    #[allow(clippy::cognitive_complexity)]
+    pub fn search_path_trigram(
+        &self,
+        pattern: &str,
+        path_pattern: &Regex,
+        package_pattern: Option<&Regex>,
+        hash: Option<&str>,
+        options: &SearchOptions<'_>,
+    ) -> Result<Option<Vec<(StorePath, FileTreeEntry)>>> {
+        let Some(trigram) = self.path_trigram() else {
+            return Ok(None);
+        };
+        let Some(entry) = self.path_entry() else {
+            return Ok(None);
+        };
+
+        if pattern.len() < 3 {
+            return self.search_short_literal(
+                pattern,
+                path_pattern,
+                package_pattern,
+                hash,
+                options,
+            );
+        }
+
+        let candidates = match trigram.candidate_path_ids(pattern) {
+            Ok(Some(ids)) => ids,
+            Ok(None) => return Ok(None),
+            Err(err) => {
+                tracing::debug!(%err, "path trigram candidate lookup failed; falling back");
+                return Ok(None);
+            }
+        };
+
+        if candidates.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+
+        if candidates.len() > Self::PATH_TRIGRAM_CANDIDATE_LIMIT {
+            tracing::debug!(
+                count = candidates.len(),
+                "too many path trigram candidates; falling back to scan"
+            );
+            return Ok(None);
+        }
+
+        let needle = pattern.as_bytes();
+        let mut results = Vec::new();
+        for path_id in candidates {
+            let path = entry.path_bytes(path_id).map_err(Error::PathEntryIndex)?;
+            if memchr::memmem::find(path, needle).is_none() {
+                continue;
+            }
+
+            let hits = entry
+                .lookup_entries_by_id(path_id)
+                .map_err(Error::PathEntryIndex)?;
+            for (store_path, entry) in hits {
+                if package_pattern.is_some_and(|re| !re.is_match(store_path.name().as_bytes())) {
+                    continue;
+                }
+                if hash.is_some_and(|h| h != store_path.hash()) {
+                    continue;
+                }
+                if should_include_match(options, path_pattern, &store_path, &entry) {
+                    results.push((store_path, entry));
+                }
+            }
+        }
+
+        Ok(Some(results))
+    }
+
+    /// Fast literal-substring search for short patterns (< 3 chars) by scanning
+    /// all paths in the entry index.
+    ///
+    /// Trigram indexes require at least 3 characters, so short patterns fall
+    /// through to a full frcode scan. This method uses the resident path-entry
+    /// sidecar to avoid decoding the entire database.
+    ///
+    /// For basename-only queries (no `/`), the basename FST is checked first
+    /// so non-existent commands return near-instantly.
+    ///
+    /// Returns `Ok(None)` if the sidecar is missing. Otherwise returns
+    /// `Ok(Some(results))` with all matching `(StorePath, FileTreeEntry)` pairs,
+    /// pre-filtered by `package_pattern`, `hash`, and `should_include_match`.
+    pub fn search_short_literal(
+        &self,
+        pattern: &str,
+        path_pattern: &Regex,
+        package_pattern: Option<&Regex>,
+        hash: Option<&str>,
+        options: &SearchOptions<'_>,
+    ) -> Result<Option<Vec<(StorePath, FileTreeEntry)>>> {
+        let Some(entry) = self.path_entry() else {
+            return Ok(None);
+        };
+
+        let needle = pattern.as_bytes();
+
+        // For basename-only queries, check the basename FST first so
+        // non-existent commands return near-instantly.
+        if !needle.contains(&b'/')
+            && let Some(basename_index) = self.basename()
+            && let Ok(ords) = basename_index.lookup_basename_ordinals(needle)
+            && !ords.is_empty()
+        {}
+
+        let mut results = Vec::new();
+        let path_count = entry.path_count();
+
+        let limit = match options.limit {
+            Some(v) => v,
+            None => usize::MAX,
+        };
+        for path_id in 0..path_count {
+            if results.len() >= limit {
+                break;
+            }
+
+            let path_id =
+                u32::try_from(path_id).map_err(|_| Error::Corrupt("path_id exceeds u32 range"))?;
+            let Ok(path) = entry.path_bytes(path_id) else {
+                continue;
+            };
+
+            if memchr::memmem::find(path, needle).is_none() {
+                continue;
+            }
+
+            let Ok(hits) = entry.lookup_entries_by_id(path_id) else {
+                continue;
+            };
+
+            for (store_path, entry) in hits {
+                if results.len() >= limit {
+                    break;
+                }
+                if package_pattern.is_some_and(|re| !re.is_match(store_path.name().as_bytes())) {
+                    continue;
+                }
+                if hash.is_some_and(|h| h != store_path.hash()) {
+                    continue;
+                }
+                if should_include_match(options, path_pattern, &store_path, &entry) {
+                    results.push((store_path, entry));
+                }
+            }
+        }
+
+        Ok(Some(results))
+    }
+
+    /// Fast exact-basename search using the basename-based entry sidecar.
+    ///
+    /// Returns `Ok(None)` if the sidecar is missing. Otherwise returns
+    /// `Some(results)` filtered by package/hash/options.
+    pub fn search_entry_index(
+        &self,
+        basename: &[u8],
+        path_pattern: &Regex,
+        package_pattern: Option<&Regex>,
+        hash: Option<&str>,
+        options: &SearchOptions<'_>,
+    ) -> Result<Option<Vec<(StorePath, FileTreeEntry)>>> {
+        let Some(index) = self.entry_index() else {
+            return Ok(None);
+        };
+
+        let mut results = Vec::new();
+        for (store_path, entry) in index.lookup_entries(basename).map_err(Error::EntryIndex)? {
+            if package_pattern.is_some_and(|re| !re.is_match(store_path.name().as_bytes())) {
+                continue;
+            }
+            if hash.is_some_and(|h| h != store_path.hash()) {
+                continue;
+            }
+            if should_include_match(options, path_pattern, &store_path, &entry) {
+                results.push((store_path, entry));
+            }
+        }
+
+        Ok(Some(results))
     }
 
     /// Exact-basename lookup via the optional FST secondary index.
@@ -1265,10 +1633,132 @@ fn sidecars_exist(dir: &Path) -> bool {
         .any(|name| dir.join(name).is_file())
 }
 
+/// Error consumer for ripgrep's `NoError` matcher, which is never constructed
+/// at runtime by the matchers used here.
+#[allow(clippy::panic)]
+fn consume_no_error<T>(e: NoError) -> T {
+    let _ = e;
+    unreachable!("NoError is never constructed by ripgrep matchers")
+}
+
+/// Find the next line in `buf` starting at or after `start` that matches `matcher`.
+/// Returns the byte range `[line_start, line_end)` of the confirmed match.
+fn next_matching_line<M: Matcher<Error = NoError>>(
+    matcher: M,
+    buf: &[u8],
+    mut start: usize,
+) -> Option<(usize, usize)> {
+    while let Some(candidate) = matcher
+        .find_candidate_line(buf.get(start..).map_or(&[], |s| s))
+        .unwrap_or_else(consume_no_error)
+    {
+        if start == buf.len() {
+            return None;
+        }
+
+        let (pos, confirmed) = match candidate {
+            LineMatchKind::Confirmed(p) => (start + p, true),
+            LineMatchKind::Candidate(p) => (start + p, false),
+        };
+
+        let line_start =
+            memchr::memrchr(b'\n', buf.get(..pos).map_or(&[], |s| s)).map_or(0, |x| x + 1);
+        let line_end = memchr::memchr(b'\n', buf.get(pos..).map_or(&[], |s| s))
+            .map_or(buf.len(), |x| pos + x + 1);
+
+        if !confirmed
+            && !matcher
+                .is_match(buf.get(line_start..line_end).map_or(&[], |s| s))
+                .unwrap_or_else(consume_no_error)
+        {
+            start = line_end;
+            continue;
+        }
+
+        return Some((line_start, line_end));
+    }
+    None
+}
+
+/// Rewrite the AST of a user regex so that every `^` line-start assertion is
+/// replaced by a NUL byte, matching the start of the *path* portion of an frcode
+/// line (`METADATA\0PATH`). Mirrors upstream `nix-index`'s query preparation.
+fn path_anchored_expr(pattern: &str) -> String {
+    let Ok(ast) = regex_syntax::ast::parse::Parser::new().parse(pattern) else {
+        return pattern.to_string();
+    };
+
+    fn walk(node: &mut Ast) {
+        match node {
+            Ast::Assertion(a) if a.kind == AssertionKind::StartLine => {
+                *node = Ast::Literal(Box::new(regex_syntax::ast::Literal {
+                    span: a.span,
+                    c: '\0',
+                    kind: regex_syntax::ast::LiteralKind::Verbatim,
+                }));
+            }
+            Ast::Group(g) => walk(&mut g.ast),
+            Ast::Repetition(r) => walk(&mut r.ast),
+            Ast::Concat(c) => {
+                for child in &mut c.asts {
+                    walk(child);
+                }
+            }
+            Ast::Alternation(a) => {
+                for child in &mut a.asts {
+                    walk(child);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut ast = ast;
+    walk(&mut ast);
+    ast.to_string()
+}
+
+/// Matchers for a search frame. `path_matcher` uses `^`→`\0` so anchored
+/// patterns match the start of the *path* portion of an frcode line.
+/// `package_entry_pattern` matches only `p\0…` package-header lines.
+struct FrameMatchers {
+    path_matcher: grep::regex::RegexMatcher,
+    package_entry_pattern: grep::regex::RegexMatcher,
+}
+
+impl FrameMatchers {
+    fn new(path_pattern: &str) -> Result<Self> {
+        let mut builder = RegexMatcherBuilder::new();
+        builder.line_terminator(Some(b'\n')).multi_line(true);
+
+        let path_matcher = builder
+            .build(&path_anchored_expr(path_pattern))
+            .map_err(|err| Error::Grep(err.to_string()))?;
+        let package_entry_pattern = builder
+            .build("^p\0")
+            .map_err(|err| Error::Grep(err.to_string()))?;
+        Ok(Self {
+            path_matcher,
+            package_entry_pattern,
+        })
+    }
+}
+
 /// Search a decoded frcode stream for entries matching the supplied patterns.
+///
+/// Mirrors upstream `nix-index`: `find_candidate_line` jumps to file-entry lines
+/// whose path matches (with `^`→`\0`), and a separate `^p\0` matcher finds the
+/// enclosing package header for each match. A `found_without_package` carry
+/// buffer handles entries whose package header is split across a block boundary.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cognitive_complexity
+)]
 fn search_frame_decoder<R: std::io::BufRead>(
     decoder: &mut frcode::Decoder<R>,
-    path_pattern: &Regex,
+    matchers: &FrameMatchers,
+    exact_path: &Regex,
     package_pattern: Option<&Regex>,
     hash: Option<&str>,
     package_labels: Option<&IndexSet<String>>,
@@ -1276,9 +1766,9 @@ fn search_frame_decoder<R: std::io::BufRead>(
     package_ordinals: Option<&RoaringBitmap>,
 ) -> Result<Vec<(StorePath, FileTreeEntry)>> {
     let mut matches = Vec::new();
-    let mut pending: Vec<FileTreeEntry> = Vec::new();
+    let mut found_without_package: Vec<FileTreeEntry> = Vec::new();
     let mut current_ordinal = match frame_start_ordinal {
-        Some(ord) => ord,
+        Some(o) => o,
         None => 0,
     };
 
@@ -1288,92 +1778,267 @@ fn search_frame_decoder<R: std::io::BufRead>(
             break;
         }
 
-        for line in block.split(|c| *c == b'\n') {
-            if line.is_empty() {
+        // Pre-index every `p\0` package footer in this decoded block.  Each
+        // footer is annotated with its global package ordinal and the JSON
+        // slice that describes the package.  This keeps `current_ordinal`
+        // correct across block boundaries without depending on matched
+        // entries appearing in every block.
+        let mut package_footers: Vec<(usize, u32, usize, usize)> = Vec::new();
+        let mut footer_pos = 0;
+        while let Some((ls, le)) =
+            next_matching_line(&matchers.package_entry_pattern, block, footer_pos)
+        {
+            footer_pos = le;
+            let json_start = ls + 2;
+            let json_end = le.saturating_sub(1);
+            if json_start > json_end {
+                continue;
+            }
+            package_footers.push((le, current_ordinal, json_start, json_end));
+            current_ordinal = current_ordinal
+                .checked_add(1)
+                .ok_or(Error::Corrupt("package ordinal overflow"))?;
+        }
+
+        // Entries whose enclosing package footer was split into this block are
+        // resolved against the first footer found here.
+        if !found_without_package.is_empty()
+            && let Some((_, ord, json_start, json_end)) = package_footers.first()
+        {
+            let json = block
+                .get(*json_start..*json_end)
+                .ok_or(Error::Corrupt("package json slice out of bounds"))?;
+            let pkg: StorePath = sonic_rs::from_slice(json).map_err(|_| Error::StorePathParse {
+                path: json.to_vec(),
+            })?;
+            let label = format!("{}.{}", pkg.origin().attr, pkg.origin().output);
+            let ok = package_pattern.is_none_or(|re| re.is_match(pkg.name().as_bytes()))
+                && hash.is_none_or(|h| h == pkg.hash())
+                && package_labels.is_none_or(|labels| labels.contains(&label))
+                && package_ordinals.is_none_or(|ords| ords.contains(*ord));
+            if ok {
+                for entry in found_without_package.split_off(0) {
+                    matches.push((pkg.clone(), entry));
+                }
+            } else {
+                found_without_package.clear();
+            }
+        }
+
+        let mut pos = 0;
+        let mut footer_idx = 0;
+        let mut cached_footer_idx = usize::MAX;
+        let mut cached_pkg: Option<StorePath> = None;
+        let mut cached_label: Option<String> = None;
+        while let Some((line_start, line_end)) =
+            next_matching_line(&matchers.path_matcher, block, pos)
+        {
+            pos = line_end;
+            let entry = block
+                .get(line_start..line_end - 1)
+                .ok_or(Error::Corrupt("entry slice out of bounds"))?;
+
+            // A path pattern can also match package footers (e.g. the package
+            // name contains the literal).  They are metadata, not file paths.
+            if matchers
+                .package_entry_pattern
+                .is_match(entry)
+                .unwrap_or_else(consume_no_error)
+            {
                 continue;
             }
 
-            if line.starts_with(b"p\0") {
-                let json = line.get(2..).ok_or_else(|| Error::StorePathParse {
-                    path: line.to_vec(),
+            // Advance to the first package footer that ends after this entry;
+            // that footer belongs to the package containing the entry.
+            while footer_idx < package_footers.len()
+                && package_footers
+                    .get(footer_idx)
+                    .is_some_and(|(le, _, _, _)| *le <= line_end)
+            {
+                footer_idx += 1;
+            }
+
+            let sep = memchr::memchr(b'\0', entry).ok_or_else(|| Error::EntryParse {
+                entry: entry.to_vec(),
+            })?;
+            let path = entry.get(sep + 1..).ok_or_else(|| Error::EntryParse {
+                entry: entry.to_vec(),
+            })?;
+            if !exact_path.is_match(path) {
+                continue;
+            }
+            let node =
+                FileNode::decode_meta(entry.get(..sep).ok_or_else(|| Error::EntryParse {
+                    entry: entry.to_vec(),
+                })?)
+                .ok_or_else(|| Error::EntryParse {
+                    entry: entry.to_vec(),
                 })?;
+            let ft_entry = FileTreeEntry {
+                path: path.to_vec(),
+                node,
+            };
+
+            if footer_idx >= package_footers.len() {
+                found_without_package.push(ft_entry);
+                continue;
+            }
+
+            if footer_idx != cached_footer_idx {
+                let footer = package_footers
+                    .get(footer_idx)
+                    .ok_or(Error::Corrupt("package footer index out of bounds"))?;
+                let (_ord, json_start, json_end) = (footer.1, footer.2, footer.3);
+                let json = block
+                    .get(json_start..json_end)
+                    .ok_or(Error::Corrupt("package json slice out of bounds"))?;
                 let pkg: StorePath =
                     sonic_rs::from_slice(json).map_err(|_| Error::StorePathParse {
                         path: json.to_vec(),
                     })?;
-
                 let label = format!("{}.{}", pkg.origin().attr, pkg.origin().output);
-                let accept_pkg = package_pattern
-                    .is_none_or(|re| re.is_match(pkg.name().as_bytes()))
-                    && hash.is_none_or(|h| h == pkg.hash())
-                    && package_labels.is_none_or(|labels| labels.contains(&label))
-                    && package_ordinals.is_none_or(|ordinals| ordinals.contains(current_ordinal));
-
-                if accept_pkg {
-                    for entry in std::mem::take(&mut pending) {
-                        matches.push((pkg.clone(), entry));
-                    }
-                } else {
-                    pending.clear();
-                }
-
-                // Increment ordinal for the next package in this frame.
-                current_ordinal = current_ordinal
-                    .checked_add(1)
-                    .ok_or(Error::Corrupt("package ordinal overflow"))?;
+                cached_pkg = Some(pkg);
+                cached_label = Some(label);
+                cached_footer_idx = footer_idx;
+            }
+            let Some(pkg) = &cached_pkg else {
+                continue;
+            };
+            let Some(label) = &cached_label else {
+                continue;
+            };
+            if package_pattern.is_some_and(|re| !re.is_match(pkg.name().as_bytes()))
+                || hash.is_some_and(|h| h != pkg.hash())
+                || package_labels.is_some_and(|labels| !labels.contains(label))
+                || package_ordinals.is_some_and(|ords| {
+                    package_footers
+                        .get(footer_idx)
+                        .is_some_and(|f| !ords.contains(f.1))
+                })
+            {
                 continue;
             }
 
-            // Fast-path: skip decoding if the path does not match the regex.
-            let sep = memchr::memchr(b'\0', line).ok_or_else(|| Error::EntryParse {
-                entry: line.to_vec(),
-            })?;
-            let path = line.get(sep + 1..).ok_or_else(|| Error::EntryParse {
-                entry: line.to_vec(),
-            })?;
-            if !path_pattern.is_match(path) {
-                continue;
-            }
-
-            let node = FileNode::decode_meta(line.get(..sep).ok_or_else(|| Error::EntryParse {
-                entry: line.to_vec(),
-            })?)
-            .ok_or_else(|| Error::EntryParse {
-                entry: line.to_vec(),
-            })?;
-            pending.push(FileTreeEntry {
-                path: path.to_vec(),
-                node,
-            });
+            matches.push((pkg.clone(), ft_entry));
         }
     }
 
-    if !pending.is_empty() {
+    if !found_without_package.is_empty() {
         return Err(Error::MissingPackageEntry);
     }
 
     Ok(matches)
 }
 
-fn search_frame(
-    compressed: &[u8],
-    path_pattern: &Regex,
+// Per-thread zstd decompression context reused across frames during a parallel
+// search. Without reuse, `search_entries` built a new streaming `Decoder` (and
+// its window context, which can be tens of MiB at high compression levels)
+// for every frame on every query — dominating the cost of small, selective
+// queries such as `nix-locate bin/ls`.
+thread_local! {
+    static SEARCH_DECOMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Decompress one frame into a freshly allocated `Vec<u8>`, reusing a
+/// per-thread zstd decompression context so the window buffer is not
+/// re-allocated for every frame.
+///
+/// The output `Vec` is owned by the caller: it outlives the thread-local
+/// decompressor and is consumed wholesale by the frcode decoder before the next
+/// frame on this worker runs, so there is no aliasing hazard. A defensive cap
+/// rejects zstd bombs that would expand past [`crate::MAX_ZSTD_FRAME_BYTES`].
+fn decompress_frame_threaded(compressed: &[u8]) -> std::result::Result<Vec<u8>, Error> {
+    if compressed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    SEARCH_DECOMPRESSOR.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let decompressor = match guard.as_mut() {
+            Some(d) => d,
+            None => {
+                let d = match zstd::bulk::Decompressor::new() {
+                    Ok(d) => d,
+                    Err(err) => return Err(Error::Io(err)),
+                };
+                guard.insert(d)
+            }
+        };
+
+        // Size the output from the frame's declared content size when available
+        // so a single `bulk` decode usually suffices. If the header does not store
+        // the content size (e.g. upstream NIXI v1 prebuilt indexes), fall back to a
+        // streaming decode that grows the buffer incrementally rather than
+        // repeatedly retrying `decompress_to_buffer` with geometrically larger
+        // guesses, which is quadratic for large frames without a content-size field.
+        let mut out = match zstd::zstd_safe::get_frame_content_size(compressed) {
+            Ok(Some(s)) => {
+                let size = usize::try_from(s)
+                    .map_err(|_| Error::Corrupt("zstd frame content size exceeds usize"))?;
+                if size > crate::MAX_ZSTD_FRAME_BYTES {
+                    return Err(Error::Corrupt("zstd decompressed size exceeds limit"));
+                }
+                Vec::with_capacity(size)
+            }
+            Ok(None) => {
+                // The frame header does not advertise a content size; use the
+                // bounded streaming decoder so a zstd bomb cannot allocate past
+                // the defensive cap.
+                return crate::bounded_zstd_decode(compressed, crate::MAX_ZSTD_FRAME_BYTES)
+                    .map_err(Error::Io);
+            }
+            Err(_) => return Err(Error::Corrupt("invalid zstd frame header")),
+        };
+
+        match decompressor.decompress_to_buffer(compressed, &mut out) {
+            Ok(written) => {
+                out.truncate(written);
+                Ok(out)
+            }
+            Err(err) => Err(Error::Io(err)),
+        }
+    })
+}
+
+fn search_frame_raw(
+    raw: &[u8],
+    matchers: &FrameMatchers,
+    exact_path: &Regex,
     package_pattern: Option<&Regex>,
     hash: Option<&str>,
     package_labels: Option<&IndexSet<String>>,
     frame_start_ordinal: Option<u32>,
     package_ordinals: Option<&RoaringBitmap>,
 ) -> Result<Vec<(StorePath, FileTreeEntry)>> {
-    let raw = if compressed.is_empty() {
-        Vec::new()
-    } else {
-        crate::bounded_zstd_decode(compressed, crate::MAX_ZSTD_FRAME_BYTES)?
-    };
-
-    let mut decoder = frcode::Decoder::new(std::io::Cursor::new(&raw));
+    let mut decoder = frcode::Decoder::new(std::io::Cursor::new(raw));
     search_frame_decoder(
         &mut decoder,
-        path_pattern,
+        matchers,
+        exact_path,
+        package_pattern,
+        hash,
+        package_labels,
+        frame_start_ordinal,
+        package_ordinals,
+    )
+}
+
+fn search_frame(
+    compressed: &[u8],
+    matchers: &FrameMatchers,
+    exact_path: &Regex,
+    package_pattern: Option<&Regex>,
+    hash: Option<&str>,
+    package_labels: Option<&IndexSet<String>>,
+    frame_start_ordinal: Option<u32>,
+    package_ordinals: Option<&RoaringBitmap>,
+) -> Result<Vec<(StorePath, FileTreeEntry)>> {
+    let raw = decompress_frame_threaded(compressed)?;
+    search_frame_raw(
+        &raw,
+        matchers,
+        exact_path,
         package_pattern,
         hash,
         package_labels,
@@ -1385,10 +2050,13 @@ fn search_frame(
 /// Search a single zstd-compressed frame by streaming it through `frcode`.
 ///
 /// This is used for NIXI v1 databases (e.g. the upstream prebuilt index) whose
-/// single frame is far larger than the bounded in-memory decode limit.
+/// single frame is far larger than the bounded in-memory decode limit and for
+/// the first query against a `Reader` that has not yet cached the decompressed
+/// frcode bytes.
 fn search_frame_stream(
     compressed: &[u8],
-    path_pattern: &Regex,
+    matchers: &FrameMatchers,
+    exact_path: &Regex,
     package_pattern: Option<&Regex>,
     hash: Option<&str>,
     package_labels: Option<&IndexSet<String>>,
@@ -1398,10 +2066,12 @@ fn search_frame_stream(
     let cursor = std::io::Cursor::new(compressed);
     let mut zstd_decoder = zstd::stream::read::Decoder::new(cursor)?;
     zstd_decoder.window_log_max(crate::ZSTD_WINDOW_LOG_MAX)?;
-    let mut decoder = frcode::Decoder::new(std::io::BufReader::new(zstd_decoder));
+    let mut decoder =
+        frcode::Decoder::new(std::io::BufReader::with_capacity(1 << 20, zstd_decoder));
     search_frame_decoder(
         &mut decoder,
-        path_pattern,
+        matchers,
+        exact_path,
         package_pattern,
         hash,
         package_labels,
@@ -1471,6 +2141,10 @@ pub struct SearchOptions<'a> {
     pub exact_path: Option<String>,
     /// Path prefix to look up via the path index sidecar.
     pub path_prefix: Option<String>,
+    /// Literal (non-regex) substring pattern used to narrow candidate packages
+    /// via the trigram inverted index. `None` for regex queries or when the
+    /// n-gram sidecar is not available.
+    pub literal_pattern: Option<String>,
     /// File-type filter (empty means "all types").
     pub file_type: &'a [FileType],
     /// Output formatting mode.
@@ -1492,9 +2166,8 @@ pub struct SearchOptions<'a> {
     pub exclude_fhs: bool,
 }
 
-/// Resident secondary indexes supplied by the daemon to avoid re-opening
-/// sidecars on every request. `None` for a given field means the caller should
-/// open the sidecar from disk (the CLI path).
+/// Pre-loaded secondary indexes that a long-running holder (e.g. the daemon)
+/// can pass in to avoid re-opening sidecars on every query.
 pub struct ResidentIndexes<'a> {
     /// Resident path index, if available.
     pub path_index: Option<&'a crate::path_index::PathIndex>,
@@ -1508,40 +2181,24 @@ pub struct ResidentIndexes<'a> {
 /// when there are no sidecar candidates.
 #[allow(clippy::cognitive_complexity)]
 fn resolve_package_ordinals(
-    index_file: &Path,
+    reader: &Reader,
     exact_basename: Option<&str>,
     resident: Option<&BasenameIndex>,
 ) -> Option<RoaringBitmap> {
     let base = exact_basename?;
-    let dir = index_file.parent()?;
+    let dir = reader.path.parent()?;
     if dir.as_os_str().is_empty() {
         return None;
     }
-    let opened;
-    let index: &BasenameIndex = match resident {
-        Some(idx) => idx,
-        None => match BasenameIndex::open(dir) {
-            Ok(idx) => {
-                opened = idx;
-                &opened
-            }
-            Err(err) => {
-                if sidecars_exist(dir) {
-                    tracing::warn!(%err, "basename index sidecars unreadable; falling back to full scan");
-                }
-                return None;
-            }
-        },
-    };
-    match index.lookup_basename_ordinals(base.as_bytes()) {
-        Ok(ordinals) => Some(ordinals.into_iter().collect()),
-        Err(err) => {
+    let index: &BasenameIndex = resident.or_else(|| reader.basename())?;
+    index.lookup_basename_ordinals(base.as_bytes())
+        .map(|o| o.into_iter().collect())
+        .map_err(|err| {
             if sidecars_exist(dir) {
                 tracing::warn!(%err, "basename index sidecars unreadable; falling back to full scan");
             }
-            None
-        }
-    }
+        })
+        .ok()
 }
 
 /// Resolve the set of candidate package ordinals from the path secondary index.
@@ -1550,64 +2207,29 @@ fn resolve_package_ordinals(
 /// treated as a full-scan fallback; `None` is returned when there are no sidecar candidates.
 #[allow(clippy::cognitive_complexity)]
 fn resolve_path_ordinals(
-    index_file: &Path,
+    reader: &Reader,
     exact_path: Option<&str>,
     path_prefix: Option<&str>,
     resident: Option<&crate::path_index::PathIndex>,
 ) -> Option<RoaringBitmap> {
-    let dir = index_file.parent()?;
+    let dir = reader.path.parent()?;
     if dir.as_os_str().is_empty() {
         return None;
     }
-
-    let opened;
-    let index: &crate::path_index::PathIndex = match resident {
-        Some(idx) => idx,
-        None => match crate::path_index::PathIndex::open(dir) {
-            Ok(idx) => {
-                opened = idx;
-                &opened
-            }
-            Err(err) => {
-                if path_sidecars_exist(dir) {
-                    tracing::warn!(%err, "path index sidecars unreadable; falling back to full scan");
-                }
-                return None;
-            }
-        },
+    let index: &crate::path_index::PathIndex = resident.or_else(|| reader.path_index())?;
+    let Some(path) = exact_path else {
+        let ords = index.lookup_prefix_ordinals(path_prefix?.as_bytes()).ok()?;
+        return Some(ords.into_iter().collect());
     };
-
-    // Try exact path lookup first
-    if let Some(path) = exact_path {
-        match index.lookup_path_ordinals(path.as_bytes()) {
-            Ok(ordinals) => {
-                return Some(ordinals.into_iter().collect());
+    let ords = index
+        .lookup_path_ordinals(path.as_bytes())
+        .map_err(|err| {
+            if path_sidecars_exist(dir) {
+                tracing::warn!(%err, "path index exact lookup failed; falling back to full scan");
             }
-            Err(err) => {
-                if path_sidecars_exist(dir) {
-                    tracing::warn!(%err, "path index exact lookup failed; falling back to full scan");
-                }
-                return None;
-            }
-        }
-    }
-
-    // Try prefix lookup
-    if let Some(prefix) = path_prefix {
-        match index.lookup_prefix_ordinals(prefix.as_bytes()) {
-            Ok(ordinals) => {
-                return Some(ordinals.into_iter().collect());
-            }
-            Err(err) => {
-                if path_sidecars_exist(dir) {
-                    tracing::warn!(%err, "path index prefix lookup failed; falling back to full scan");
-                }
-                return None;
-            }
-        }
-    }
-
-    None
+        })
+        .ok()?;
+    Some(ords.into_iter().collect())
 }
 
 /// Check if path index sidecars exist in the directory.
@@ -1618,6 +2240,43 @@ fn path_sidecars_exist(dir: &Path) -> bool {
     ]
     .iter()
     .any(|name| dir.join(name).is_file())
+}
+
+/// Whether the trigram inverted-index sidecars are present in `dir`.
+fn ngram_sidecars_exist(dir: &Path) -> bool {
+    [
+        crate::ngram_index::FST_FILE,
+        crate::ngram_index::POSTINGS_FILE,
+    ]
+    .iter()
+    .any(|name| dir.join(name).is_file())
+}
+
+/// Resolve the set of candidate package ordinals from the trigram (n-gram)
+/// inverted path index for a LITERAL (non-regex) substring pattern.
+///
+/// Returns `None` when the pattern is not literal (too short / regex-like), the
+/// sidecars are absent, or they are unreadable — callers fall back to a full scan.
+#[allow(clippy::cognitive_complexity)]
+fn resolve_ngram_ordinals(reader: &Reader, literal: Option<&str>) -> Option<RoaringBitmap> {
+    let pat = literal?;
+    if pat.len() < 3 {
+        return None;
+    }
+    let dir = reader.path.parent()?;
+    if dir.as_os_str().is_empty() {
+        return None;
+    }
+    reader
+        .ngram()?
+        .candidate_ordinals(pat)
+        .map(|bm| bm.map(|b| b.into_iter().collect()))
+        .map_err(|err| {
+            if ngram_sidecars_exist(dir) {
+                tracing::warn!(%err, "ngram candidate lookup failed; falling back to full scan");
+            }
+        })
+        .ok()?
 }
 
 /// Format the `attr.output` label for a result, wrapping non-toplevels in parentheses.
@@ -1866,85 +2525,205 @@ pub fn search_results(
     resident: Option<ResidentIndexes<'_>>,
 ) -> crate::Result<Vec<(crate::StorePath, crate::files::FileTreeEntry)>> {
     let index_file = options.database.join("files");
+    let reader = Reader::open(&index_file).map_err(|source| crate::Error::ReadDatabase {
+        path: index_file.clone(),
+        source: Box::new(source),
+    })?;
+    search_results_with_reader(&reader, &index_file, options, resident)
+}
 
+/// Like [`search_results`], but uses an already-opened [`Reader`].
+///
+/// This lets long-running holders such as the resident daemon reuse the same
+/// mmap-backed reader (and any cached decoded frames) across queries instead of
+/// paying the open/decompression cost on every request.
+///
+/// # Errors
+///
+/// Returns an error if the pattern is invalid or the search fails.
+#[allow(clippy::cognitive_complexity)]
+#[allow(clippy::too_many_lines)]
+pub fn search_results_with_reader(
+    reader: &Reader,
+    index_file: &Path,
+    options: &SearchOptions<'_>,
+    resident: Option<ResidentIndexes<'_>>,
+) -> crate::Result<Vec<(crate::StorePath, crate::files::FileTreeEntry)>> {
     let path_pattern = compile_search_regex(&options.pattern, "path")?;
     let package_re = match &options.package_pattern {
         Some(pat) => Some(compile_search_regex(pat, "package")?),
         None => None,
     };
 
-    let (resident_path, resident_basename) = match resident {
-        Some(r) => (r.path_index, r.basename_index),
-        None => (None, None),
-    };
+    let basename_index = resident.as_ref().and_then(|r| r.basename_index);
+    let path_index = resident.as_ref().and_then(|r| r.path_index);
 
     // Resolve ordinals from basename index (for exact basename queries)
     let basename_ordinals = resolve_package_ordinals(
-        &index_file,
+        reader,
         options.exact_basename.as_deref(),
-        resident_basename,
+        basename_index,
     );
 
     // Resolve ordinals from path index (for rooted/prefix queries)
     let path_ordinals = resolve_path_ordinals(
-        &index_file,
+        reader,
         options.exact_path.as_deref(),
         options.path_prefix.as_deref(),
-        resident_path,
+        path_index,
     );
 
-    // Combine ordinals from both sources if both are present
-    let package_ordinals: Option<RoaringBitmap> = match (basename_ordinals, path_ordinals) {
-        (Some(b), Some(p)) => {
-            let combined = b | &p;
-            Some(combined)
-        }
+    // Combine basename + path ordinals (union) into the base candidate set.
+    let base_ordinals: Option<RoaringBitmap> = match (basename_ordinals, path_ordinals) {
+        (Some(b), Some(p)) => Some(b | &p),
         (Some(b), None) => Some(b),
         (None, Some(p)) => Some(p),
         (None, None) => None,
     };
 
+    // Narrow the candidate set further with the trigram inverted index when the
+    // query is a literal substring. An empty intersection means nothing matches.
+    let ngram_ordinals = resolve_ngram_ordinals(reader, options.literal_pattern.as_deref());
+
+    let package_ordinals: Option<RoaringBitmap> = match (base_ordinals, ngram_ordinals) {
+        (Some(b), Some(ng)) => Some(b & &ng),
+        (Some(b), None) => Some(b),
+        (None, Some(ng)) => Some(ng),
+        (None, None) => None,
+    };
+
+    // Only short-circuit before the fast paths when we already know the exact
+    // basename/path/prefix/literal candidates are empty and no fast path could
+    // change that. If any fast path may apply, let it run.
     if package_ordinals
         .as_ref()
         .is_some_and(RoaringBitmap::is_empty)
+        && options.exact_path.is_none()
+        && options.exact_basename.is_none()
+        && options.literal_pattern.is_none()
     {
         return Ok(Vec::new());
     }
 
-    let reader = Reader::open(&index_file).map_err(|source| crate::Error::ReadDatabase {
-        path: index_file.clone(),
-        source: Box::new(source),
-    })?;
+    // Try the fast path sidecars in order of specificity:
+    // 1. exact full path, 2. exact basename, 3. literal substring.
+    let mut results = Vec::new();
+    let mut used_fast_path = false;
 
-    // Try redb index for exact-path lookups when available.
-    // Apply the same package/hash filters the full scan would use.
-    let mut results = if let (Some(redb), Some(exact_path)) = (&reader.redb, &options.exact_path) {
-        let path_bytes = exact_path.as_bytes();
-        match redb.exact_path_entries(path_bytes) {
-            Ok(Some(mut hits)) => {
-                hits.retain(|(store_path, _)| {
-                    package_re
-                        .as_ref()
-                        .is_none_or(|re| re.is_match(store_path.name().as_bytes()))
-                        && options
-                            .hash
-                            .as_deref()
-                            .is_none_or(|h| h == store_path.hash())
-                });
-                hits
+    // 1. Exact full path: prefer the per-path entry cache, then redb.
+    if let Some(exact_path) = &options.exact_path {
+        let bytes = exact_path.as_bytes();
+        if let Some(path_entry) = reader.path_entry() {
+            let mut hits = Vec::new();
+            for (store_path, entry) in
+                path_entry
+                    .lookup_entries(bytes)
+                    .map_err(|source| crate::Error::ReadDatabase {
+                        path: index_file.to_path_buf(),
+                        source: Box::new(Error::PathEntryIndex(source)),
+                    })?
+            {
+                if package_re
+                    .as_ref()
+                    .is_none_or(|re| re.is_match(store_path.name().as_bytes()))
+                    && options
+                        .hash
+                        .as_deref()
+                        .is_none_or(|h| h == store_path.hash())
+                    && should_include_match(options, &path_pattern, &store_path, &entry)
+                {
+                    hits.push((store_path, entry));
+                }
             }
-            Ok(None) => Vec::new(),
-            Err(err) => {
-                tracing::debug!(%err, "redb exact-path lookup failed; falling back to scan");
-                Vec::new()
+            results = hits;
+            used_fast_path = true;
+        } else if let Some(redb) = reader.redb.get() {
+            let mut hits = Vec::new();
+            match redb.exact_path_entries(bytes) {
+                Ok(Some(redb_hits)) => {
+                    for (store_path, entry) in redb_hits {
+                        if package_re
+                            .as_ref()
+                            .is_none_or(|re| re.is_match(store_path.name().as_bytes()))
+                            && options
+                                .hash
+                                .as_deref()
+                                .is_none_or(|h| h == store_path.hash())
+                            && should_include_match(options, &path_pattern, &store_path, &entry)
+                        {
+                            hits.push((store_path, entry));
+                        }
+                    }
+                    results = hits;
+                    used_fast_path = true;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::debug!(%err, "redb exact-path lookup failed; falling back to scan");
+                }
             }
         }
-    } else {
-        Vec::new()
-    };
+    }
 
-    // If redb didn't return results (or wasn't used), fall back to full scan
-    if results.is_empty() {
+    // 2. Exact basename (whole_name without --root, or basename portion only).
+    if !used_fast_path
+        && options.exact_basename.is_some()
+        && options.exact_path.is_none()
+        && options.path_prefix.is_none()
+    {
+        let base_bytes = match options.exact_basename.as_deref() {
+            Some(s) => s.as_bytes(),
+            None => b"",
+        };
+        match reader.search_entry_index(
+            base_bytes,
+            &path_pattern,
+            package_re.as_ref(),
+            options.hash.as_deref(),
+            options,
+        ) {
+            Ok(Some(entry_results)) => {
+                results = entry_results;
+                used_fast_path = true;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::debug!(%err, "entry index search failed; falling back");
+            }
+        }
+    }
+
+    // 3. Literal substring: path-level trigram + entry cache.
+    if !used_fast_path
+        && options.literal_pattern.is_some()
+        && options.exact_basename.is_none()
+        && options.exact_path.is_none()
+        && options.path_prefix.is_none()
+    {
+        let pattern_str: &str = match options.literal_pattern.as_deref() {
+            Some(s) => s,
+            None => &options.pattern,
+        };
+        match reader.search_path_trigram(
+            pattern_str,
+            &path_pattern,
+            package_re.as_ref(),
+            options.hash.as_deref(),
+            options,
+        ) {
+            Ok(Some(path_results)) => {
+                results = path_results;
+                used_fast_path = true;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::debug!(%err, "path trigram search failed; falling back");
+            }
+        }
+    }
+
+    // 4. Fall back to frcode scanning when no fast path applied.
+    if !used_fast_path {
         results = reader
             .search_entries(
                 &path_pattern,
@@ -1954,7 +2733,7 @@ pub fn search_results(
                 package_ordinals.as_ref(),
             )
             .map_err(|source| crate::Error::ReadDatabase {
-                path: index_file,
+                path: index_file.to_path_buf(),
                 source: Box::new(source),
             })?;
     }
@@ -2049,6 +2828,22 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
 /// Returns an error if the database cannot be read, sidecars cannot be written,
 /// or the database is corrupt.
 pub fn generate_sidecars(db_path: &Path) -> Result<()> {
+    generate_sidecars_impl(db_path, true)
+}
+
+/// Like [`generate_sidecars`], but when `include_heavy` is `false` the heavy
+/// entry/ngram secondary indexes are skipped. The daemon uses this in `Lru`
+/// cache mode to defer their construction; queries fall back to full scans
+/// until the sidecars are built.
+#[cfg(feature = "daemon")]
+#[allow(dead_code)]
+pub(crate) fn generate_sidecars_mode(db_path: &Path, include_heavy: bool) -> Result<()> {
+    generate_sidecars_impl(db_path, include_heavy)
+}
+
+#[allow(clippy::cognitive_complexity)]
+#[allow(clippy::too_many_lines)]
+fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
     let reader = Reader::open(db_path)?;
     let db_dir = db_path
         .parent()
@@ -2058,7 +2853,21 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
     // Scan all frames to extract package paths and build secondary indexes.
     let mut builder = BasenameIndexBuilder::new();
     let mut path_builder = PathIndexBuilder::new();
-    let mut command_builder = crate::command_index::CommandIndexBuilder::new();
+    let mut entry_builder = if include_heavy {
+        Some(crate::entry_index::EntryIndexBuilder::new())
+    } else {
+        None
+    };
+    let mut path_entry_builder = if include_heavy {
+        Some(crate::path_entry_index::PathEntryIndexBuilder::new())
+    } else {
+        None
+    };
+    let mut ngram_builder = if include_heavy {
+        Some(crate::ngram_index::NgramIndexBuilder::new())
+    } else {
+        None
+    };
     let mut all_package_labels: Vec<String> = Vec::new();
     let mut all_package_meta: Vec<PackageMeta> = Vec::new();
     let mut all_package_attrs: Vec<(String, String, String)> = Vec::new();
@@ -2077,7 +2886,9 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
                 compressed,
                 &mut builder,
                 &mut path_builder,
-                &mut command_builder,
+                entry_builder.as_mut(),
+                path_entry_builder.as_mut(),
+                ngram_builder.as_mut(),
                 &mut all_package_labels,
                 &mut all_package_meta,
                 &mut all_package_attrs,
@@ -2102,7 +2913,9 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
                 &raw,
                 &mut builder,
                 &mut path_builder,
-                &mut command_builder,
+                entry_builder.as_mut(),
+                path_entry_builder.as_mut(),
+                ngram_builder.as_mut(),
                 &mut all_package_labels,
                 &mut all_package_meta,
                 &mut all_package_attrs,
@@ -2117,9 +2930,42 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
     path_builder
         .write_sidecars(db_dir)
         .map_err(Error::PathIndex)?;
-    command_builder
-        .write_sidecars(db_dir)
-        .map_err(Error::CommandIndex)?;
+
+    // Build and write the heavy secondary indexes when requested.
+    if let (Some(entry_builder), Some(path_entry_builder), Some(ngram_builder)) =
+        (entry_builder, path_entry_builder, ngram_builder)
+    {
+        // Write entry-level basename sidecar (fast command-not-found lookups).
+        entry_builder
+            .write_sidecars(db_dir)
+            .map_err(Error::EntryIndex)?;
+
+        // Build path-level trigram index from the sorted path entry map.
+        let mut path_trigram_builder = crate::path_trigram_index::PathTrigramIndexBuilder::new();
+        let mut path_id = 0u32;
+        for (path, _records) in path_entry_builder.iter() {
+            path_trigram_builder
+                .record_path(path_id, path)
+                .map_err(Error::PathTrigramIndex)?;
+            path_id = path_id
+                .checked_add(1)
+                .ok_or(Error::Corrupt("path-id overflow in path trigram index"))?;
+        }
+        path_trigram_builder
+            .write_sidecars(db_dir)
+            .map_err(Error::PathTrigramIndex)?;
+
+        // Write per-path entry cache last, after the trigram builder has consumed
+        // the sorted iterator.
+        path_entry_builder
+            .write_sidecars(db_dir)
+            .map_err(Error::PathEntryIndex)?;
+
+        // Write trigram (n-gram) inverted path index for fast literal queries.
+        ngram_builder
+            .write_sidecars(db_dir)
+            .map_err(Error::NgramIndex)?;
+    }
 
     // Write frame_map sidecar if we have v2 frame data.
     if let (Some(frame_map), Some(_frame_starts)) = (&reader.frame_map, &reader.frame_starts) {
@@ -2158,16 +3004,20 @@ fn write_packages_json(db_dir: &Path, packages: &[PackageMeta]) -> Result<()> {
 }
 
 /// Scan a decoded frcode stream to extract package paths.
+#[allow(clippy::too_many_arguments)]
 fn scan_decoder_for_packages<R: std::io::BufRead>(
     decoder: &mut frcode::Decoder<R>,
     builder: &mut BasenameIndexBuilder,
     path_builder: &mut PathIndexBuilder,
-    command_builder: &mut crate::command_index::CommandIndexBuilder,
+    mut entry_builder: Option<&mut crate::entry_index::EntryIndexBuilder>,
+    mut path_entry_builder: Option<&mut crate::path_entry_index::PathEntryIndexBuilder>,
+    mut ngram_builder: Option<&mut crate::ngram_index::NgramIndexBuilder>,
     all_package_labels: &mut Vec<String>,
     all_package_meta: &mut Vec<PackageMeta>,
     all_package_attrs: &mut Vec<(String, String, String)>,
 ) -> Result<()> {
     let mut current_paths: Vec<Vec<u8>> = Vec::new();
+    let mut current_entries: Vec<FileTreeEntry> = Vec::new();
 
     loop {
         let block = decoder.decode()?;
@@ -2200,26 +3050,51 @@ fn scan_decoder_for_packages<R: std::io::BufRead>(
                         description: None,
                         main_program: None,
                     });
-                    all_package_attrs.push((attr.clone(), output.clone(), pkg.hash().to_string()));
+                    all_package_attrs.push((attr, output, pkg.hash().to_string()));
 
                     let paths = std::mem::take(&mut current_paths);
+                    let entries = std::mem::take(&mut current_entries);
                     let ordinal = builder
                         .record_package(label, paths.clone())
                         .map_err(Error::SecondaryIndex)?;
                     path_builder
                         .record_package(ordinal, paths.clone())
                         .map_err(Error::PathIndex)?;
-                    command_builder
-                        .record_package(attr.clone(), output.clone(), pkg.origin().toplevel, paths)
-                        .map_err(Error::CommandIndex)?;
+                    if let Some(entry_builder) = entry_builder.as_mut() {
+                        entry_builder
+                            .record_package(&pkg, &entries)
+                            .map_err(Error::EntryIndex)?;
+                    }
+                    if let Some(path_entry_builder) = path_entry_builder.as_mut() {
+                        path_entry_builder
+                            .record_package(&pkg, &entries)
+                            .map_err(Error::PathEntryIndex)?;
+                    }
+                    if let Some(ngram_builder) = ngram_builder.as_mut() {
+                        ngram_builder
+                            .record_package(ordinal, paths)
+                            .map_err(Error::NgramIndex)?;
+                    }
                 }
             } else {
-                // File entry: extract path.
+                // File entry: extract path and (when building the entry index) node.
                 let sep = memchr::memchr(b'\0', line).ok_or_else(|| Error::EntryParse {
                     entry: line.to_vec(),
                 })?;
-                if let Some(path) = line.get(sep + 1..) {
-                    current_paths.push(path.to_vec());
+                let (meta, rest) = line.split_at(sep);
+                let path = rest.get(1..).ok_or_else(|| Error::EntryParse {
+                    entry: line.to_vec(),
+                })?;
+                current_paths.push(path.to_vec());
+                if entry_builder.is_some() || path_entry_builder.is_some() {
+                    let node =
+                        FileNode::<()>::decode_meta(meta).ok_or_else(|| Error::EntryParse {
+                            entry: line.to_vec(),
+                        })?;
+                    current_entries.push(FileTreeEntry {
+                        path: path.to_vec(),
+                        node,
+                    });
                 }
             }
         }
@@ -2229,11 +3104,14 @@ fn scan_decoder_for_packages<R: std::io::BufRead>(
 }
 
 /// Scan a single in-memory frcode frame to extract package paths.
+#[allow(clippy::too_many_arguments)]
 fn scan_frame_for_packages(
     raw: &[u8],
     builder: &mut BasenameIndexBuilder,
     path_builder: &mut PathIndexBuilder,
-    command_builder: &mut crate::command_index::CommandIndexBuilder,
+    entry_builder: Option<&mut crate::entry_index::EntryIndexBuilder>,
+    path_entry_builder: Option<&mut crate::path_entry_index::PathEntryIndexBuilder>,
+    ngram_builder: Option<&mut crate::ngram_index::NgramIndexBuilder>,
     all_package_labels: &mut Vec<String>,
     all_package_meta: &mut Vec<PackageMeta>,
     all_package_attrs: &mut Vec<(String, String, String)>,
@@ -2243,7 +3121,9 @@ fn scan_frame_for_packages(
         &mut decoder,
         builder,
         path_builder,
-        command_builder,
+        entry_builder,
+        path_entry_builder,
+        ngram_builder,
         all_package_labels,
         all_package_meta,
         all_package_attrs,
@@ -2254,11 +3134,14 @@ fn scan_frame_for_packages(
 ///
 /// This is used for NIXI v1 databases whose single frame is far larger than the
 /// bounded in-memory decode limit.
+#[allow(clippy::too_many_arguments)]
 fn scan_frame_stream_for_packages(
     compressed: &[u8],
     builder: &mut BasenameIndexBuilder,
     path_builder: &mut PathIndexBuilder,
-    command_builder: &mut crate::command_index::CommandIndexBuilder,
+    entry_builder: Option<&mut crate::entry_index::EntryIndexBuilder>,
+    path_entry_builder: Option<&mut crate::path_entry_index::PathEntryIndexBuilder>,
+    ngram_builder: Option<&mut crate::ngram_index::NgramIndexBuilder>,
     all_package_labels: &mut Vec<String>,
     all_package_meta: &mut Vec<PackageMeta>,
     all_package_attrs: &mut Vec<(String, String, String)>,
@@ -2266,12 +3149,15 @@ fn scan_frame_stream_for_packages(
     let cursor = std::io::Cursor::new(compressed);
     let mut zstd_decoder = zstd::stream::read::Decoder::new(cursor)?;
     zstd_decoder.window_log_max(crate::ZSTD_WINDOW_LOG_MAX)?;
-    let mut decoder = frcode::Decoder::new(std::io::BufReader::new(zstd_decoder));
+    let mut decoder =
+        frcode::Decoder::new(std::io::BufReader::with_capacity(1 << 20, zstd_decoder));
     scan_decoder_for_packages(
         &mut decoder,
         builder,
         path_builder,
-        command_builder,
+        entry_builder,
+        path_entry_builder,
+        ngram_builder,
         all_package_labels,
         all_package_meta,
         all_package_attrs,
@@ -2368,6 +3254,7 @@ mod tests {
             exact_basename: None,
             exact_path: None,
             path_prefix: None,
+            literal_pattern: None,
             file_type: &[],
             mode: SearchMode::Minimal,
             json: false,
@@ -2379,6 +3266,569 @@ mod tests {
             exclude_fhs: false,
         };
         search(&options).expect("search ok");
+    }
+
+    #[test]
+    fn ngram_narrows_search_results() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+        let path = sample_store_path();
+        let tree = sample_tree();
+
+        {
+            let mut writer = Writer::create(&db_path, 3).expect("create");
+            writer.add(&path, &tree, b"").expect("add");
+            writer.finish().expect("finish");
+        }
+
+        // Build the secondary sidecars (basename, path, entry, ngram).
+        generate_sidecars(&db_path).expect("sidecars");
+
+        let options = SearchOptions {
+            database: dir.path().to_path_buf(),
+            pattern: "bin/hello".into(),
+            hash: None,
+            package_pattern: None,
+            exact_basename: None,
+            exact_path: None,
+            path_prefix: None,
+            literal_pattern: Some("bin/hello".into()),
+            file_type: &[],
+            mode: SearchMode::Minimal,
+            json: false,
+            limit: None,
+            count: false,
+            sort: SearchSort::None,
+            min_size: None,
+            max_size: None,
+            exclude_fhs: false,
+        };
+
+        let hits = search_results(&options, None).expect("search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1.path.as_slice(), b"/bin/hello");
+        assert_eq!(hits[0].0.name(), "hello-2.12");
+    }
+
+    // Differential test: sidecar-pruned `search_results` must return exactly the
+    // same (store_path, path) set as a full-scan regex over the same literal
+    // substring. The ngram sidecar narrows by *package* ordinal, so this exercises
+    // that package ordinals in the sidecar indexes align with the decoder's
+    // per-frame `current_ordinal` (incl. multi-frame `frame_starts` threading).
+    #[test]
+    fn sidecar_search_matches_full_scan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+
+        let make_sp = |hash: &str, name: &str, attr: &str| {
+            StorePath::new(
+                "/nix/store".into(),
+                hash.into(),
+                name.into(),
+                Origin {
+                    attr: attr.into(),
+                    output: "out".into(),
+                    toplevel: true,
+                    system: Some("x86_64-linux".into()),
+                },
+            )
+        };
+        let hello = make_sp("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "hello-2.12", "hello");
+        let coreutils = make_sp(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "coreutils-9.5",
+            "coreutils",
+        );
+        let grep = make_sp("cccccccccccccccccccccccccccccccc", "grep-3.11", "grep");
+
+        // Filler so the raw database is large enough to span multiple zstd frames,
+        // which is the path that exercises `frame_map`/`frame_starts` alignment.
+        let filler: Vec<(Bytes, FileTree)> = (0..60)
+            .map(|i| {
+                (
+                    Bytes::from(format!("tool{i}").into_bytes()),
+                    FileTree::regular(64472, true),
+                )
+            })
+            .collect();
+
+        let hello_tree = FileTree::directory(vec![
+            (
+                Bytes::from_static(b"bin"),
+                FileTree::directory(
+                    std::iter::once((Bytes::from_static(b"hello"), FileTree::regular(64472, true)))
+                        .chain(filler.iter().cloned())
+                        .collect(),
+                ),
+            ),
+            (
+                Bytes::from_static(b"lib"),
+                FileTree::directory(vec![(
+                    Bytes::from_static(b"hello.a"),
+                    FileTree::regular(64472, false),
+                )]),
+            ),
+            (
+                Bytes::from_static(b"share"),
+                FileTree::directory(vec![(
+                    Bytes::from_static(b"doc"),
+                    FileTree::directory(vec![(
+                        Bytes::from_static(b"hello"),
+                        FileTree::directory(vec![(
+                            Bytes::from_static(b"README"),
+                            FileTree::regular(64472, false),
+                        )]),
+                    )]),
+                )]),
+            ),
+        ]);
+        let coreutils_tree = FileTree::directory(vec![
+            (
+                Bytes::from_static(b"bin"),
+                FileTree::directory(
+                    std::iter::once((Bytes::from_static(b"ls"), FileTree::regular(64472, true)))
+                        .chain(std::iter::once((
+                            Bytes::from_static(b"cat"),
+                            FileTree::regular(64472, true),
+                        )))
+                        .chain(filler.iter().cloned())
+                        .collect(),
+                ),
+            ),
+            (
+                Bytes::from_static(b"lib"),
+                FileTree::directory(vec![(
+                    Bytes::from_static(b"libc.so"),
+                    FileTree::regular(64472, false),
+                )]),
+            ),
+            (
+                Bytes::from_static(b"share"),
+                FileTree::directory(vec![(
+                    Bytes::from_static(b"man"),
+                    FileTree::directory(vec![(
+                        Bytes::from_static(b"man1"),
+                        FileTree::directory(vec![(
+                            Bytes::from_static(b"ls.1"),
+                            FileTree::regular(64472, false),
+                        )]),
+                    )]),
+                )]),
+            ),
+        ]);
+        let grep_tree = FileTree::directory(vec![
+            (
+                Bytes::from_static(b"bin"),
+                FileTree::directory(
+                    std::iter::once((Bytes::from_static(b"grep"), FileTree::regular(64472, true)))
+                        .chain(filler.iter().cloned())
+                        .collect(),
+                ),
+            ),
+            (
+                Bytes::from_static(b"lib"),
+                FileTree::directory(vec![(
+                    Bytes::from_static(b"libgrep.a"),
+                    FileTree::regular(64472, false),
+                )]),
+            ),
+            (
+                Bytes::from_static(b"share"),
+                FileTree::directory(vec![(
+                    Bytes::from_static(b"man"),
+                    FileTree::directory(vec![(
+                        Bytes::from_static(b"man1"),
+                        FileTree::directory(vec![(
+                            Bytes::from_static(b"grep.1"),
+                            FileTree::regular(64472, false),
+                        )]),
+                    )]),
+                )]),
+            ),
+        ]);
+
+        {
+            let mut writer = Writer::create(&db_path, 3).expect("create");
+            writer.add(&hello, &hello_tree, b"").expect("add");
+            writer.add(&coreutils, &coreutils_tree, b"").expect("add");
+            writer.add(&grep, &grep_tree, b"").expect("add");
+            writer.finish().expect("finish");
+        }
+
+        generate_sidecars(&db_path).expect("sidecars");
+
+        let reader = Reader::open(&db_path).expect("reader");
+        assert!(
+            reader.frame_starts.is_some(),
+            "expected frame_starts sidecar"
+        );
+
+        let normalize = |results: Vec<(StorePath, FileTreeEntry)>| -> Vec<(String, Vec<u8>)> {
+            let mut v: Vec<(String, Vec<u8>)> = results
+                .into_iter()
+                .map(|(sp, e)| (sp.name().to_string(), e.path.to_vec()))
+                .collect();
+            v.sort();
+            v
+        };
+
+        for pat in [
+            "bin", "lib", "share", "hello", "grep", "man1", "README", "/bin", "libc", "hello.a",
+        ] {
+            // Full-scan baseline: every entry whose path contains the literal substring.
+            let re = Regex::new(&regex::escape(pat)).expect("regex");
+            let baseline = reader
+                .search_entries(&re, None, None, None, None)
+                .expect("baseline search");
+
+            // Sidecar-pruned equivalent via `search_results`.
+            let options = SearchOptions {
+                database: dir.path().to_path_buf(),
+                pattern: regex::escape(pat),
+                hash: None,
+                package_pattern: None,
+                exact_basename: None,
+                exact_path: None,
+                path_prefix: None,
+                literal_pattern: Some(pat.into()),
+                file_type: &[],
+                mode: SearchMode::Minimal,
+                json: false,
+                limit: None,
+                count: false,
+                sort: SearchSort::None,
+                min_size: None,
+                max_size: None,
+                exclude_fhs: false,
+            };
+            let pruned = search_results(&options, None).expect("sidecar search");
+
+            assert_eq!(
+                normalize(pruned),
+                normalize(baseline),
+                "sidecar pruning diverged from full scan for literal {pat:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn entry_index_exact_basename_matches_full_scan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+
+        let hello = sample_store_path();
+        let hello2 = StorePath::new(
+            "/nix/store".into(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            "hello-2.13".into(),
+            Origin {
+                attr: "hello".into(),
+                output: "out".into(),
+                toplevel: true,
+                system: Some("x86_64-linux".into()),
+            },
+        );
+        let tree = sample_tree();
+
+        {
+            let mut writer = Writer::create(&db_path, 3).expect("create");
+            writer.add(&hello, &tree, b"").expect("add");
+            writer.add(&hello2, &tree, b"").expect("add");
+            writer.finish().expect("finish");
+        }
+
+        generate_sidecars(&db_path).expect("sidecars");
+
+        let reader = Reader::open(&db_path).expect("reader");
+        let re = Regex::new(&(regex::escape("hello") + "$")).expect("regex");
+        let baseline = reader
+            .search_entries(&re, None, None, None, None)
+            .expect("baseline");
+
+        let options = SearchOptions {
+            database: dir.path().to_path_buf(),
+            pattern: "hello$".into(),
+            hash: None,
+            package_pattern: None,
+            exact_basename: Some("hello".into()),
+            exact_path: None,
+            path_prefix: None,
+            literal_pattern: None,
+            file_type: &[],
+            mode: SearchMode::Minimal,
+            json: false,
+            limit: None,
+            count: false,
+            sort: SearchSort::None,
+            min_size: None,
+            max_size: None,
+            exclude_fhs: false,
+        };
+        let pruned = search_results(&options, None).expect("entry-index search");
+
+        let normalize = |results: Vec<(StorePath, FileTreeEntry)>| -> Vec<(String, Vec<u8>)> {
+            let mut v: Vec<(String, Vec<u8>)> = results
+                .into_iter()
+                .map(|(sp, e)| (sp.name().to_string(), e.path.to_vec()))
+                .collect();
+            v.sort();
+            v
+        };
+
+        assert_eq!(
+            normalize(pruned),
+            normalize(baseline),
+            "entry-index exact basename diverged from full scan"
+        );
+    }
+
+    #[test]
+    fn normalized_path_fast_path_matches_full_scan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+
+        let make_sp = |hash: &str, name: &str, attr: &str| {
+            StorePath::new(
+                "/nix/store".into(),
+                hash.into(),
+                name.into(),
+                Origin {
+                    attr: attr.into(),
+                    output: "out".into(),
+                    toplevel: true,
+                    system: Some("x86_64-linux".into()),
+                },
+            )
+        };
+        let coreutils = make_sp(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "coreutils-9.5",
+            "coreutils",
+        );
+
+        let tree = FileTree::directory(vec![
+            (
+                Bytes::from_static(b"bin"),
+                FileTree::directory(vec![
+                    (Bytes::from_static(b"ls"), FileTree::regular(64472, true)),
+                    (Bytes::from_static(b"cat"), FileTree::regular(64472, true)),
+                ]),
+            ),
+            (
+                Bytes::from_static(b"lib"),
+                FileTree::directory(vec![(
+                    Bytes::from_static(b"libc.so"),
+                    FileTree::regular(64472, false),
+                )]),
+            ),
+        ]);
+
+        {
+            let mut writer = Writer::create(&db_path, 1).expect("create");
+            writer.add(&coreutils, &tree, b"").expect("add");
+            writer.finish().expect("finish");
+        }
+        generate_sidecars(&db_path).expect("sidecars");
+
+        let reader = Reader::open(&db_path).expect("reader");
+
+        let normalize = |results: Vec<(StorePath, FileTreeEntry)>| -> Vec<Vec<u8>> {
+            let mut v: Vec<Vec<u8>> = results.into_iter().map(|(_, e)| e.path).collect();
+            v.sort();
+            v
+        };
+
+        for pat in ["bin/ls", "/bin/ls", "lib/libc.so", "/lib/libc.so"] {
+            let re = Regex::new(&regex::escape(pat)).expect("regex");
+            let baseline = reader
+                .search_entries(&re, None, None, None, None)
+                .expect("baseline search");
+
+            let options = SearchOptions {
+                database: dir.path().to_path_buf(),
+                pattern: regex::escape(pat),
+                hash: None,
+                package_pattern: None,
+                exact_basename: None,
+                exact_path: None,
+                path_prefix: None,
+                literal_pattern: Some(pat.into()),
+                file_type: &[],
+                mode: SearchMode::Minimal,
+                json: false,
+                limit: None,
+                count: false,
+                sort: SearchSort::None,
+                min_size: None,
+                max_size: None,
+                exclude_fhs: false,
+            };
+            let pruned = search_results(&options, None).expect("sidecar search");
+
+            assert_eq!(
+                normalize(pruned),
+                normalize(baseline),
+                "sidecar pruning diverged from full scan for literal {pat:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fast_path_fallbacks_for_regex_and_short_literals() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+
+        let make_sp = |hash: &str, name: &str, attr: &str| {
+            StorePath::new(
+                "/nix/store".into(),
+                hash.into(),
+                name.into(),
+                Origin {
+                    attr: attr.into(),
+                    output: "out".into(),
+                    toplevel: true,
+                    system: Some("x86_64-linux".into()),
+                },
+            )
+        };
+        let hello = make_sp(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "hello-2.12",
+            "hello",
+        );
+        let hello_tree = FileTree::directory(vec![(
+            Bytes::from_static(b"bin"),
+            FileTree::directory(vec![(
+                Bytes::from_static(b"hello"),
+                FileTree::regular(64472, true),
+            )]),
+        )]);
+
+        {
+            let mut writer = Writer::create(&db_path, 3).expect("create");
+            writer.add(&hello, &hello_tree, b"").expect("add");
+            writer.finish().expect("finish");
+        }
+
+        generate_sidecars(&db_path).expect("sidecars");
+
+        let reader = Reader::open(&db_path).expect("reader");
+
+        let normalize = |results: Vec<(StorePath, FileTreeEntry)>| -> Vec<(String, Vec<u8>)> {
+            let mut v: Vec<(String, Vec<u8>)> = results
+                .into_iter()
+                .map(|(sp, e)| (sp.name().to_string(), e.path.to_vec()))
+                .collect();
+            v.sort();
+            v
+        };
+
+        // Regex: path trigram fast path is skipped, falls back to frcode.
+        let regex_options = SearchOptions {
+            database: dir.path().to_path_buf(),
+            pattern: "b.n".into(),
+            hash: None,
+            package_pattern: None,
+            exact_basename: None,
+            exact_path: None,
+            path_prefix: None,
+            literal_pattern: None,
+            file_type: &[],
+            mode: SearchMode::Minimal,
+            json: false,
+            limit: None,
+            count: false,
+            sort: SearchSort::None,
+            min_size: None,
+            max_size: None,
+            exclude_fhs: false,
+        };
+        let regex_baseline = reader
+            .search_entries(&Regex::new("b.n").expect("regex"), None, None, None, None)
+            .expect("baseline");
+        let regex_pruned = search_results(&regex_options, None).expect("regex search");
+        assert_eq!(
+            normalize(regex_pruned),
+            normalize(regex_baseline),
+            "regex query diverged from full scan"
+        );
+
+        // Short literal (<3 bytes): path trigram returns None, falls back.
+        let short_options = SearchOptions {
+            database: dir.path().to_path_buf(),
+            pattern: "he".into(),
+            literal_pattern: Some("he".into()),
+            ..regex_options.clone()
+        };
+        let short_baseline = reader
+            .search_entries(&Regex::new("he").expect("regex"), None, None, None, None)
+            .expect("baseline");
+        let short_pruned = search_results(&short_options, None).expect("short literal search");
+        assert_eq!(
+            normalize(short_pruned),
+            normalize(short_baseline),
+            "short literal query diverged from full scan"
+        );
+    }
+
+    #[test]
+    fn missing_path_trigram_sidecars_fall_back_to_frcode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+        let path = sample_store_path();
+        let tree = sample_tree();
+
+        {
+            let mut writer = Writer::create(&db_path, 3).expect("create");
+            writer.add(&path, &tree, b"").expect("add");
+            writer.finish().expect("finish");
+        }
+
+        generate_sidecars(&db_path).expect("sidecars");
+
+        // Remove the new path-level sidecars so the fast paths cannot run.
+        let dir = db_path.parent().expect("parent");
+        let _ = std::fs::remove_file(dir.join(crate::path_trigram_index::FST_FILE));
+        let _ = std::fs::remove_file(dir.join(crate::path_trigram_index::POSTINGS_FILE));
+        let _ = std::fs::remove_file(dir.join(crate::path_entry_index::ENTRIES_FILE));
+        let _ = std::fs::remove_file(dir.join(crate::path_entry_index::FST_FILE));
+
+        let reader = Reader::open(&db_path).expect("reader");
+        let re = Regex::new(&regex::escape("bin/hello")).expect("regex");
+        let baseline = reader
+            .search_entries(&re, None, None, None, None)
+            .expect("baseline");
+
+        let options = SearchOptions {
+            database: dir.to_path_buf(),
+            pattern: "bin/hello".into(),
+            hash: None,
+            package_pattern: None,
+            exact_basename: None,
+            exact_path: None,
+            path_prefix: None,
+            literal_pattern: Some("bin/hello".into()),
+            file_type: &[],
+            mode: SearchMode::Minimal,
+            json: false,
+            limit: None,
+            count: false,
+            sort: SearchSort::None,
+            min_size: None,
+            max_size: None,
+            exclude_fhs: false,
+        };
+        let pruned = search_results(&options, None).expect("fallback search");
+
+        let mut baseline: Vec<_> = baseline.into_iter().map(|(_, e)| e.path).collect();
+        baseline.sort();
+        let mut pruned: Vec<_> = pruned.into_iter().map(|(_, e)| e.path).collect();
+        pruned.sort();
+
+        assert_eq!(
+            pruned, baseline,
+            "missing sidecars should fall back to frcode"
+        );
     }
 
     #[test]

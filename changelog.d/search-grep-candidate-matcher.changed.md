@@ -1,0 +1,1 @@
+- Rewrote `PathMatcher` to build a `grep`-style line matcher and `search_frame_decoder` to jump directly to candidate lines, decoding and verifying only path matches instead of every frcode line.

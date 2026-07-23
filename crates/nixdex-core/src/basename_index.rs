@@ -13,7 +13,8 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use byteorder::{LittleEndian, WriteBytesExt};
-use fst::Map;
+use fst::automaton::{Automaton, Str};
+use fst::{IntoStreamer, Map, Streamer};
 use mmap_guard;
 use roaring::RoaringBitmap;
 use thiserror::Error;
@@ -297,6 +298,38 @@ impl BasenameIndex {
         read_ordinals_at(&self.postings, cookie)
     }
 
+    /// Look up package ordinals for basenames that start with `prefix`.
+    ///
+    /// This is a safe over-approximation for literal patterns whose last `/`-delimited
+    /// component is `prefix`: any path containing such a literal must contain a path
+    /// component that starts with `prefix`, and that component appears in the index.
+    ///
+    /// Returns an empty list when no basenames match the prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the FST stream operation fails or postings are corrupt.
+    pub fn lookup_basename_prefix_ordinals(&self, prefix: &[u8]) -> Result<Vec<u32>> {
+        // FST automata operate on UTF-8 byte strings; a non-UTF-8 prefix can
+        // never match the valid UTF-8 keys stored in the index.
+        let Ok(prefix) = std::str::from_utf8(prefix) else {
+            return Ok(Vec::new());
+        };
+
+        let mut matched = RoaringBitmap::new();
+        let mut stream = self
+            .map
+            .search(Str::new(prefix).starts_with())
+            .into_stream();
+
+        while let Some((_key, cookie)) = stream.next() {
+            let ordinals = read_ordinals_at(&self.postings, cookie)?;
+            matched.extend(ordinals);
+        }
+
+        Ok(matched.iter().collect())
+    }
+
     /// Number of packages recorded in the name table.
     #[must_use]
     pub fn package_count(&self) -> usize {
@@ -462,6 +495,7 @@ fn parse_name_ranges(bytes: &[u8]) -> Result<Vec<(usize, usize)>> {
 mod tests {
     use super::*;
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn basename_of_paths() {
         assert_eq!(basename_of(b"/bin/ls"), b"ls");
@@ -470,6 +504,7 @@ mod tests {
         assert_eq!(basename_of(b"/bin/"), b"");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn build_and_query_exact_basename() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -511,6 +546,7 @@ mod tests {
         assert_eq!(ls_ordinals, vec![0, 2]); // coreutils (0), busybox (2)
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn open_missing_sidecar_is_missing_error() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -518,6 +554,7 @@ mod tests {
         assert!(matches!(err, Error::Missing { .. }));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn parse_name_ranges_rejects_empty_name() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -537,6 +574,7 @@ mod tests {
         assert!(err.to_string().contains("empty package name"));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn parse_name_ranges_rejects_excessive_count() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -556,6 +594,7 @@ mod tests {
         assert!(err.to_string().contains("package name count too large"));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn read_ordinals_at_rejects_excessive_count() {
         let mut postings = Vec::new();
@@ -570,6 +609,7 @@ mod tests {
         assert!(err.to_string().contains("too many ordinals"));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn lookup_basename_empty_index() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -583,6 +623,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn lookup_basename_multiple_matches() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -603,6 +644,7 @@ mod tests {
         assert_eq!(results.len(), 5);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn open_missing_fst_sidecar() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -615,6 +657,7 @@ mod tests {
         assert!(err.to_string().contains(FST_FILE));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn open_missing_postings_sidecar() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -627,6 +670,7 @@ mod tests {
         assert!(err.to_string().contains(POSTINGS_FILE));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn open_missing_names_sidecar() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -639,6 +683,7 @@ mod tests {
         assert!(err.to_string().contains(NAMES_FILE));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn oversized_fst_sidecar_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -656,6 +701,7 @@ mod tests {
         assert!(err.to_string().contains("too large"));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn oversized_postings_sidecar_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -674,6 +720,42 @@ mod tests {
         assert!(err.to_string().contains("too large"));
     }
 
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn build_and_query_basename_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut builder = BasenameIndexBuilder::new();
+        builder
+            .record_package(
+                "coreutils.out".into(),
+                vec![b"/bin/ls".to_vec(), b"/bin/lscpu".to_vec()],
+            )
+            .expect("pkg0");
+        builder
+            .record_package("hello.out".into(), vec![b"/bin/hello".to_vec()])
+            .expect("pkg1");
+        builder
+            .record_package(
+                "firefox.out".into(),
+                vec![b"/bin/firefox".to_vec(), b"/bin/firefox-profile".to_vec()],
+            )
+            .expect("pkg2");
+        builder.write_sidecars(dir.path()).expect("write");
+
+        let index = BasenameIndex::open(dir.path()).expect("open");
+        let mut ordinals = index
+            .lookup_basename_prefix_ordinals(b"fire")
+            .expect("fire prefix");
+        ordinals.sort();
+        assert_eq!(ordinals, vec![2u32]);
+
+        let ls = index
+            .lookup_basename_prefix_ordinals(b"ls")
+            .expect("ls prefix");
+        assert!(ls.contains(&0));
+    }
+
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn basename_of_edge_cases() {
         assert_eq!(basename_of(b""), b"");
@@ -685,6 +767,7 @@ mod tests {
         assert_eq!(basename_of(b"//double"), b"double");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn record_package_ordinal_overflow() {
         let mut builder = BasenameIndexBuilder::new();

@@ -1,0 +1,1 @@
+- Add path-level trigram and per-path entry sidecars so `nixdex locate` literal, exact-basename, and exact-path queries bypass frcode decoding.

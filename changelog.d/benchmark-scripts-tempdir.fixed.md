@@ -1,0 +1,1 @@
+- Use secure temporary directories and per-iteration files in benchmark scripts to avoid predictable `/tmp` paths and symlink/TOCTOU attacks.

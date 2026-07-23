@@ -43,7 +43,13 @@
         commonArgs = {
           inherit src;
           strictDeps = true;
-          buildInputs = [ pkgs.openssl ];
+          buildInputs = [
+            pkgs.openssl
+            # Native zlib: required by crates that link libz (e.g. under
+            # `--all-features`) and by the rustup-distributed nightly rustc,
+            # which dynamically links libz.
+            pkgs.zlib
+          ];
           nativeBuildInputs = [
             pkgs.cacert
             pkgs.clang

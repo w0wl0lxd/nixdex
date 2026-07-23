@@ -9,16 +9,20 @@ pub mod cdc;
 pub mod command_index;
 pub mod daemon;
 pub mod database;
+pub mod entry_index;
 pub mod errors;
 pub mod files;
 pub mod frcode;
 pub mod hydra;
 pub mod index;
 pub mod listings;
+pub mod ngram_index;
 pub mod nixpkgs;
 pub mod package_search;
 pub mod path_cache;
+pub mod path_entry_index;
 pub mod path_index;
+pub mod path_trigram_index;
 pub mod prebuilt;
 pub mod redb_index;
 pub mod store_path;
@@ -38,7 +42,11 @@ pub use store_path::{Origin, StorePath};
 pub const CACHE_URL: &str = "https://cache.nixos.org";
 
 /// Maximum uncompressed size accepted from a single zstd frame (defensive cap).
-pub(crate) const MAX_ZSTD_FRAME_BYTES: usize = 512 * 1024 * 1024;
+///
+/// Version 1 prebuilt indexes from upstream `nix-index-database` decompress to
+/// well over 1 GiB, so the cap must allow a full upstream database. It still
+/// protects against zstd bombs because it is bounded by `MAX_DATABASE_BYTES`.
+pub(crate) const MAX_ZSTD_FRAME_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 /// Maximum back-reference window log for zstd decoders (defensive cap).
 ///
@@ -53,7 +61,8 @@ pub(crate) const ZSTD_WINDOW_LOG_MAX: u32 = 27;
 /// This bounds the memory impact of a zstd bomb: a tiny compressed payload
 /// that expands to many gigabytes will hit the limit before OOMing the host.
 pub(crate) fn bounded_zstd_decode(compressed: &[u8], max_bytes: usize) -> io::Result<Vec<u8>> {
-    let mut decoder = zstd::stream::read::Decoder::new(compressed)?;
+    let mut decoder = zstd::stream::read::Decoder::with_buffer(compressed)?;
+    decoder = decoder.single_frame();
     decoder.window_log_max(ZSTD_WINDOW_LOG_MAX)?;
     let mut out = Vec::with_capacity(compressed.len().min(max_bytes));
     // Read one byte past the cap so we can tell whether the true size exceeds it.
@@ -105,6 +114,7 @@ pub fn search_database_results(
 mod tests {
     use super::bounded_zstd_decode;
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn bounded_zstd_decode_honors_limit() {
         let original = vec![b'a'; 1024 * 1024];

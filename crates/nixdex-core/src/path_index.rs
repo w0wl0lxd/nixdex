@@ -303,6 +303,7 @@ fn read_ordinals_at(postings: &[u8], cookie: u64) -> Result<Vec<u32>> {
 mod tests {
     use super::*;
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn build_and_query_exact_path() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -333,6 +334,7 @@ mod tests {
         assert!(missing.is_empty());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn build_and_query_prefix() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -360,6 +362,7 @@ mod tests {
         assert!(empty.is_empty());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn open_missing_sidecar_is_missing_error() {
         let dir = tempfile::tempdir().expect("tempdir");

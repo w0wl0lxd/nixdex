@@ -1,0 +1,1 @@
+- Exact attribute lookups in package search now use a pre-built index, making `nixdex info` and `nixdex search --exact --attr` O(1).

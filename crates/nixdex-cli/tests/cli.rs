@@ -146,6 +146,7 @@ fn write_fixture_database(dir: &std::path::Path) -> PathBuf {
 fn run(args: &[&str]) -> std::process::Output {
     Command::new(NIXDEX_EXE)
         .args(args)
+        .env("NIXDEX_NO_DAEMON", "1")
         .output()
         .expect("spawn nixdex")
 }
@@ -407,6 +408,7 @@ fn nix_locate_explicit_db_flag_overrides_default() {
     let output = Command::new(nix_locate_exe())
         .args(["-d", "/nonexistent-nixdex-test-dir-xyz", "somepattern"])
         .env("HOME", "/tmp/nixdex-test-home-override")
+        .env("NIXDEX_NO_DAEMON", "1")
         .env_remove("XDG_CACHE_HOME")
         .env_remove("NIX_INDEX_DATABASE")
         .output()
