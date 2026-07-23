@@ -21,25 +21,13 @@ cargo build --release --bin nixdex
 NIXDEX="$(realpath "${CARGO_TARGET_DIR:-target}/release/nixdex")"
 
 if [[ ! -f "$DB_DIR/files" ]]; then
-  echo "no database found at '$DB_DIR/files'; downloading prebuilt index..."
-  for attempt in 1 2 3; do
-    if "$NIXDEX" update --small -d "$DB_DIR"; then
-      break
-    fi
-    echo "download attempt $attempt failed; retrying in 10s..." >&2
-    sleep 10
-  done
-  if [[ ! -f "$DB_DIR/files" ]]; then
-    echo "error: failed to download prebuilt index to '$DB_DIR'" >&2
-    echo "Run 'nixdex update -d $DB_DIR' first, or pass an existing database directory." >&2
-    exit 1
-  fi
+  echo "error: no database found at '$DB_DIR/files'" >&2
+  echo "Run 'nixdex index --download-prebuilt -d $DB_DIR' first, or pass a database directory." >&2
+  exit 1
 fi
 
 if ! command -v nix-locate >/dev/null 2>&1; then
-  echo "error: nix-locate not found; cannot run comparison benchmark" >&2
-  echo "Ensure nix-index is installed on the runner before running this script." >&2
-  exit 1
+  echo "warning: nix-locate not found; only nixdex will be benchmarked" >&2
 fi
 
 QUERIES=(
