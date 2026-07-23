@@ -1,0 +1,1 @@
+- Extract a fixed literal prefix from regex patterns (e.g. `bin/` from `bin/.*test$`) via `regex_syntax` AST analysis and use it to prune candidate packages through the n-gram inverted index, reducing the number of frcode frames scanned for regex queries.
