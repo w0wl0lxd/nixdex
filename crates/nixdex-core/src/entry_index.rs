@@ -5,7 +5,7 @@
 //! - `files.entry.postings` — cookie → `u32` blob length + postcard blob of
 //!   `Vec<EntryRecord>`
 //! - `files.entryidx.sp` — postcard-serialized `Vec<StorePath>`, indexed by the
-//!   `store_path_idx` stored inside each [`EntryRecord`]
+//!   `store_path_idx` stored inside each `EntryRecord`
 //!
 //! For `command-not-found` / `find_command_providers` we look up an exact
 //! basename, then return every `(StorePath, FileTreeEntry)` that contributes a
@@ -31,7 +31,7 @@ const POSTINGS_MAGIC: &[u8] = b"NBEN";
 const SIDE_VERSION: u32 = 1;
 
 /// Maximum total size of the postings sidecar (defensive cap).
-const MAX_POSTINGS_BYTES: usize = 1 << 30;
+const MAX_POSTINGS_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
 /// Maximum total size of the FST sidecar (defensive cap).
 const MAX_FST_BYTES: usize = 512 << 20;
