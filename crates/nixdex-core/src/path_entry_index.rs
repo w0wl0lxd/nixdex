@@ -299,6 +299,11 @@ impl PathEntryIndex {
         Self::open_inner(db_dir)
     }
 
+    /// Return the number of unique paths in the index.
+    pub fn path_count(&self) -> usize {
+        self.map.len()
+    }
+
     fn open_inner(db_dir: &Path) -> IndexResult<Self> {
         for name in [
             FST_FILE,
