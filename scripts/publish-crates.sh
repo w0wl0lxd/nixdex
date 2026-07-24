@@ -6,7 +6,7 @@ set -euo pipefail
 # `nixdex` crate. Additional crate names can be passed as arguments for
 # future nixdex-XYZ subcrate names.
 
-DEFAULT_CRATES=(nixdex-core nixdex-cli nixdex-daemon nixdex)
+DEFAULT_CRATES=(nixdex-core nixdex-cli nixdex-daemon nixdex nixdex-history nixdex-options)
 MAX_ATTEMPTS=5
 RETRY_DELAY=30
 
