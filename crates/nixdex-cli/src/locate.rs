@@ -153,6 +153,11 @@ pub struct Opts {
     #[arg(long, short = '0', alias = "print0")]
     pub null_output: bool,
 
+    /// Read multiple search patterns from stdin (one per line) and
+    /// process them in a single invocation, reusing the DB handle.
+    #[arg(long)]
+    pub batch: bool,
+
     /// Disable the resident daemon and run a local search directly. The daemon
     /// keeps the index resident for warm sub-100ms queries; without it each
     /// invocation reloads the index from disk.
@@ -306,6 +311,33 @@ pub async fn run(matches: Opts) -> color_eyre::Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .try_init();
 
+    if matches.batch {
+        let args = process_args(matches)?;
+        let options = SearchOptions {
+            database: args.database,
+            pattern: args.pattern,
+            hash: args.hash,
+            package_pattern: args.package_pattern,
+            exact_basename: args.exact_basename,
+            exact_path: args.exact_path,
+            path_prefix: args.path_prefix,
+            literal_pattern: args.literal_pattern,
+            file_type: &args.file_type,
+            mode: args.mode,
+            json: args.json,
+            limit: args.limit,
+            count: args.count,
+            sort: args.sort,
+            min_size: args.min_size,
+            max_size: args.max_size,
+            exclude_fhs: args.exclude_fhs,
+            null_output: args.null_output,
+        };
+        let patterns = read_batch_patterns()?;
+        nixdex_core::search_database_batch(&options, &patterns).wrap_err("nix-locate failed")?;
+        return Ok(());
+    }
+
     if !matches.no_daemon && !crate::daemon_client::daemon_disabled() {
         match locate_via_daemon(&matches).await {
             Ok(lines) => {
@@ -345,6 +377,20 @@ pub async fn run(matches: Opts) -> color_eyre::Result<()> {
 
     nixdex_core::search_database(&options).wrap_err("nix-locate failed")?;
     Ok(())
+}
+
+/// Read search patterns from stdin, one per line. Empty lines are skipped.
+fn read_batch_patterns() -> color_eyre::Result<Vec<String>> {
+    let stdin = std::io::stdin();
+    let mut patterns = Vec::new();
+    for line in stdin.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            patterns.push(trimmed.to_string());
+        }
+    }
+    Ok(patterns)
 }
 
 /// Query the resident daemon, spawning one if necessary, and return rendered

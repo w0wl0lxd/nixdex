@@ -528,7 +528,9 @@ impl Writer {
                     self.basename_index.write_sidecars(dir)?;
                     write_attrs_sidecar(dir, &self.attrs)?;
                     self.path_index.write_sidecars(dir)?;
-                    self.command_index.write_sidecars(dir).map_err(Error::CommandIndex)?;
+                    self.command_index
+                        .write_sidecars(dir)
+                        .map_err(Error::CommandIndex)?;
                     if let Some(redb) = self.redb.take() {
                         redb.finish()
                             .map_err(|err| Error::Io(std::io::Error::other(err.to_string())))?;
@@ -580,7 +582,9 @@ impl Writer {
             self.basename_index.write_sidecars(dir)?;
             write_attrs_sidecar(dir, &self.attrs)?;
             self.path_index.write_sidecars(dir)?;
-            self.command_index.write_sidecars(dir).map_err(Error::CommandIndex)?;
+            self.command_index
+                .write_sidecars(dir)
+                .map_err(Error::CommandIndex)?;
             if let Some(redb) = self.redb.take() {
                 redb.finish()
                     .map_err(|err| Error::Io(std::io::Error::other(err.to_string())))?;
@@ -1752,7 +1756,9 @@ fn next_matching_line<M: Matcher<Error = NoError>>(
 /// Returns `Some(prefix)` when the prefix is at least 3 bytes (the minimum
 /// trigram length), otherwise `None`.
 fn extract_regex_literal_prefix(pattern: &str) -> Option<String> {
-    let ast = regex_syntax::ast::parse::Parser::new().parse(pattern).ok()?;
+    let ast = regex_syntax::ast::parse::Parser::new()
+        .parse(pattern)
+        .ok()?;
     let prefix = literal_prefix_from_ast(&ast)?;
     if prefix.len() >= 3 {
         Some(prefix)
@@ -1766,7 +1772,9 @@ fn extract_regex_literal_prefix(pattern: &str) -> Option<String> {
 /// Mirrors [`extract_regex_literal_prefix`] but walks the `Concat` children in
 /// reverse, accumulating from the tail. For `bin/.*test$` this returns `test`.
 fn extract_regex_literal_suffix(pattern: &str) -> Option<String> {
-    let ast = regex_syntax::ast::parse::Parser::new().parse(pattern).ok()?;
+    let ast = regex_syntax::ast::parse::Parser::new()
+        .parse(pattern)
+        .ok()?;
     let suffix = literal_suffix_from_ast(&ast)?;
     if suffix.len() >= 3 {
         Some(suffix)
@@ -2780,11 +2788,8 @@ pub fn search_results_with_reader(
     let path_index = resident.as_ref().and_then(|r| r.path_index);
 
     // Resolve ordinals from basename index (for exact basename queries)
-    let basename_ordinals = resolve_package_ordinals(
-        reader,
-        options.exact_basename.as_deref(),
-        basename_index,
-    );
+    let basename_ordinals =
+        resolve_package_ordinals(reader, options.exact_basename.as_deref(), basename_index);
 
     // Resolve ordinals from path index (for rooted/prefix queries)
     let path_ordinals = resolve_path_ordinals(
@@ -3079,6 +3084,60 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
 
     if options.count {
         println!("{matched}");
+    }
+
+    Ok(())
+}
+
+/// Search the database for multiple patterns in a single invocation,
+/// reusing the DB reader across queries to avoid repeated open overhead.
+pub fn search_batch(options: &SearchOptions<'_>, patterns: &[String]) -> crate::Result<()> {
+    let index_file = options.database.join("files");
+    let reader = Reader::open(&index_file).map_err(|source| crate::Error::ReadDatabase {
+        path: index_file.clone(),
+        source: Box::new(source),
+    })?;
+
+    let package_db = (|| {
+        let path = options.database.join("packages.json");
+        if path.exists() {
+            crate::package_search::SearchDb::open(&path).ok()
+        } else {
+            None
+        }
+    })();
+
+    for pattern in patterns {
+        let mut batch_options = options.clone();
+        batch_options.pattern = pattern.clone();
+        batch_options.literal_pattern = None;
+
+        let results = search_results_with_reader(&reader, &index_file, &batch_options, None)?;
+
+        if batch_options.count {
+            println!("{}", results.len());
+            continue;
+        }
+
+        let path_pattern = compile_search_regex(&batch_options.pattern, "path")?;
+        let mut printed_attrs: IndexSet<String> = IndexSet::new();
+        let mut printed = 0usize;
+
+        for (store_path, entry) in results {
+            if batch_options.limit.is_some_and(|limit| printed >= limit) {
+                break;
+            }
+            if print_match(
+                &batch_options,
+                package_db.as_ref(),
+                &path_pattern,
+                &mut printed_attrs,
+                &store_path,
+                &entry,
+            ) {
+                printed += 1;
+            }
+        }
     }
 
     Ok(())
@@ -4037,7 +4096,7 @@ mod tests {
 
         // Short literal (<3 bytes): path trigram returns None, falls back.
         let short_options = SearchOptions {
-    null_output: false,
+            null_output: false,
             pattern: "he".into(),
             literal_pattern: Some("he".into()),
             ..regex_options.clone()
@@ -4681,7 +4740,10 @@ mod tests {
             Bytes::from_static(b"bin"),
             FileTree::directory(vec![
                 (Bytes::from_static(b"ls"), FileTree::regular(0, true)),
-                (Bytes::from_static(b"test_runner"), FileTree::regular(0, true)),
+                (
+                    Bytes::from_static(b"test_runner"),
+                    FileTree::regular(0, true),
+                ),
                 (Bytes::from_static(b"test"), FileTree::regular(0, true)),
             ]),
         )]);

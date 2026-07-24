@@ -269,7 +269,7 @@ impl EvalJob {
         self.meta.as_ref()?.main_program.as_deref()
     }
 
-/// Return the value of `meta.description`, if any.
+    /// Return the value of `meta.description`, if any.
     #[must_use]
     pub fn description(&self) -> Option<&str> {
         self.meta.as_ref()?.description.as_deref()
@@ -290,7 +290,11 @@ impl EvalJob {
     /// Return the value of `meta.maintainers`, if present, as a list of strings.
     #[must_use]
     pub fn maintainers(&self) -> Option<Vec<String>> {
-        self.meta.as_ref()?.maintainers.as_ref().map(|v| extract_maintainers(v))
+        self.meta
+            .as_ref()?
+            .maintainers
+            .as_ref()
+            .map(|v| extract_maintainers(v))
     }
 
     /// Return the value of `meta.platforms`, if present.
@@ -339,23 +343,21 @@ fn extract_license(value: &sonic_rs::Value) -> String {
 fn extract_maintainers(values: &Vec<sonic_rs::Value>) -> Vec<String> {
     values
         .iter()
-        .filter_map(|v| {
-            match v.as_ref() {
-                sonic_rs::ValueRef::String(s) => Some(s.to_string()),
-                sonic_rs::ValueRef::Object(map) => {
-                    let mut result = None;
-                    for (k, v) in map.iter() {
-                        if k == "email" || k == "github" || k == "name" {
-                            if let sonic_rs::ValueRef::String(s) = v.as_ref() {
-                                result = Some(s.to_string());
-                                break;
-                            }
+        .filter_map(|v| match v.as_ref() {
+            sonic_rs::ValueRef::String(s) => Some(s.to_string()),
+            sonic_rs::ValueRef::Object(map) => {
+                let mut result = None;
+                for (k, v) in map.iter() {
+                    if k == "email" || k == "github" || k == "name" {
+                        if let sonic_rs::ValueRef::String(s) = v.as_ref() {
+                            result = Some(s.to_string());
+                            break;
                         }
                     }
-                    result
                 }
-                _ => None,
+                result
             }
+            _ => None,
         })
         .collect()
 }

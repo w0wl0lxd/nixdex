@@ -670,20 +670,21 @@ async fn nix_locate_handler(
         ));
     }
 
-    let (database_dir, resident_path, resident_basename, package_db) = match read_snapshot(&index_state) {
-        Some(snapshot) => (
-            snapshot.database_dir,
-            Some(std::sync::Arc::clone(&snapshot.path_index)),
-            Some(std::sync::Arc::clone(&snapshot.basename)),
-            snapshot.package_db,
-        ),
-        None => {
-            return Err(json_error(
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "no database loaded",
-            ));
-        }
-    };
+    let (database_dir, resident_path, resident_basename, package_db) =
+        match read_snapshot(&index_state) {
+            Some(snapshot) => (
+                snapshot.database_dir,
+                Some(std::sync::Arc::clone(&snapshot.path_index)),
+                Some(std::sync::Arc::clone(&snapshot.basename)),
+                snapshot.package_db,
+            ),
+            None => {
+                return Err(json_error(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "no database loaded",
+                ));
+            }
+        };
 
     // Build the path regex with anchors based on at_root/whole_name.
     let start_anchor = if params.at_root { "^" } else { "" };
@@ -770,7 +771,11 @@ async fn nix_locate_handler(
             max_size: params.max_size,
             exclude_fhs: params.exclude_fhs,
             null_output: params.null_output,
-            literal_pattern: (!params.regex && !params.at_root && !params.whole_name && !params.pattern.is_empty()).then(|| params.pattern.clone()),
+            literal_pattern: (!params.regex
+                && !params.at_root
+                && !params.whole_name
+                && !params.pattern.is_empty())
+            .then(|| params.pattern.clone()),
         };
 
         let resident = crate::database::ResidentIndexes {
