@@ -3,3 +3,4 @@
 pub mod daemon_client;
 pub mod index;
 pub mod locate;
+pub mod tui;

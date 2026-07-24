@@ -1,0 +1,21 @@
+[package]
+name = "nixdex-tui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Interactive ratatui TUI for nixdex"
+publish = true
+
+[dependencies]
+nixdex-core = { workspace = true, features = ["cli", "daemon"] }
+ratatui = { workspace = true }
+crossterm = { workspace = true, features = ["event-stream"] }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+color-eyre = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

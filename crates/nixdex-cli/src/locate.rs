@@ -107,6 +107,10 @@ pub struct Opts {
     #[arg(long, value_enum, default_value = "auto")]
     pub color: Color,
 
+    /// Alias for `--color=never`.
+    #[arg(long)]
+    pub no_color: bool,
+
     /// Only print matches whose basename matches PATTERN exactly.
     #[arg(short = 'w', long)]
     pub whole_name: bool,
@@ -153,6 +157,15 @@ pub struct Opts {
     #[arg(long, short = '0', alias = "print0")]
     pub null_output: bool,
 
+    /// Suppress all non-error output.
+    #[arg(long)]
+    pub quiet: bool,
+
+    /// Show expanded metadata (description, license, homepage, maintainers)
+    /// alongside the standard locate output.
+    #[arg(long)]
+    pub details: bool,
+
     /// Read multiple search patterns from stdin (one per line) and
     /// process them in a single invocation, reusing the DB handle.
     #[arg(long)]
@@ -185,6 +198,8 @@ struct ProcessedArgs {
     max_size: Option<u64>,
     exclude_fhs: bool,
     null_output: bool,
+    quiet: bool,
+    details: bool,
 }
 
 fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
@@ -252,10 +267,14 @@ fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
     let pattern = make_pattern(&matches.pattern, true);
     let package_pattern = matches.package.as_deref().map(|p| make_pattern(p, false));
 
-    let color = match matches.color {
-        Color::Auto => std::io::stdout().is_terminal(),
-        Color::Always => true,
-        Color::Never => false,
+    let color = if matches.no_color {
+        false
+    } else {
+        match matches.color {
+            Color::Auto => std::io::stdout().is_terminal(),
+            Color::Always => true,
+            Color::Never => false,
+        }
     };
 
     let file_type = match matches.r#type {
@@ -298,6 +317,8 @@ fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
         max_size: matches.max_size,
         exclude_fhs: matches.exclude_fhs,
         null_output: matches.null_output,
+        quiet: matches.quiet,
+        details: matches.details,
     })
 }
 
@@ -332,6 +353,8 @@ pub async fn run(matches: Opts) -> color_eyre::Result<()> {
             max_size: args.max_size,
             exclude_fhs: args.exclude_fhs,
             null_output: args.null_output,
+            quiet: args.quiet,
+            details: args.details,
         };
         let patterns = read_batch_patterns()?;
         nixdex_core::search_database_batch(&options, &patterns).wrap_err("nix-locate failed")?;
@@ -373,6 +396,8 @@ pub async fn run(matches: Opts) -> color_eyre::Result<()> {
         max_size: args.max_size,
         exclude_fhs: args.exclude_fhs,
         null_output: args.null_output,
+        quiet: args.quiet,
+        details: args.details,
     };
 
     nixdex_core::search_database(&options).wrap_err("nix-locate failed")?;
@@ -406,6 +431,8 @@ async fn locate_via_daemon(opts: &Opts) -> Result<Vec<String>, crate::daemon_cli
         opts.json,
         opts.minimal,
         opts.null_output,
+        opts.quiet,
+        opts.details,
     ))
 }
 
@@ -420,6 +447,8 @@ fn daemon_query(opts: &Opts) -> Vec<(String, String)> {
         ("count".into(), opts.count.to_string()),
         ("exclude_fhs".into(), opts.exclude_fhs.to_string()),
         ("null".into(), opts.null_output.to_string()),
+        ("quiet".into(), opts.quiet.to_string()),
+        ("details".into(), opts.details.to_string()),
     ];
     if let Some(p) = &opts.package {
         q.push(("package".into(), p.clone()));

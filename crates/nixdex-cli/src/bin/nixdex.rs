@@ -2,16 +2,20 @@
 //! and description from the `packages.json` sidecar.
 
 use std::io::IsTerminal;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate, generate_to};
 use color_eyre::eyre::WrapErr;
+use tracing;
 use tracing_subscriber::EnvFilter;
 
 use nixdex_cli::{index, locate};
 use nixdex_core::package_search::{SearchDb, SearchField, SearchSort};
+use nixdex_history::HistoryDb;
+use nixdex_options::OptionsDb;
 
 /// Detect which comma command is available on `$PATH` ("," or "comma").
 /// Returns the detected command token, or `None` if neither is available.
@@ -83,6 +87,10 @@ enum Cmd {
     Search(SearchOpts),
     /// Show metadata for a single attribute.
     Info(InfoOpts),
+    /// Show version history for a package attribute.
+    History(HistoryOpts),
+    /// Search NixOS module options.
+    Options(OptionsOpts),
     /// Print database statistics and sidecar status.
     Stats(StatsOpts),
     /// Generate shell completions.
@@ -164,9 +172,44 @@ struct SearchOpts {
     #[arg(long)]
     json: bool,
 
+    /// Stream results as they are found, flushing after each line.
+    #[arg(long)]
+    stream: bool,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    format: OutputFormat,
+
     /// Whether to use colors in output.
     #[arg(long, value_enum, default_value = "auto")]
     color: Color,
+
+    /// Alias for `--color=never`.
+    #[arg(long)]
+    no_color: bool,
+
+    /// Exclude results matching PATTERN.
+    #[arg(long)]
+    exclude: Option<String>,
+
+    /// Exclude results matching REGEX pattern.
+    #[arg(long)]
+    exclude_regex: Option<String>,
+
+    /// Reverse the sort order.
+    #[arg(long)]
+    reverse: bool,
+}
+
+/// Output format for search results.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum OutputFormat {
+    /// Human-readable tabular format.
+    Table,
+    /// NDJSON (one JSON object per line).
+    Ndjson,
+    /// CSV format.
+    Csv,
 }
 
 /// Show metadata for a single package attribute.
@@ -180,6 +223,48 @@ struct InfoOpts {
     /// Directory where the index is stored.
     #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
     database: PathBuf,
+
+    /// Print the result as JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Show version history for a package attribute.
+#[derive(Debug, Parser)]
+#[command(author, about, version)]
+struct HistoryOpts {
+    /// Attribute path to look up.
+    #[arg(value_name = "ATTR")]
+    attr: String,
+
+    /// Directory where the index is stored.
+    #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
+    database: PathBuf,
+
+    /// Print the result as JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Search NixOS module options.
+#[derive(Debug, Parser)]
+#[command(author, about, version)]
+struct OptionsOpts {
+    /// Search pattern.
+    #[arg(value_name = "PATTERN")]
+    pattern: String,
+
+    /// Directory where the index is stored.
+    #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
+    database: PathBuf,
+
+    /// Match case-sensitively.
+    #[arg(long)]
+    case_sensitive: bool,
+
+    /// Maximum number of results.
+    #[arg(short, long)]
+    limit: Option<usize>,
 
     /// Print the result as JSON.
     #[arg(long)]
@@ -405,12 +490,21 @@ fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
     }
 
     let db = SearchDb::open(&sidecar).wrap_err("failed to load package metadata sidecar")?;
+
+    let sort = if opts.reverse {
+        SearchSort::Reverse
+    } else {
+        opts.sort
+    };
+
+    let exclude_pattern = opts.exclude.as_deref().or(opts.exclude_regex.as_deref());
+
     let matches = if opts.fuzzy {
         db.search_fuzzy(
             &opts.pattern,
             opts.field,
             opts.case_sensitive,
-            opts.sort,
+            sort,
             opts.limit,
         )
     } else {
@@ -420,15 +514,53 @@ fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
             opts.field,
             opts.case_sensitive,
             opts.exact,
-            opts.sort,
+            sort,
             opts.limit,
         )
     }
     .wrap_err("search failed")?;
 
+    let matches: Vec<_> = if let Some(exclude) = exclude_pattern {
+        let regex = regex::Regex::new(exclude)
+            .wrap_err_with(|| format!("invalid exclude pattern: {exclude}"))?;
+        matches
+            .into_iter()
+            .filter(|r| !regex.is_match(&r.attr))
+            .collect()
+    } else {
+        matches
+    };
+
     if opts.count {
         println!("{}", matches.len());
         return Ok(());
+    }
+
+    let use_color = if opts.no_color {
+        false
+    } else {
+        opts.color.use_color()
+    };
+
+    match opts.format {
+        OutputFormat::Ndjson => {
+            for record in matches {
+                let line =
+                    sonic_rs::to_string(record).wrap_err("failed to serialize search result")?;
+                println!("{line}");
+            }
+            return Ok(());
+        }
+        OutputFormat::Csv => {
+            println!("attr,name,description,main_program");
+            for record in matches {
+                let desc = record.description.as_deref().map_or("", |d| d);
+                let main = record.main_program.as_deref().map_or("", |m| m);
+                println!("{},{},{},{}", record.attr, record.name, desc, main);
+            }
+            return Ok(());
+        }
+        OutputFormat::Table => {}
     }
 
     if opts.json {
@@ -439,7 +571,6 @@ fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
         return Ok(());
     }
 
-    let use_color = opts.color.use_color();
     for record in matches {
         let desc = record.description.as_deref().map_or("—", |d| d);
         if opts.name_only {
@@ -453,6 +584,11 @@ fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
             );
         } else {
             println!("{}\t{}\t{}", record.attr, record.name, desc);
+        }
+        if opts.stream {
+            std::io::stdout()
+                .flush()
+                .wrap_err("failed to flush stdout")?;
         }
     }
 
@@ -502,6 +638,79 @@ fn run_info(opts: InfoOpts) -> color_eyre::Result<()> {
     Ok(())
 }
 
+fn run_history(opts: HistoryOpts) -> color_eyre::Result<()> {
+    let history_file = opts.database.join("files.history");
+    if !history_file.exists() {
+        color_eyre::eyre::bail!(
+            "no version history sidecar found at {}. Run `nix-index` first.",
+            history_file.display()
+        );
+    }
+
+    let db = HistoryDb::open(&opts.database).wrap_err("failed to load history sidecar")?;
+    let versions = db.lookup_attr(&opts.attr);
+
+    if versions.is_empty() {
+        color_eyre::eyre::bail!("no version history found for attr {}", opts.attr);
+    }
+
+    if opts.json {
+        println!(
+            "{}",
+            sonic_rs::to_string(&versions).wrap_err("failed to serialize history")?
+        );
+    } else {
+        println!("{}:", opts.attr);
+        for entry in &versions {
+            println!("  {}  {}  {}", entry.version, entry.commit, entry.date);
+        }
+    }
+
+    Ok(())
+}
+
+fn run_options(opts: OptionsOpts) -> color_eyre::Result<()> {
+    let options_file = opts.database.join("files.options");
+    if !options_file.exists() {
+        color_eyre::eyre::bail!(
+            "no options sidecar found at {}. Run `nix-index --options` first.",
+            options_file.display()
+        );
+    }
+
+    let db = OptionsDb::open(&opts.database).wrap_err("failed to load options sidecar")?;
+    let mut results = db.search(&opts.pattern, opts.case_sensitive);
+
+    if let Some(limit) = opts.limit {
+        results.truncate(limit);
+    }
+
+    if opts.json {
+        println!(
+            "{}",
+            sonic_rs::to_string(&results).wrap_err("failed to serialize options results")?
+        );
+    } else {
+        for record in &results {
+            println!("{}:", record.attr);
+            println!("  type: {}", record.r#type);
+            if let Some(desc) = record.description.strip_prefix("| ") {
+                println!("  description: {desc}");
+            } else {
+                println!("  description: {}", record.description);
+            }
+            if let Some(default) = &record.default {
+                println!("  default: {default}");
+            }
+            if let Some(example) = &record.example {
+                println!("  example: {example}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn run_stats(opts: StatsOpts) -> color_eyre::Result<()> {
     let files = opts.database.join("files");
     if !files.is_file() {
@@ -522,6 +731,8 @@ fn run_stats(opts: StatsOpts) -> color_eyre::Result<()> {
         "files.path.fst",
         "files.path.postings",
         "files.attrs",
+        "files.history",
+        "files.options",
         "packages.json",
     ];
     let mut sidecar_sizes = std::collections::BTreeMap::new();
@@ -639,7 +850,86 @@ async fn run_update(opts: UpdateOpts) -> color_eyre::Result<()> {
         .await
         .wrap_err("failed to download prebuilt index")?;
 
+    // Download version history and options sidecars alongside the prebuilt index.
+    let dest_dir = opts.database.clone();
+    if let Err(err) = download_history_sidecar(&config, &dest_dir).await {
+        tracing::warn!(error = %err, "failed to download history sidecar");
+    }
+    if let Err(err) = download_options_sidecar(&config, &dest_dir).await {
+        tracing::warn!(error = %err, "failed to download options sidecar");
+    }
+
     println!("updated index at {}", opts.database.display());
+    Ok(())
+}
+
+async fn download_history_sidecar(
+    config: &nixdex_core::prebuilt::PrebuiltConfig,
+    dest_dir: &std::path::Path,
+) -> color_eyre::Result<()> {
+    let filename = if config.small {
+        format!("index-{}-small.history", config.architecture)
+    } else {
+        format!("index-{}.history", config.architecture)
+    };
+    let url = format!("{}/{}", config.release_url, filename);
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("nixdex/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|err| color_eyre::eyre::eyre!("failed to build HTTP client: {err}"))?;
+    let dest = dest_dir.join(nixdex_history::HISTORY_FILE);
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|err| color_eyre::eyre::eyre!("failed to download history sidecar: {err}"))?;
+    if response.status().is_success() {
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!("failed to read history sidecar: {err}"))?;
+        tokio::fs::write(&dest, &bytes).await?;
+        tracing::info!(path = %dest.display(), "downloaded history sidecar");
+    }
+    Ok(())
+}
+
+async fn download_options_sidecar(
+    config: &nixdex_core::prebuilt::PrebuiltConfig,
+    dest_dir: &std::path::Path,
+) -> color_eyre::Result<()> {
+    let filename = if config.small {
+        format!("index-{}-small.options", config.architecture)
+    } else {
+        format!("index-{}.options", config.architecture)
+    };
+    let url = format!("{}/{}", config.release_url, filename);
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("nixdex/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|err| color_eyre::eyre::eyre!("failed to build HTTP client: {err}"))?;
+    let dest = dest_dir.join(nixdex_options::OPTIONS_FILE);
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|err| color_eyre::eyre::eyre!("failed to download options sidecar: {err}"))?;
+    if response.status().is_success() {
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!("failed to read options sidecar: {err}"))?;
+        tokio::fs::write(&dest, &bytes).await?;
+        tracing::info!(path = %dest.display(), "downloaded options sidecar");
+    }
     Ok(())
 }
 
@@ -1175,6 +1465,8 @@ async fn main() -> color_eyre::Result<()> {
     match opts.cmd {
         Cmd::Search(search_opts) => run_search(search_opts),
         Cmd::Info(info_opts) => run_info(info_opts),
+        Cmd::History(history_opts) => run_history(history_opts),
+        Cmd::Options(options_opts) => run_options(options_opts),
         Cmd::Stats(stats_opts) => run_stats(stats_opts),
         Cmd::Completions(opts) => {
             run_completions(opts);

@@ -50,6 +50,10 @@ struct IndexSnapshot {
     reader: Arc<Reader>,
     /// Loaded package metadata database, if present.
     package_db: Option<Arc<crate::package_search::SearchDb>>,
+    /// Loaded version history database, if present.
+    history_db: Option<Arc<nixdex_history::HistoryDb>>,
+    /// Loaded options database, if present.
+    options_db: Option<Arc<nixdex_options::OptionsDb>>,
 }
 
 #[cfg(feature = "daemon")]
@@ -418,6 +422,36 @@ fn load_and_store_index(cache_dir: &std::path::Path, index_state: &IndexState) {
         }
     };
 
+    let history_db = {
+        let history_file = index_dir.join("files.history");
+        if history_file.exists() {
+            match nixdex_history::HistoryDb::open(&index_dir) {
+                Ok(db) => Some(Arc::new(db)),
+                Err(err) => {
+                    tracing::warn!(error = %err, path = %history_file.display(), "failed to load history sidecar");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
+    let options_db = {
+        let options_file = index_dir.join("files.options");
+        if options_file.exists() {
+            match nixdex_options::OptionsDb::open(&index_dir) {
+                Ok(db) => Some(Arc::new(db)),
+                Err(err) => {
+                    tracing::warn!(error = %err, path = %options_file.display(), "failed to load options sidecar");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
     let snapshot = IndexSnapshot {
         database_dir: index_dir.clone(),
         basename: Arc::new(basename),
@@ -425,6 +459,8 @@ fn load_and_store_index(cache_dir: &std::path::Path, index_state: &IndexState) {
         command_index: Arc::new(command_index),
         reader: Arc::new(reader),
         package_db,
+        history_db,
+        options_db,
     };
 
     if let Ok(mut state) = index_state.index.write() {
@@ -582,6 +618,10 @@ async fn run_http_server(addr: &str, index_state: Arc<IndexState>) -> Result<()>
         .route("/locate", get(locate_handler))
         .route("/nix-locate", get(nix_locate_handler))
         .route("/search", get(search_handler))
+        .route("/info", get(info_handler))
+        .route("/history", get(history_handler))
+        .route("/options", get(options_handler))
+        .route("/stats", get(stats_handler))
         .route("/command", get(command_handler))
         .with_state(index_state);
 
@@ -771,6 +811,8 @@ async fn nix_locate_handler(
             max_size: params.max_size,
             exclude_fhs: params.exclude_fhs,
             null_output: params.null_output,
+            quiet: params.quiet,
+            details: params.details,
             literal_pattern: (!params.regex
                 && !params.at_root
                 && !params.whole_name
@@ -972,6 +1014,10 @@ struct NixLocateParams {
     exclude_fhs: bool,
     #[serde(default)]
     null_output: bool,
+    #[serde(default)]
+    quiet: bool,
+    #[serde(default)]
+    details: bool,
 }
 
 #[cfg(feature = "daemon")]
@@ -1322,6 +1368,256 @@ struct SearchResponse {
     count: Option<usize>,
     names: Option<Vec<String>>,
     results: Vec<crate::PackageMeta>,
+}
+
+/// Query parameters for `GET /info`.
+#[cfg(feature = "daemon")]
+#[derive(Deserialize)]
+struct InfoParams {
+    /// Attribute path to look up.
+    attr: String,
+}
+
+/// HTTP handler for `/info`.
+///
+/// Returns package metadata for a single attribute.
+#[cfg(feature = "daemon")]
+async fn info_handler(
+    State(index_state): State<Arc<IndexState>>,
+    axum::extract::Query(params): axum::extract::Query<InfoParams>,
+) -> std::result::Result<
+    axum::Json<InfoResponse>,
+    (axum::http::StatusCode, axum::Json<ErrorResponse>),
+> {
+    index_state.requests_total.fetch_add(1, Ordering::Relaxed);
+
+    let db = match read_snapshot(&index_state) {
+        Some(snapshot) => snapshot.package_db,
+        None => {
+            return Err(json_error(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "no package database loaded",
+            ));
+        }
+    };
+
+    let Some(db) = db else {
+        return Err(json_error(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "no package database loaded",
+        ));
+    };
+
+    let results = db
+        .search(
+            &params.attr,
+            false,
+            crate::package_search::SearchField::Attr,
+            true,
+            true,
+            crate::package_search::SearchSort::None,
+            Some(1),
+        )
+        .map_err(|err| json_error(axum::http::StatusCode::BAD_REQUEST, err.to_string()))?;
+
+    let Some(record) = results.first() else {
+        return Err(json_error(
+            axum::http::StatusCode::NOT_FOUND,
+            format!("no package found with attr {}", params.attr),
+        ));
+    };
+
+    Ok(axum::Json(InfoResponse {
+        attr: record.attr.clone(),
+        name: record.name.clone(),
+        description: record.description.clone(),
+        main_program: record.main_program.clone(),
+        license: record.license.clone(),
+        homepage: record.homepage.clone(),
+        maintainers: record.maintainers.clone(),
+        platforms: record.platforms.clone(),
+        versions: None,
+    }))
+}
+
+/// Response for `/info`.
+#[cfg(feature = "daemon")]
+#[derive(Serialize)]
+struct InfoResponse {
+    attr: String,
+    name: String,
+    description: Option<String>,
+    main_program: Option<String>,
+    license: Option<String>,
+    homepage: Option<String>,
+    maintainers: Option<Vec<String>>,
+    platforms: Option<Vec<String>>,
+    versions: Option<Vec<String>>,
+}
+
+/// Query parameters for `GET /history`.
+#[cfg(feature = "daemon")]
+#[derive(Deserialize)]
+struct HistoryParams {
+    /// Attribute path to look up.
+    attr: String,
+}
+
+/// HTTP handler for `/history`.
+///
+/// Returns version history for a package attribute.
+#[cfg(feature = "daemon")]
+async fn history_handler(
+    State(index_state): State<Arc<IndexState>>,
+    axum::extract::Query(params): axum::extract::Query<HistoryParams>,
+) -> std::result::Result<
+    axum::Json<HistoryResponse>,
+    (axum::http::StatusCode, axum::Json<ErrorResponse>),
+> {
+    index_state.requests_total.fetch_add(1, Ordering::Relaxed);
+
+    let history_db = match read_snapshot(&index_state) {
+        Some(snapshot) => snapshot.history_db,
+        None => {
+            return Err(json_error(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "no index loaded",
+            ));
+        }
+    };
+
+    let Some(history_db) = history_db else {
+        return Err(json_error(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "no history database loaded",
+        ));
+    };
+
+    let versions = history_db.lookup_attr(&params.attr);
+
+    Ok(axum::Json(HistoryResponse {
+        attr: params.attr,
+        versions,
+    }))
+}
+
+/// Response for `/history`.
+#[cfg(feature = "daemon")]
+#[derive(Serialize)]
+struct HistoryResponse {
+    attr: String,
+    versions: Vec<nixdex_history::VersionEntry>,
+}
+
+/// Query parameters for `GET /options`.
+#[cfg(feature = "daemon")]
+#[derive(Deserialize)]
+struct OptionsParams {
+    /// Search pattern.
+    pattern: String,
+    /// Match case-sensitively.
+    #[serde(default)]
+    case_sensitive: bool,
+    /// Maximum number of results.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// HTTP handler for `/options`.
+///
+///Searches NixOS module options by pattern.
+#[cfg(feature = "daemon")]
+async fn options_handler(
+    State(index_state): State<Arc<IndexState>>,
+    axum::extract::Query(params): axum::extract::Query<OptionsParams>,
+) -> std::result::Result<
+    axum::Json<OptionsResponse>,
+    (axum::http::StatusCode, axum::Json<ErrorResponse>),
+> {
+    index_state.requests_total.fetch_add(1, Ordering::Relaxed);
+
+    let options_db = match read_snapshot(&index_state) {
+        Some(snapshot) => snapshot.options_db,
+        None => {
+            return Err(json_error(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "no index loaded",
+            ));
+        }
+    };
+
+    let Some(options_db) = options_db else {
+        return Err(json_error(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "no options database loaded",
+        ));
+    };
+
+    let limit = match params.limit {
+        Some(limit) => limit,
+        None => MAX_RESULT_LIMIT,
+    };
+    if limit > MAX_RESULT_LIMIT {
+        return Err(json_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("limit must be at most {MAX_RESULT_LIMIT}"),
+        ));
+    }
+
+    let matched = options_db.search(&params.pattern, params.case_sensitive);
+    let results: Vec<nixdex_options::OptionRecord> = matched.into_iter().cloned().collect();
+
+    Ok(axum::Json(OptionsResponse {
+        pattern: params.pattern,
+        count: results.len(),
+        results,
+    }))
+}
+
+/// Response for `/options`.
+#[cfg(feature = "daemon")]
+#[derive(Serialize)]
+struct OptionsResponse {
+    pattern: String,
+    count: usize,
+    results: Vec<nixdex_options::OptionRecord>,
+}
+
+/// HTTP handler for `/stats`.
+///
+///Returns database statistics including sidecar status.
+#[cfg(feature = "daemon")]
+async fn stats_handler(State(index_state): State<Arc<IndexState>>) -> axum::Json<StatsResponse> {
+    index_state.requests_total.fetch_add(1, Ordering::Relaxed);
+
+    let (history_count, options_count, sidecar_status) = match read_snapshot(&index_state) {
+        Some(snapshot) => {
+            let history_count = snapshot.history_db.as_ref().map(|db| db.attr_count());
+            let options_count = snapshot.options_db.as_ref().map(|db| db.option_count());
+            let sidecar_status = snapshot.reader.package_count();
+            (history_count, options_count, sidecar_status)
+        }
+        None => (None, None, None),
+    };
+
+    axum::Json(StatsResponse {
+        version: env!("CARGO_PKG_VERSION"),
+        uptime_seconds: index_state.start_time.elapsed().as_secs(),
+        history_count,
+        options_count,
+        sidecar_entry_count: sidecar_status,
+    })
+}
+
+/// Response for `/stats`.
+#[cfg(feature = "daemon")]
+#[derive(Serialize)]
+struct StatsResponse {
+    version: &'static str,
+    uptime_seconds: u64,
+    history_count: Option<usize>,
+    options_count: Option<usize>,
+    sidecar_entry_count: Option<usize>,
 }
 
 /// Query parameters for `GET /command`.

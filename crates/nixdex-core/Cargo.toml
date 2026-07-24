@@ -11,7 +11,7 @@ publish = true
 [features]
 default = []
 cli = ["dep:clap"]
-daemon = ["dep:axum"]
+daemon = ["dep:axum", "dep:nixdex-history", "dep:nixdex-options"]
 prebuilt = []
 cdc = ["dep:fastcdc", "dep:blake3"]
 
@@ -44,9 +44,11 @@ grep = { workspace = true }
 fuzzy-matcher = { workspace = true }
 clap = { workspace = true, optional = true }
 xz2 = "0.1.7"
-mmap-guard = "0.2.2"
+mmap-guard = { workspace = true }
 fastrand = "2"
 axum = { version = "0.8", features = ["json"], optional = true }
+nixdex-history = { workspace = true, optional = true }
+nixdex-options = { workspace = true, optional = true }
 sha2 = "0.10"
 subtle = "2.6"
 redb = "4.1"
