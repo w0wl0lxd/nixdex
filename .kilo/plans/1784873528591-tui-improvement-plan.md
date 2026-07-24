@@ -123,8 +123,7 @@ Event Loop:
 
 ### 2.5 UI Design
 
-- **Theme**: Catppuccin Mocha (from ns-tui) as default, with Nord and Dracula
-  alternatives (from trx)
+- **Theme**: Tokyo Night (default, from ratatui-themes ecosystem), with Catppuccin Mocha, Nord, and Dracula alternatives
 - **Layout**:
   - Top: Header bar with mode badge and search input
   - Middle: Scrollable results list (or detail view)
@@ -164,7 +163,7 @@ Event Loop:
 - [ ] Add search result caching for repeated queries (from trx)
 
 ### Phase 3: Theme & Polish (Days 5-6)
-- [ ] Implement Catppuccin Mocha theme as default
+- [ ] Implement Tokyo Night theme as default
 - [ ] Add Nord and Dracula theme alternatives
 - [ ] Add theme selection via command palette or config
 - [ ] Improve status bar with better navigation hints
