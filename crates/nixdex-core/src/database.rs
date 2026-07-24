@@ -20,12 +20,14 @@ use std::sync::{Arc, Mutex};
 use byteorder::{LittleEndian, WriteBytesExt};
 use grep::matcher::{LineMatchKind, Matcher, NoError};
 use grep::regex::RegexMatcherBuilder;
+use libc;
 use memchr;
 use mmap_guard;
 use rayon::prelude::*;
 use regex::bytes::{Regex, RegexBuilder};
 use regex_syntax::ast::{AssertionKind, Ast, LiteralKind};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sonic_rs;
 use thiserror::Error;
 
@@ -83,6 +85,15 @@ const ATTRS_VERSION: u32 = 1;
 
 /// Maximum size of the attrs sidecar (defensive cap).
 const MAX_ATTRS_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Frame hashes sidecar filename for incremental builds.
+const FRAME_HASHES_FILE: &str = "files.frame_hashes";
+
+/// Magic for the frame hashes sidecar.
+const FRAME_HASHES_MAGIC: &[u8] = b"NFHS";
+
+/// Frame hashes sidecar version.
+const FRAME_HASHES_VERSION: u32 = 1;
 
 /// Defensive cap on the number of v2 frames (seek table entries).
 const MAX_FRAME_COUNT: usize = 1024 * 1024;
@@ -747,6 +758,13 @@ impl Reader {
         }
 
         let data = mmap_guard::map_file(&path_buf)?;
+
+        #[cfg(feature = "huge_pages")]
+        {
+            let ptr = data.as_ptr() as *mut libc::c_void;
+            let len = data.len();
+            huge_pages::advise_huge_pages(ptr, len);
+        }
 
         if data.len() < DATA_START {
             return Err(Error::Corrupt("database file too short for header"));
@@ -1691,6 +1709,120 @@ pub fn read_attrs_sidecar(db_dir: &Path) -> Result<Option<Vec<(String, String, S
     Ok(Some(attrs))
 }
 
+/// Write the frame hashes sidecar for incremental builds.
+///
+/// Stores SHA-256 hashes of each compressed frame so that
+/// unchanged frames can be skipped during sidecar regeneration.
+fn write_frame_hashes(db_dir: &Path, frame_hashes: &[(u32, [u8; 32])]) -> Result<()> {
+    let path = db_dir.join(FRAME_HASHES_FILE);
+    let mut file = File::create(&path)?;
+
+    file.write_all(FRAME_HASHES_MAGIC)?;
+    file.write_u32::<LittleEndian>(FRAME_HASHES_VERSION)?;
+    let count = u32::try_from(frame_hashes.len())
+        .map_err(|_| Error::Corrupt("frame hashes count overflow"))?;
+    file.write_u32::<LittleEndian>(count)?;
+
+    for &(frame_idx, ref hash) in frame_hashes {
+        file.write_u32::<LittleEndian>(frame_idx)?;
+        file.write_all(hash)?;
+    }
+
+    file.flush()?;
+    Ok(())
+}
+
+/// Read the frame hashes sidecar for incremental builds.
+///
+/// Returns `Ok(None)` if the file is missing or has an invalid magic/version.
+pub fn read_frame_hashes(db_dir: &Path) -> Result<Option<Vec<(u32, [u8; 32])>>> {
+    let path = db_dir.join(FRAME_HASHES_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+
+    if bytes.len() < FRAME_HASHES_MAGIC.len() + 8 {
+        return Ok(None);
+    }
+
+    let magic = bytes
+        .get(..FRAME_HASHES_MAGIC.len())
+        .ok_or(Error::Corrupt("frame hashes magic missing"))?;
+    if magic != FRAME_HASHES_MAGIC {
+        return Ok(None);
+    }
+
+    let version = read_u32_le(&bytes, FRAME_HASHES_MAGIC.len())?;
+    if version != FRAME_HASHES_VERSION {
+        return Ok(None);
+    }
+
+    let count = usize::try_from(read_u32_le(&bytes, FRAME_HASHES_MAGIC.len() + 4)?)
+        .map_err(|_| Error::Corrupt("frame hashes count overflow"))?;
+
+    let expected_len = FRAME_HASHES_MAGIC.len() + 8 + count * (4 + 32);
+    if bytes.len() != expected_len {
+        return Err(Error::Corrupt("frame hashes sidecar has invalid size"));
+    }
+
+    let mut frame_hashes = Vec::with_capacity(count);
+    let mut offset = FRAME_HASHES_MAGIC.len() + 8;
+
+    for _ in 0..count {
+        let frame_idx = read_u32_le(&bytes, offset)?;
+        offset += 4;
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&bytes[offset..offset + 32]);
+        offset += 32;
+        frame_hashes.push((frame_idx, hash));
+    }
+
+    Ok(Some(frame_hashes))
+}
+
+/// Compute SHA-256 hashes for each frame in the reader.
+fn compute_frame_hashes(reader: &Reader) -> Vec<(u32, [u8; 32])> {
+    reader
+        .frames
+        .iter()
+        .enumerate()
+        .map(|(i, (offset, len))| {
+            let frame_data = reader.data.get(*offset..*offset + *len).unwrap_or_default();
+            let mut hasher = Sha256::new();
+            hasher.update(frame_data);
+            let hash: [u8; 32] = hasher.finalize().into();
+            (i as u32, hash)
+        })
+        .collect()
+}
+
+/// Compare stored frame hashes with current hashes and return
+/// the indices of frames whose sidecars need rebuilding.
+///
+/// Returns `None` if no stored hashes exist (full rebuild needed).
+pub fn frame_hashes_diff(
+    db_dir: &Path,
+    current_hashes: &[(u32, [u8; 32])],
+) -> Result<Option<Vec<u32>>> {
+    let stored = match read_frame_hashes(db_dir)? {
+        Some(h) => h,
+        None => return Ok(None),
+    };
+
+    let stored_map: std::collections::HashMap<u32, [u8; 32]> = stored.into_iter().collect();
+
+    let mut changed = Vec::new();
+    for &(frame_idx, ref hash) in current_hashes {
+        if stored_map.get(&frame_idx) != Some(hash) {
+            changed.push(frame_idx);
+        }
+    }
+
+    Ok(Some(changed))
+}
+
 /// Write a length-prefixed string (u32 LE length + UTF-8 bytes).
 fn write_length_prefixed_string<W: Write>(writer: &mut W, s: &str) -> Result<()> {
     let bytes = s.as_bytes();
@@ -2478,6 +2610,14 @@ fn ngram_sidecars_exist(dir: &Path) -> bool {
 /// critical search path. The compiler is prevented from eliding the reads
 /// via [`std::hint::black_box`].
 fn prefault_mmap(data: &[u8]) {
+    #[cfg(feature = "huge_pages")]
+    {
+        let ptr = data.as_ptr() as *mut libc::c_void;
+        let len = data.len();
+        huge_pages::advise_willneed(ptr, len);
+        return;
+    }
+
     const PAGE_SIZE: usize = 4096;
     let len = data.len();
     if len == 0 {
@@ -3292,6 +3432,22 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
     generate_sidecars_impl(db_path, true)
 }
 
+/// Compare stored frame hashes with current hashes and return
+/// the indices of frames whose sidecars need rebuilding.
+///
+/// Returns `Ok(None)` if no stored hashes exist (full rebuild needed).
+/// Returns `Ok(Some(vec![])` if all sidecars are up to date.
+pub fn sidecar_diff(db_path: &Path) -> Result<Option<Vec<u32>>> {
+    let reader = Reader::open(db_path)?;
+    let db_dir = db_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or(Error::Corrupt("database path has no parent directory"))?;
+
+    let current_hashes = compute_frame_hashes(&reader);
+    frame_hashes_diff(db_dir, &current_hashes)
+}
+
 /// Like [`generate_sidecars`], but when `include_heavy` is `false` the heavy
 /// entry/ngram secondary indexes are skipped. The daemon uses this in `Lru`
 /// cache mode to defer their construction; queries fall back to full scans
@@ -3310,6 +3466,26 @@ fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .ok_or(Error::Corrupt("database path has no parent directory"))?;
+
+    // Compute frame hashes for incremental update detection.
+    let current_hashes = compute_frame_hashes(&reader);
+
+    // Check if sidecars are already up to date.
+    if let Some(changed) = frame_hashes_diff(db_dir, &current_hashes)? {
+        if changed.is_empty() {
+            tracing::info!(
+                db_path = %db_path.display(),
+                "sidecars are up to date; skipping regeneration"
+            );
+            return Ok(());
+        }
+        tracing::info!(
+            db_path = %db_path.display(),
+            changed_frames = changed.len(),
+            total_frames = reader.frames.len(),
+            "sidecar diff detected changed frames; rebuilding"
+        );
+    }
 
     // Scan all frames to extract package paths and build secondary indexes.
     let mut builder = BasenameIndexBuilder::new();
@@ -3439,6 +3615,9 @@ fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
 
     // Write attrs sidecar so prebuilt indexes can be reused for incremental builds.
     write_attrs_sidecar(db_dir, &all_package_attrs)?;
+
+    // Write frame hashes sidecar for incremental update detection.
+    write_frame_hashes(db_dir, &current_hashes)?;
 
     tracing::info!(
         db_path = %db_path.display(),
@@ -3645,6 +3824,21 @@ fn format_grouped(n: u64) -> String {
     out
 }
 
+mod huge_pages {
+    pub fn advise_huge_pages(ptr: *mut libc::c_void, len: usize) {
+        unsafe {
+            libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
+            libc::madvise(ptr, len, libc::MADV_WILLNEED);
+        }
+    }
+
+    pub fn advise_willneed(ptr: *mut libc::c_void, len: usize) {
+        unsafe {
+            libc::madvise(ptr, len, libc::MADV_WILLNEED);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3730,6 +3924,8 @@ mod tests {
             max_size: None,
             exclude_fhs: false,
             null_output: false,
+            quiet: false,
+            details: false,
         };
         search(&options).expect("search ok");
     }
@@ -3769,6 +3965,8 @@ mod tests {
             max_size: None,
             exclude_fhs: false,
             null_output: false,
+            quiet: false,
+            details: false,
         };
 
         let hits = search_results(&options, None).expect("search");
@@ -3968,6 +4166,8 @@ mod tests {
                 max_size: None,
                 exclude_fhs: false,
                 null_output: false,
+                quiet: false,
+                details: false,
             };
             let pruned = search_results(&options, None).expect("sidecar search");
 
@@ -4032,6 +4232,8 @@ mod tests {
             max_size: None,
             exclude_fhs: false,
             null_output: false,
+            quiet: false,
+            details: false,
         };
         let pruned = search_results(&options, None).expect("entry-index search");
 
@@ -4132,6 +4334,8 @@ mod tests {
                 max_size: None,
                 exclude_fhs: false,
                 null_output: false,
+                quiet: false,
+                details: false,
             };
             let pruned = search_results(&options, None).expect("sidecar search");
 
@@ -4213,6 +4417,8 @@ mod tests {
             max_size: None,
             exclude_fhs: false,
             null_output: false,
+            quiet: false,
+            details: false,
         };
         let regex_baseline = reader
             .search_entries(&Regex::new("b.n").expect("regex"), None, None, None, None)
@@ -4227,6 +4433,8 @@ mod tests {
         // Short literal (<3 bytes): path trigram returns None, falls back.
         let short_options = SearchOptions {
             null_output: false,
+            quiet: false,
+            details: false,
             pattern: "he".into(),
             literal_pattern: Some("he".into()),
             ..regex_options.clone()
@@ -4289,6 +4497,8 @@ mod tests {
             max_size: None,
             exclude_fhs: false,
             null_output: false,
+            quiet: false,
+            details: false,
         };
         let pruned = search_results(&options, None).expect("fallback search");
 
@@ -4830,6 +5040,8 @@ mod tests {
             max_size: None,
             exclude_fhs: false,
             null_output: false,
+            quiet: false,
+            details: false,
         };
         let regex_pruned = search_results(&regex_options, None).expect("regex search");
 
@@ -4921,6 +5133,8 @@ mod tests {
             max_size: None,
             exclude_fhs: false,
             null_output: false,
+            quiet: false,
+            details: false,
         };
         let regex_pruned = search_results(&regex_options, None).expect("regex search");
 

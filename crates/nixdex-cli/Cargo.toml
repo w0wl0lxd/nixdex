@@ -21,11 +21,10 @@ reqwest = { workspace = true }
 nixdex-core = { workspace = true, features = ["cli", "daemon"] }
 nixdex-history = { workspace = true }
 nixdex-options = { workspace = true }
+nixdex-tui = { workspace = true }
 tracing = { workspace = true }
 clap_complete = "4.6.7"
 clap_mangen = "0.2.26"
-ratatui = { workspace = true }
-crossterm = { workspace = true }
 
 [dev-dependencies]
 bytes = { workspace = true }

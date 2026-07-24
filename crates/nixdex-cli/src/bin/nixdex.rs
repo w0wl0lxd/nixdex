@@ -12,7 +12,7 @@ use color_eyre::eyre::WrapErr;
 use tracing;
 use tracing_subscriber::EnvFilter;
 
-use nixdex_cli::{index, locate};
+use nixdex_cli::{index, locate, tui};
 use nixdex_core::package_search::{SearchDb, SearchField, SearchSort};
 use nixdex_history::HistoryDb;
 use nixdex_options::OptionsDb;
@@ -111,8 +111,12 @@ enum Cmd {
     Update(UpdateOpts),
     /// Generate sidecar indexes for an existing `files` database.
     GenerateSidecars(GenerateSidecarsOpts),
+    /// Check which sidecars need rebuilding after a database update.
+    SidecarDiff(SidecarDiffOpts),
     /// Print a command-not-found hint for a missing command.
     CommandNotFound(CommandNotFoundOpts),
+    /// Run the interactive TUI.
+    Tui(tui::TuiOpts),
     /// Run the background daemon (alias for `nixdex-daemon`).
     Daemon(DaemonOpts),
 }
@@ -378,6 +382,15 @@ struct GenerateSidecarsOpts {
     database: PathBuf,
 }
 
+/// Options for `nixdex sidecar diff`.
+#[derive(Debug, Parser)]
+#[command(author, about, version)]
+struct SidecarDiffOpts {
+    /// Directory where the index is stored.
+    #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
+    database: PathBuf,
+}
+
 /// Options for `nixdex command-not-found`.
 #[derive(Debug, Parser)]
 #[command(author, about, version)]
@@ -409,6 +422,15 @@ struct CommandNotFoundOpts {
     /// Output the suggestion as JSON.
     #[arg(long)]
     json: bool,
+}
+
+/// Options for `nixdex tui`.
+#[derive(Debug, Parser)]
+#[command(author, about, version)]
+struct TuiOpts {
+    /// Directory where the index is stored.
+    #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
+    database: PathBuf,
 }
 
 /// Options for running the background daemon.
@@ -938,6 +960,29 @@ fn run_generate_sidecars(opts: GenerateSidecarsOpts) -> color_eyre::Result<()> {
     nixdex_core::generate_sidecars(&files)
         .wrap_err_with(|| format!("failed to generate sidecars for {}", files.display()))?;
     println!("generated sidecars for {}", opts.database.display());
+    Ok(())
+}
+
+fn run_sidecar_diff(opts: SidecarDiffOpts) -> color_eyre::Result<()> {
+    let files = opts.database.join("files");
+    let diff = nixdex_core::sidecar_diff(&files)
+        .wrap_err_with(|| format!("failed to check sidecar diff for {}", files.display()))?;
+
+    match diff {
+        None => {
+            println!("no stored frame hashes found; full sidecar rebuild needed");
+        }
+        Some(changed) if changed.is_empty() => {
+            println!("all sidecars are up to date");
+        }
+        Some(changed) => {
+            println!("{} frame(s) need sidecar rebuild:", changed.len());
+            for idx in changed {
+                println!("  frame {idx}");
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1479,7 +1524,11 @@ async fn main() -> color_eyre::Result<()> {
         Cmd::Which(which_opts) => run_which(which_opts),
         Cmd::Update(update_opts) => run_update(update_opts).await,
         Cmd::GenerateSidecars(opts) => run_generate_sidecars(opts),
+        Cmd::SidecarDiff(opts) => run_sidecar_diff(opts),
         Cmd::CommandNotFound(opts) => run_command_not_found(opts),
+        Cmd::Tui(tui_opts) => {
+            return tui::run_tui(tui_opts.database).await;
+        }
         Cmd::Daemon(daemon_opts) => run_daemon(daemon_opts).await,
     }
 }

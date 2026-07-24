@@ -54,7 +54,8 @@ indicatif = { version = "0.18.4", default-features = false, features = [
 # Databases and indexing
 fst = "0.4"
 mmap-guard = "0.2.2"
-roaring = { version = "0.11.4", features = ["simd"] }
+libc = "0.2"
+roaring = "0.11.4"
 
 # Workspace crates
 nixdex-core = { path = "crates/nixdex-core", version = "0.1.0" }
@@ -92,11 +93,12 @@ divan = "0.1"
 # TUI
 ratatui = "0.25"
 crossterm = { version = "0.27", features = ["event-stream"] }
+nixdex-tui = { path = "crates/nixdex-tui", version = "0.1.0" }
 nixdex-history = { path = "crates/nixdex-history", version = "0.1.0" }
 nixdex-options = { path = "crates/nixdex-options", version = "0.1.0" }
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "warn"
 unused_must_use = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
 

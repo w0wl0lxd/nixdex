@@ -17,11 +17,12 @@ pub enum Theme {
     CatppuccinMocha,
     Nord,
     Dracula,
+    TokyoNight,
 }
 
 impl Default for Theme {
     fn default() -> Self {
-        Self::CatppuccinMocha
+        Self::TokyoNight
     }
 }
 
@@ -69,6 +70,7 @@ pub struct App {
     pub search_exact: bool,
     pub search_regex: bool,
     pub search_fuzzy: bool,
+    pub search_tiered_fuzzy: bool,
     pub search_limit: Option<usize>,
     pub search_count: bool,
     pub search_json: bool,
@@ -125,6 +127,7 @@ impl App {
             search_exact: false,
             search_regex: false,
             search_fuzzy: false,
+            search_tiered_fuzzy: false,
             search_limit: Some(50),
             search_count: false,
             search_json: false,
@@ -237,7 +240,8 @@ impl App {
     }
 
     pub fn add_toast(&mut self, message: String) {
-        self.toasts.push(Toast::new(message, Duration::from_secs(3)));
+        self.toasts
+            .push(Toast::new(message, Duration::from_secs(3)));
     }
 
     pub fn tick(&mut self) {
@@ -258,7 +262,7 @@ impl App {
     }
 
     pub fn cache_results(&mut self, query: String, results: Vec<SearchResult>) {
-        self.search_cache.insert(query, results);
+        self.search_cache.insert(query.clone(), results);
         self.cache_timestamps.insert(query, Instant::now());
     }
 
@@ -272,10 +276,75 @@ impl App {
 
     pub fn clear_expired_cache(&mut self) {
         let now = Instant::now();
-        self.cache_timestamps.retain(|_, ts| {
-            now.duration_since(*ts) < self.cache_ttl
-        });
+        self.cache_timestamps
+            .retain(|_, ts| now.duration_since(*ts) < self.cache_ttl);
         let valid_keys: Vec<String> = self.cache_timestamps.keys().cloned().collect();
         self.search_cache.retain(|k, _| valid_keys.contains(k));
     }
+}
+
+pub fn fuzzy_score(query: &str, target: &str) -> u32 {
+    if query.is_empty() {
+        return 0;
+    }
+
+    let query_lower = query.to_lowercase();
+    let target_lower = target.to_lowercase();
+
+    if target_lower == query_lower {
+        return 1000;
+    }
+
+    if target_lower.starts_with(&query_lower) {
+        return 500;
+    }
+
+    let query_chars: Vec<char> = query_lower.chars().collect();
+    let target_chars: Vec<char> = target_lower.chars().collect();
+
+    let mut score = 0;
+    let mut query_idx = 0;
+    let mut last_match_idx = None;
+
+    for (ti, tc) in target_chars.iter().enumerate() {
+        if query_idx < query_chars.len() && *tc == query_chars[query_idx] {
+            if let Some(last_idx) = last_match_idx {
+                if ti == last_idx + 1 {
+                    score += 50;
+                } else if is_word_boundary(&target_chars, last_idx, ti) {
+                    score += 100;
+                } else {
+                    score += 10;
+                }
+            } else {
+                score += 30;
+            }
+            last_match_idx = Some(ti);
+            query_idx += 1;
+        }
+    }
+
+    if query_idx < query_chars.len() {
+        return 0;
+    }
+
+    score
+}
+
+fn is_word_boundary(chars: &[char], from: usize, to: usize) -> bool {
+    if from + 1 == to {
+        return false;
+    }
+    if from == 0 {
+        return true;
+    }
+    let prev = chars[from];
+    let curr = chars[to];
+    prev.is_ascii_whitespace()
+        || prev == '_'
+        || prev == '-'
+        || prev == '.'
+        || prev == '/'
+        || prev == ':'
+        || curr.is_ascii_uppercase() && prev.is_ascii_lowercase()
 }
