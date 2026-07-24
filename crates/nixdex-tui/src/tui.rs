@@ -1,19 +1,25 @@
 use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use app::App;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use nixdex_core::database::{SearchOptions, SearchSort};
 use nixdex_core::package_search::{SearchDb, SearchField, SearchSort as PkgSearchSort};
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use tokio::time::{interval, Duration};
+use ratatui::backend::CrosstermBackend;
+use tokio::time::{interval, sleep};
 
 use crate::app::DetailView;
 use crate::app::SearchMode;
 use crate::event::AppEvent;
+
+const DEBOUNCE_DELAY: Duration = Duration::from_millis(300);
+const CACHE_TTL: Duration = Duration::from_secs(30);
 
 pub async fn run_tui(database: PathBuf) -> io::Result<()> {
     enable_raw_mode()?;
@@ -23,6 +29,7 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(database);
+    app.cache_ttl = CACHE_TTL;
     let mut tick_interval = interval(Duration::from_millis(500));
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
@@ -43,6 +50,9 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
         }
     });
 
+    let mut debounce_timer: Option<tokio::time::Sleep> = None;
+    let mut pending_query: Option<String> = None;
+
     loop {
         terminal.draw(|frame| ui::render(frame, &app))?;
 
@@ -50,6 +60,7 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
             maybe_event = rx.recv() => {
                 match maybe_event {
                     Some(app_event) => {
+                        handle_input_event(&mut app, &app_event, &mut pending_query, &mut debounce_timer);
                         handle_event(&mut app, app_event);
                     }
                     None => break,
@@ -57,6 +68,19 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
             }
             _ = tick_interval.tick() => {
                 app.tick();
+            }
+            _ = async {
+                if let Some(ref mut timer) = debounce_timer {
+                    timer.as_mut();
+                }
+            } => {
+                if let Some(query) = pending_query.take() {
+                    debounce_timer = None;
+                    if query != app.input {
+                        app.set_input(query.clone());
+                        perform_search(&mut app, &query);
+                    }
+                }
             }
         }
     }
@@ -69,8 +93,67 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
     Ok(())
 }
 
+fn handle_input_event(
+    app: &mut App,
+    event: &AppEvent,
+    pending_query: &mut Option<String>,
+    debounce_timer: &mut Option<tokio::time::Sleep>,
+) {
+    match event {
+        AppEvent::Key(KeyEvent {
+            code: KeyCode::Char(c),
+            modifiers: KeyModifiers::NONE,
+            ..
+        }) => {
+            if !app.input.is_empty() || *c != ' ' {
+                let mut new_input = app.input.clone();
+                new_input.push(*c);
+                *pending_query = Some(new_input);
+                *debounce_timer = Some(sleep(DEBOUNCE_DELAY));
+            }
+        }
+        AppEvent::Key(KeyEvent {
+            code: KeyCode::Backspace,
+            modifiers: KeyModifiers::NONE,
+            ..
+        }) => {
+            let mut new_input = app.input.clone();
+            new_input.pop();
+            *pending_query = Some(new_input);
+            *debounce_timer = Some(sleep(DEBOUNCE_DELAY));
+        }
+        AppEvent::Key(KeyEvent {
+            code: KeyCode::Esc,
+            modifiers: KeyModifiers::NONE,
+            ..
+        }) => {
+            *pending_query = None;
+            *debounce_timer = None;
+        }
+        _ => {}
+    }
+}
+
 fn handle_event(app: &mut App, event: AppEvent) {
     if let Some(detail) = &app.detail {
+        if detail.pinned {
+            match event {
+                AppEvent::Key(KeyEvent {
+                    code: KeyCode::Esc,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                })
+                | AppEvent::Key(KeyEvent {
+                    code: KeyCode::Char('q'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => {
+                    app.close_detail();
+                }
+                _ => {}
+            }
+            return;
+        }
         handle_detail_event(app, event, detail);
         return;
     }
@@ -93,34 +176,23 @@ fn handle_event(app: &mut App, event: AppEvent) {
             modifiers: KeyModifiers::NONE,
             ..
         }) => {
-            app.set_status(String::from("Focus: search input — type to search, Esc to clear"));
+            app.set_status(String::from(
+                "Focus: search input — type to search, Esc to clear",
+            ));
         }
         AppEvent::Key(KeyEvent {
-            code: KeyCode::Char(c),
+            code: KeyCode::Char(':'),
             modifiers: KeyModifiers::NONE,
             ..
         }) => {
-            app.input.push(c);
-            let query = app.input.clone();
-            perform_search(app, &query);
+            app.set_status(String::from("Command palette — not yet implemented"));
         }
         AppEvent::Key(KeyEvent {
-            code: KeyCode::Backspace,
+            code: KeyCode::Char('?'),
             modifiers: KeyModifiers::NONE,
             ..
         }) => {
-            app.input.pop();
-            let query = app.input.clone();
-            perform_search(app, &query);
-        }
-        AppEvent::Key(KeyEvent {
-            code: KeyCode::Esc,
-            modifiers: KeyModifiers::NONE,
-            ..
-        }) => {
-            app.input.clear();
-            app.set_results(Vec::new());
-            app.set_status(String::from("Search cleared"));
+            app.set_status(String::from("Help overlay — not yet implemented"));
         }
         AppEvent::Key(KeyEvent {
             code: KeyCode::Up,
@@ -178,13 +250,25 @@ fn handle_event(app: &mut App, event: AppEvent) {
                     description: result.description.clone(),
                     path: result.path.clone(),
                     size: result.size,
-                    license: None,
-                    homepage: None,
-                    maintainers: Vec::new(),
-                    main_program: None,
+                    license: result.license.clone(),
+                    homepage: result.homepage.clone(),
+                    maintainers: result.maintainers.clone(),
+                    main_program: result.main_program.clone(),
+                    pinned: false,
                 };
                 app.set_detail(detail);
             }
+        }
+        AppEvent::Key(KeyEvent {
+            code: KeyCode::Char(' '),
+            modifiers: KeyModifiers::NONE,
+            ..
+        }) => {
+            app.toggle_detail_pin();
+            app.set_status(format!(
+                "Detail {}",
+                if app.detail_pinned { "pinned" } else { "unpinned" }
+            ));
         }
         AppEvent::Key(KeyEvent {
             code: KeyCode::Tab,
@@ -197,11 +281,14 @@ fn handle_event(app: &mut App, event: AppEvent) {
                 SearchMode::Which => SearchMode::Search,
             };
             app.set_mode(next_mode);
-            app.set_status(format!("Switched to {} mode", match next_mode {
-                SearchMode::Search => "search",
-                SearchMode::Locate => "locate",
-                SearchMode::Which => "which",
-            }));
+            app.set_status(format!(
+                "Switched to {} mode",
+                match next_mode {
+                    SearchMode::Search => "search",
+                    SearchMode::Locate => "locate",
+                    SearchMode::Which => "which",
+                }
+            ));
         }
         AppEvent::Key(KeyEvent {
             code: KeyCode::Char('r'),
@@ -233,11 +320,74 @@ fn handle_event(app: &mut App, event: AppEvent) {
             ));
         }
         AppEvent::Key(KeyEvent {
-            code: KeyCode::Char(':'),
+            code: KeyCode::Char('a'),
             modifiers: KeyModifiers::NONE,
             ..
         }) => {
-            app.set_status(String::from("Command palette — not yet implemented"));
+            app.toggle_expand_all();
+            app.set_status(format!(
+                "Expand all {}",
+                if app.expand_all { "on" } else { "off" }
+            ));
+        }
+        AppEvent::Key(KeyEvent {
+            code: KeyCode::Char('y'),
+            modifiers: KeyModifiers::NONE,
+            ..
+        }) => {
+            if let Some(result) = app.selected_result() {
+                copy_to_clipboard(&result.attr);
+                app.add_toast(format!("Copied: {}", result.attr));
+            }
+        }
+        AppEvent::Key(KeyEvent {
+            code: KeyCode::Char('e'),
+            modifiers: KeyModifiers::NONE,
+            ..
+        }) => {
+            if let Some(result) = app.selected_result() {
+                let cmd = format!("nix-env -iA nixpkgs.{}", result.attr);
+                copy_to_clipboard(&cmd);
+                app.add_toast(format!("Copied install command"));
+            }
+        }
+        AppEvent::Key(KeyEvent {
+            code: KeyCode::Char('p'),
+            modifiers: KeyModifiers::NONE,
+            ..
+        }) => {
+            if let Some(result) = app.selected_result() {
+                let cmd = format!("nix profile install nixpkgs#{}", result.attr);
+                copy_to_clipboard(&cmd);
+                app.add_toast(format!("Copied profile command"));
+            }
+        }
+        AppEvent::Mouse(MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(MouseButton::Left),
+            row,
+            ..
+        }) => {
+            let result_count = app.result_count();
+            if result_count > 0 {
+                let first_result_row = 2u16;
+                let row_offset = row.saturating_sub(first_result_row) as usize;
+                if row_offset < result_count {
+                    app.selected = row_offset.min(result_count - 1);
+                    app.ensure_visible();
+                }
+            }
+        }
+        AppEvent::Mouse(MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollDown,
+            ..
+        }) => {
+            app.select_next();
+        }
+        AppEvent::Mouse(MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            ..
+        }) => {
+            app.select_prev();
         }
         _ => {}
     }
@@ -264,6 +414,17 @@ fn handle_detail_event(app: &mut App, event: AppEvent, _detail: &DetailView) {
         }) => {
             app.close_detail();
         }
+        AppEvent::Key(KeyEvent {
+            code: KeyCode::Char(' '),
+            modifiers: KeyModifiers::NONE,
+            ..
+        }) => {
+            app.toggle_detail_pin();
+            app.set_status(format!(
+                "Detail {}",
+                if app.detail_pinned { "pinned" } else { "unpinned" }
+            ));
+        }
         _ => {}
     }
 }
@@ -273,6 +434,19 @@ fn perform_search(app: &mut App, query: &str) {
         app.set_results(Vec::new());
         return;
     }
+
+    if app.is_cache_valid(query) {
+        if let Some(cached) = app.get_cached_results(query) {
+            app.set_results(cached.clone());
+            app.set_status(format!(
+                "Found {} result(s) (cached)",
+                app.result_count()
+            ));
+            return;
+        }
+    }
+
+    app.is_searching = true;
 
     match app.mode {
         SearchMode::Search => {
@@ -285,12 +459,16 @@ fn perform_search(app: &mut App, query: &str) {
             perform_which_search(app, query);
         }
     }
+
+    app.is_searching = false;
 }
 
 fn perform_package_search(app: &mut App, query: &str) {
     let sidecar = app.database.join("packages.json");
     if !sidecar.exists() {
-        app.set_status(String::from("No package metadata sidecar found. Run nix-index first."));
+        app.set_status(String::from(
+            "No package metadata sidecar found. Run nix-index first.",
+        ));
         return;
     }
 
@@ -310,7 +488,6 @@ fn perform_package_search(app: &mut App, query: &str) {
             SearchSort::AttrAsc => PkgSearchSort::Attr,
             SearchSort::SizeAsc => PkgSearchSort::Name,
             SearchSort::SizeDesc => PkgSearchSort::NameDesc,
-            SearchSort::Reverse => PkgSearchSort::Reverse,
         }
     };
 
@@ -344,8 +521,13 @@ fn perform_package_search(app: &mut App, query: &str) {
                     description: r.description.unwrap_or_default(),
                     path: None,
                     size: None,
+                    license: r.license,
+                    homepage: r.homepage,
+                    maintainers: r.maintainers.unwrap_or_default(),
+                    main_program: r.main_program,
                 })
                 .collect();
+            app.cache_results(query.to_string(), results.clone());
             app.set_results(results);
             app.set_status(format!("Found {} result(s)", app.result_count()));
         }
@@ -394,9 +576,14 @@ fn perform_locate_search(app: &mut App, query: &str) {
                         description: String::new(),
                         path: Some(String::from_utf8_lossy(&entry.path).to_string()),
                         size,
+                        license: None,
+                        homepage: None,
+                        maintainers: Vec::new(),
+                        main_program: None,
                     }
                 })
                 .collect();
+            app.cache_results(query.to_string(), search_results.clone());
             app.set_results(search_results);
             app.set_status(format!("Found {} result(s)", app.result_count()));
         }
@@ -414,9 +601,7 @@ fn perform_which_search(app: &mut App, query: &str) {
 
     match nixdex_core::command_index::CommandIndex::open(&app.database) {
         Ok(index) => {
-            let providers = index
-                .lookup_command(command.as_bytes())
-                .unwrap_or_default();
+            let providers = index.lookup_command(command.as_bytes()).unwrap_or_default();
             let results: Vec<crate::app::SearchResult> = providers
                 .into_iter()
                 .map(|p| crate::app::SearchResult {
@@ -425,13 +610,56 @@ fn perform_which_search(app: &mut App, query: &str) {
                     description: String::new(),
                     path: None,
                     size: None,
+                    license: None,
+                    homepage: None,
+                    maintainers: Vec::new(),
+                    main_program: None,
                 })
                 .collect();
+            app.cache_results(query.to_string(), results.clone());
             app.set_results(results);
             app.set_status(format!("Found {} provider(s)", app.result_count()));
         }
         Err(_) => {
-            app.set_status(String::from("Command index not available. Run nix-index first."));
+            app.set_status(String::from(
+                "Command index not available. Run nix-index first.",
+            ));
         }
     }
+}
+
+fn copy_to_clipboard(text: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(output) = std::process::Command::new("xclip")
+            .args(["-selection", "clipboard"])
+            .input(text)
+            .output()
+        {
+            if output.status.success() {
+                return;
+            }
+        }
+        if let Ok(output) = std::process::Command::new("wl-copy")
+            .arg(text)
+            .output()
+        {
+            if output.status.success() {
+                return;
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("pbcopy")
+            .input(text)
+            .output();
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("clip")
+            .input(text)
+            .output();
+    }
+    eprintln!("{}", text);
 }

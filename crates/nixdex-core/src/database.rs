@@ -118,7 +118,11 @@ impl NgramCache {
 
     fn insert(&mut self, key: String, value: Arc<RoaringBitmap>) {
         if self.map.contains_key(&key) {
-            self.map.insert(key, value);
+            self.map.insert(key.clone(), value);
+            if let Some(pos) = self.order.iter().position(|k| k == &key) {
+                self.order.remove(pos);
+            }
+            self.order.insert(0, key);
             return;
         }
         if self.map.len() >= NGRAM_CACHE_CAPACITY {
@@ -2535,7 +2539,10 @@ fn resolve_ngram_ordinals_multi(
     }
 
     if let Some(ref bm) = result {
-        cache.lock().unwrap().insert(cache_key, Arc::new(bm.clone()));
+        cache
+            .lock()
+            .unwrap()
+            .insert(cache_key, Arc::new(bm.clone()));
     }
 
     result
@@ -2916,9 +2923,7 @@ pub fn search_results_with_reader(
     // Selectivity estimation: count ngram candidates to guide fast-path
     // ordering. The path trigram fast path is most selective when candidates
     // are below the limit.
-    let ngram_candidate_count = ngram_ordinals
-        .as_ref()
-        .map_or(0, |bm| bm.len() as usize);
+    let ngram_candidate_count = ngram_ordinals.as_ref().map_or(0, |bm| bm.len() as usize);
 
     let package_ordinals: Option<RoaringBitmap> = match (base_ordinals, ngram_ordinals) {
         (Some(b), Some(ng)) => Some(b & &ng),
@@ -3004,7 +3009,10 @@ pub fn search_results_with_reader(
                     }
                     results = hits;
                     used_fast_path = true;
-                    tracing::debug!(hits = results.len(), "search plan: exact path (redb) fast path");
+                    tracing::debug!(
+                        hits = results.len(),
+                        "search plan: exact path (redb) fast path"
+                    );
                 }
                 Ok(None) => {}
                 Err(err) => {
@@ -3035,7 +3043,10 @@ pub fn search_results_with_reader(
             Ok(Some(entry_results)) => {
                 results = entry_results;
                 used_fast_path = true;
-                tracing::debug!(hits = results.len(), "search plan: exact basename fast path");
+                tracing::debug!(
+                    hits = results.len(),
+                    "search plan: exact basename fast path"
+                );
             }
             Ok(None) => {}
             Err(err) => {
@@ -3085,7 +3096,10 @@ pub fn search_results_with_reader(
                 tracing::debug!(hits = results.len(), "search plan: path trigram fast path");
             }
             Ok(None) => {
-                tracing::debug!(ngram_candidate_count, "search plan: path trigram fell back to scan");
+                tracing::debug!(
+                    ngram_candidate_count,
+                    "search plan: path trigram fell back to scan"
+                );
             }
             Err(err) => {
                 tracing::debug!(%err, "path trigram search failed; falling back");

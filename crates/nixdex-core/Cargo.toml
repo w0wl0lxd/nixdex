@@ -14,6 +14,7 @@ cli = ["dep:clap"]
 daemon = ["dep:axum", "dep:nixdex-history", "dep:nixdex-options"]
 prebuilt = []
 cdc = ["dep:fastcdc", "dep:blake3"]
+huge_pages = ["dep:memmap2"]
 
 [dependencies]
 tokio = { workspace = true }
@@ -45,6 +46,7 @@ fuzzy-matcher = { workspace = true }
 clap = { workspace = true, optional = true }
 xz2 = "0.1.7"
 mmap-guard = { workspace = true }
+memmap2 = { workspace = true, optional = true }
 fastrand = "2"
 axum = { version = "0.8", features = ["json"], optional = true }
 nixdex-history = { workspace = true, optional = true }
