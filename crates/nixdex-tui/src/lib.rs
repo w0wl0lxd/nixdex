@@ -7,4 +7,5 @@ pub use app::App;
 pub use app::DetailView;
 pub use app::SearchMode;
 pub use app::SearchResult;
+pub use app::Theme;
 pub use tui::run_tui;

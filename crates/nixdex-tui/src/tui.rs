@@ -1,15 +1,16 @@
 use std::io;
+use std::io::Write;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use app::App;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent};
+use crate::app::App;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use nixdex_core::database::{SearchOptions, SearchSort};
-use nixdex_core::package_search::{SearchDb, SearchField, SearchSort as PkgSearchSort};
+use nixdex_core::package_search::{SearchDb, SearchSort as PkgSearchSort};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::time::{interval, sleep};
@@ -17,6 +18,7 @@ use tokio::time::{interval, sleep};
 use crate::app::DetailView;
 use crate::app::SearchMode;
 use crate::event::AppEvent;
+use crate::ui;
 
 const DEBOUNCE_DELAY: Duration = Duration::from_millis(300);
 const CACHE_TTL: Duration = Duration::from_secs(30);
@@ -50,7 +52,7 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
         }
     });
 
-    let mut debounce_timer: Option<tokio::time::Sleep> = None;
+    let mut debounce_deadline: Option<Instant> = None;
     let mut pending_query: Option<String> = None;
 
     loop {
@@ -60,7 +62,7 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
             maybe_event = rx.recv() => {
                 match maybe_event {
                     Some(app_event) => {
-                        handle_input_event(&mut app, &app_event, &mut pending_query, &mut debounce_timer);
+                        handle_input_event(&mut app, &app_event, &mut pending_query, &mut debounce_deadline);
                         handle_event(&mut app, app_event);
                     }
                     None => break,
@@ -70,12 +72,18 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
                 app.tick();
             }
             _ = async {
-                if let Some(ref mut timer) = debounce_timer {
-                    timer.as_mut();
+                if let Some(deadline) = debounce_deadline {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return;
+                    }
+                    sleep(remaining).await;
+                } else {
+                    sleep(Duration::from_secs(60)).await;
                 }
             } => {
                 if let Some(query) = pending_query.take() {
-                    debounce_timer = None;
+                    debounce_deadline = None;
                     if query != app.input {
                         app.set_input(query.clone());
                         perform_search(&mut app, &query);
@@ -97,7 +105,7 @@ fn handle_input_event(
     app: &mut App,
     event: &AppEvent,
     pending_query: &mut Option<String>,
-    debounce_timer: &mut Option<tokio::time::Sleep>,
+    debounce_deadline: &mut Option<Instant>,
 ) {
     match event {
         AppEvent::Key(KeyEvent {
@@ -109,7 +117,7 @@ fn handle_input_event(
                 let mut new_input = app.input.clone();
                 new_input.push(*c);
                 *pending_query = Some(new_input);
-                *debounce_timer = Some(sleep(DEBOUNCE_DELAY));
+                *debounce_deadline = Some(Instant::now() + DEBOUNCE_DELAY);
             }
         }
         AppEvent::Key(KeyEvent {
@@ -120,7 +128,7 @@ fn handle_input_event(
             let mut new_input = app.input.clone();
             new_input.pop();
             *pending_query = Some(new_input);
-            *debounce_timer = Some(sleep(DEBOUNCE_DELAY));
+            *debounce_deadline = Some(Instant::now() + DEBOUNCE_DELAY);
         }
         AppEvent::Key(KeyEvent {
             code: KeyCode::Esc,
@@ -128,7 +136,7 @@ fn handle_input_event(
             ..
         }) => {
             *pending_query = None;
-            *debounce_timer = None;
+            *debounce_deadline = None;
         }
         _ => {}
     }
@@ -154,7 +162,7 @@ fn handle_event(app: &mut App, event: AppEvent) {
             }
             return;
         }
-        handle_detail_event(app, event, detail);
+        handle_detail_event(app, event);
         return;
     }
 
@@ -267,7 +275,11 @@ fn handle_event(app: &mut App, event: AppEvent) {
             app.toggle_detail_pin();
             app.set_status(format!(
                 "Detail {}",
-                if app.detail_pinned { "pinned" } else { "unpinned" }
+                if app.detail_pinned {
+                    "pinned"
+                } else {
+                    "unpinned"
+                }
             ));
         }
         AppEvent::Key(KeyEvent {
@@ -363,7 +375,7 @@ fn handle_event(app: &mut App, event: AppEvent) {
             }
         }
         AppEvent::Mouse(MouseEvent {
-            kind: crossterm::event::MouseEventKind::Down(MouseButton::Left),
+            kind: MouseEventKind::Down(MouseButton::Left),
             row,
             ..
         }) => {
@@ -378,13 +390,13 @@ fn handle_event(app: &mut App, event: AppEvent) {
             }
         }
         AppEvent::Mouse(MouseEvent {
-            kind: crossterm::event::MouseEventKind::ScrollDown,
+            kind: MouseEventKind::ScrollDown,
             ..
         }) => {
             app.select_next();
         }
         AppEvent::Mouse(MouseEvent {
-            kind: crossterm::event::MouseEventKind::ScrollUp,
+            kind: MouseEventKind::ScrollUp,
             ..
         }) => {
             app.select_prev();
@@ -393,7 +405,7 @@ fn handle_event(app: &mut App, event: AppEvent) {
     }
 }
 
-fn handle_detail_event(app: &mut App, event: AppEvent, _detail: &DetailView) {
+fn handle_detail_event(app: &mut App, event: AppEvent) {
     match event {
         AppEvent::Key(KeyEvent {
             code: KeyCode::Esc,
@@ -422,7 +434,11 @@ fn handle_detail_event(app: &mut App, event: AppEvent, _detail: &DetailView) {
             app.toggle_detail_pin();
             app.set_status(format!(
                 "Detail {}",
-                if app.detail_pinned { "pinned" } else { "unpinned" }
+                if app.detail_pinned {
+                    "pinned"
+                } else {
+                    "unpinned"
+                }
             ));
         }
         _ => {}
@@ -438,10 +454,7 @@ fn perform_search(app: &mut App, query: &str) {
     if app.is_cache_valid(query) {
         if let Some(cached) = app.get_cached_results(query) {
             app.set_results(cached.clone());
-            app.set_status(format!(
-                "Found {} result(s) (cached)",
-                app.result_count()
-            ));
+            app.set_status(format!("Found {} result(s) (cached)", app.result_count()));
             return;
         }
     }
@@ -480,18 +493,42 @@ fn perform_package_search(app: &mut App, query: &str) {
         }
     };
 
-    let sort = if app.search_sort == SearchSort::Reverse {
-        PkgSearchSort::Reverse
-    } else {
-        match app.search_sort {
-            SearchSort::None => PkgSearchSort::None,
-            SearchSort::AttrAsc => PkgSearchSort::Attr,
-            SearchSort::SizeAsc => PkgSearchSort::Name,
-            SearchSort::SizeDesc => PkgSearchSort::NameDesc,
-        }
+    let sort = match app.search_sort {
+        SearchSort::None => PkgSearchSort::None,
+        SearchSort::AttrAsc => PkgSearchSort::Attr,
+        SearchSort::SizeAsc => PkgSearchSort::Name,
+        SearchSort::SizeDesc => PkgSearchSort::NameDesc,
+        SearchSort::Reverse => PkgSearchSort::Reverse,
     };
 
-    let matches = if app.search_fuzzy {
+    let matches = if app.search_tiered_fuzzy {
+        let fuzzy_results = db.search_fuzzy(
+            query,
+            app.search_field,
+            app.search_case_sensitive,
+            PkgSearchSort::None,
+            app.search_limit,
+        );
+        match fuzzy_results {
+            Ok(records) => {
+                let mut scored: Vec<_> = records
+                    .into_iter()
+                    .map(|r| {
+                        let score = crate::app::fuzzy_score(query, &r.attr);
+                        (score, r)
+                    })
+                    .collect();
+                scored.sort_by(|(score_a, a), (score_b, b)| {
+                    score_b.cmp(score_a).then_with(|| a.attr.cmp(&b.attr))
+                });
+                if let Some(limit) = app.search_limit {
+                    scored.truncate(limit);
+                }
+                Ok(scored.into_iter().map(|(_, r)| r).collect())
+            }
+            Err(e) => Err(e),
+        }
+    } else if app.search_fuzzy {
         db.search_fuzzy(
             query,
             app.search_field,
@@ -516,15 +553,15 @@ fn perform_package_search(app: &mut App, query: &str) {
             let results: Vec<crate::app::SearchResult> = records
                 .into_iter()
                 .map(|r| crate::app::SearchResult {
-                    attr: r.attr,
-                    name: r.name,
-                    description: r.description.unwrap_or_default(),
+                    attr: r.attr.clone(),
+                    name: r.name.clone(),
+                    description: r.description.as_deref().unwrap_or_default().to_string(),
                     path: None,
                     size: None,
-                    license: r.license,
-                    homepage: r.homepage,
-                    maintainers: r.maintainers.unwrap_or_default(),
-                    main_program: r.main_program,
+                    license: r.license.clone(),
+                    homepage: r.homepage.clone(),
+                    maintainers: r.maintainers.as_deref().unwrap_or_default().to_vec(),
+                    main_program: r.main_program.clone(),
                 })
                 .collect();
             app.cache_results(query.to_string(), results.clone());
@@ -631,35 +668,39 @@ fn perform_which_search(app: &mut App, query: &str) {
 fn copy_to_clipboard(text: &str) {
     #[cfg(target_os = "linux")]
     {
-        if let Ok(output) = std::process::Command::new("xclip")
+        if let Ok(mut cmd) = std::process::Command::new("xclip")
             .args(["-selection", "clipboard"])
-            .input(text)
-            .output()
+            .stdin(std::process::Stdio::piped())
+            .spawn()
         {
-            if output.status.success() {
-                return;
+            if let Some(mut stdin) = cmd.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
             }
+            let _ = cmd.wait();
+            return;
         }
-        if let Ok(output) = std::process::Command::new("wl-copy")
-            .arg(text)
-            .output()
+        if let Ok(mut cmd) = std::process::Command::new("wl-copy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
         {
-            if output.status.success() {
-                return;
+            if let Some(mut stdin) = cmd.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
             }
+            let _ = cmd.wait();
+            return;
         }
     }
     #[cfg(target_os = "macos")]
     {
         let _ = std::process::Command::new("pbcopy")
-            .input(text)
-            .output();
+            .stdin(std::process::Stdio::piped())
+            .spawn();
     }
     #[cfg(windows)]
     {
         let _ = std::process::Command::new("clip")
-            .input(text)
-            .output();
+            .stdin(std::process::Stdio::piped())
+            .spawn();
     }
     eprintln!("{}", text);
 }

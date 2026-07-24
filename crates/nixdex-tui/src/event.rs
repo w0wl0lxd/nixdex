@@ -1,4 +1,6 @@
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 #[derive(Debug, Clone)]
 pub enum AppEvent {
@@ -45,6 +47,10 @@ impl AppEvent {
                 code: KeyCode::Up,
                 modifiers: KeyModifiers::NONE,
                 ..
+            }) | AppEvent::Key(KeyEvent {
+                code: KeyCode::Char('k'),
+                modifiers: KeyModifiers::NONE,
+                ..
             })
         )
     }
@@ -54,6 +60,10 @@ impl AppEvent {
             self,
             AppEvent::Key(KeyEvent {
                 code: KeyCode::Down,
+                modifiers: KeyModifiers::NONE,
+                ..
+            }) | AppEvent::Key(KeyEvent {
+                code: KeyCode::Char('j'),
                 modifiers: KeyModifiers::NONE,
                 ..
             })
@@ -137,6 +147,17 @@ impl AppEvent {
         )
     }
 
+    pub fn is_space(&self) -> bool {
+        matches!(
+            self,
+            AppEvent::Key(KeyEvent {
+                code: KeyCode::Char(' '),
+                modifiers: KeyModifiers::NONE,
+                ..
+            })
+        )
+    }
+
     pub fn is_ctrl_r(&self) -> bool {
         matches!(
             self,
@@ -192,6 +213,61 @@ impl AppEvent {
         )
     }
 
+    pub fn is_question(&self) -> bool {
+        matches!(
+            self,
+            AppEvent::Key(KeyEvent {
+                code: KeyCode::Char('?'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            })
+        )
+    }
+
+    pub fn is_char_a(&self) -> bool {
+        matches!(
+            self,
+            AppEvent::Key(KeyEvent {
+                code: KeyCode::Char('a'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            })
+        )
+    }
+
+    pub fn is_char_y(&self) -> bool {
+        matches!(
+            self,
+            AppEvent::Key(KeyEvent {
+                code: KeyCode::Char('y'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            })
+        )
+    }
+
+    pub fn is_char_e(&self) -> bool {
+        matches!(
+            self,
+            AppEvent::Key(KeyEvent {
+                code: KeyCode::Char('e'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            })
+        )
+    }
+
+    pub fn is_char_p(&self) -> bool {
+        matches!(
+            self,
+            AppEvent::Key(KeyEvent {
+                code: KeyCode::Char('p'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            })
+        )
+    }
+
     pub fn as_char(&self) -> Option<char> {
         if let AppEvent::Key(KeyEvent {
             code: KeyCode::Char(c),
@@ -200,6 +276,48 @@ impl AppEvent {
         }) = self
         {
             Some(*c)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_mouse_scroll_down(&self) -> bool {
+        if let AppEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            ..
+        }) = self
+        {
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn is_mouse_scroll_up(&self) -> bool {
+        if let AppEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            ..
+        }) = self
+        {
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn is_mouse_click(&self) -> bool {
+        matches!(
+            self,
+            AppEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                ..
+            })
+        )
+    }
+
+    pub fn mouse_row(&self) -> Option<u16> {
+        if let AppEvent::Mouse(MouseEvent { row, .. }) = self {
+            Some(*row)
         } else {
             None
         }

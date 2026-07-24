@@ -1,5 +1,7 @@
 //! nixdex-core — library for building and searching a Nix package file index.
 
+#![allow(unsafe_code)]
+
 use std::io::{self, Read};
 
 pub mod basename_index;
@@ -29,6 +31,7 @@ pub mod store_path;
 
 pub use cache_dir::{nix_index_dir, nixdex_dir};
 pub use database::generate_sidecars;
+pub use database::sidecar_diff;
 pub use errors::{Error, Result};
 pub use files::{ALL_FILE_TYPES, FileEntries, FileNode, FileTree, FileTreeEntry, FileType};
 pub use hydra::Fetcher;

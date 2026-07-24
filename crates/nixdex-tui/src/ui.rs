@@ -1,11 +1,10 @@
-use ratatui::backend::CrosstermBackend;
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
-use ratatui::Frame;
 
-use crate::app::{App, DetailView, SearchMode, SearchResult};
+use crate::app::{App, DetailView, SearchMode, Theme};
 
 fn mode_name(mode: SearchMode) -> &'static str {
     match mode {
@@ -13,6 +12,122 @@ fn mode_name(mode: SearchMode) -> &'static str {
         SearchMode::Locate => "LOCATE",
         SearchMode::Which => "WHICH",
     }
+}
+
+fn theme_colors(theme: Theme) -> ThemeColors {
+    match theme {
+        Theme::TokyoNight => ThemeColors {
+            bg: Color::Rgb(30, 30, 46),
+            fg: Color::Rgb(220, 220, 220),
+            header_bg: Color::Rgb(40, 40, 60),
+            header_fg: Color::Rgb(220, 220, 220),
+            mode_fg: Color::Rgb(136, 192, 208),
+            selected_bg: Color::Rgb(50, 50, 70),
+            selected_fg: Color::Rgb(240, 240, 240),
+            selected_modifier: Modifier::BOLD,
+            attr_fg: Color::Rgb(163, 216, 163),
+            desc_fg: Color::Rgb(150, 150, 170),
+            status_fg: Color::Rgb(120, 120, 140),
+            accent_fg: Color::Rgb(136, 192, 208),
+            detail_label_fg: Color::Rgb(136, 192, 208),
+            detail_value_fg: Color::Rgb(220, 220, 220),
+            overlay_bg: Color::Rgb(20, 20, 36),
+            overlay_border: Color::Rgb(80, 80, 120),
+            toast_bg: Color::Rgb(50, 50, 70),
+            toast_fg: Color::Rgb(220, 220, 220),
+            spinner_fg: Color::Rgb(240, 240, 240),
+            pinned_fg: Color::Rgb(240, 240, 240),
+        },
+        Theme::CatppuccinMocha => ThemeColors {
+            bg: Color::Rgb(30, 30, 46),
+            fg: Color::Rgb(205, 214, 244),
+            header_bg: Color::Rgb(49, 50, 68),
+            header_fg: Color::Rgb(205, 214, 244),
+            mode_fg: Color::Rgb(166, 227, 240),
+            selected_bg: Color::Rgb(69, 71, 90),
+            selected_fg: Color::Rgb(245, 224, 220),
+            selected_modifier: Modifier::BOLD,
+            attr_fg: Color::Rgb(166, 227, 240),
+            desc_fg: Color::Rgb(166, 173, 200),
+            status_fg: Color::Rgb(137, 140, 160),
+            accent_fg: Color::Rgb(166, 227, 240),
+            detail_label_fg: Color::Rgb(166, 227, 240),
+            detail_value_fg: Color::Rgb(205, 214, 244),
+            overlay_bg: Color::Rgb(24, 24, 38),
+            overlay_border: Color::Rgb(76, 77, 100),
+            toast_bg: Color::Rgb(49, 50, 68),
+            toast_fg: Color::Rgb(205, 214, 244),
+            spinner_fg: Color::Rgb(245, 224, 220),
+            pinned_fg: Color::Rgb(245, 224, 220),
+        },
+        Theme::Nord => ThemeColors {
+            bg: Color::Rgb(30, 30, 46),
+            fg: Color::Rgb(220, 220, 220),
+            header_bg: Color::Rgb(40, 40, 60),
+            header_fg: Color::Rgb(220, 220, 220),
+            mode_fg: Color::Rgb(136, 192, 208),
+            selected_bg: Color::Rgb(50, 50, 70),
+            selected_fg: Color::Rgb(240, 240, 240),
+            selected_modifier: Modifier::BOLD,
+            attr_fg: Color::Rgb(163, 216, 163),
+            desc_fg: Color::Rgb(150, 150, 170),
+            status_fg: Color::Rgb(120, 120, 140),
+            accent_fg: Color::Rgb(136, 192, 208),
+            detail_label_fg: Color::Rgb(136, 192, 208),
+            detail_value_fg: Color::Rgb(220, 220, 220),
+            overlay_bg: Color::Rgb(20, 20, 36),
+            overlay_border: Color::Rgb(80, 80, 120),
+            toast_bg: Color::Rgb(50, 50, 70),
+            toast_fg: Color::Rgb(220, 220, 220),
+            spinner_fg: Color::Rgb(240, 240, 240),
+            pinned_fg: Color::Rgb(240, 240, 240),
+        },
+        Theme::Dracula => ThemeColors {
+            bg: Color::Rgb(40, 40, 50),
+            fg: Color::Rgb(220, 220, 220),
+            header_bg: Color::Rgb(50, 50, 65),
+            header_fg: Color::Rgb(220, 220, 220),
+            mode_fg: Color::Rgb(189, 147, 249),
+            selected_bg: Color::Rgb(60, 60, 80),
+            selected_fg: Color::Rgb(248, 248, 242),
+            selected_modifier: Modifier::BOLD,
+            attr_fg: Color::Rgb(80, 250, 123),
+            desc_fg: Color::Rgb(150, 150, 170),
+            status_fg: Color::Rgb(120, 120, 140),
+            accent_fg: Color::Rgb(189, 147, 249),
+            detail_label_fg: Color::Rgb(189, 147, 249),
+            detail_value_fg: Color::Rgb(248, 248, 242),
+            overlay_bg: Color::Rgb(30, 30, 40),
+            overlay_border: Color::Rgb(100, 100, 140),
+            toast_bg: Color::Rgb(60, 60, 80),
+            toast_fg: Color::Rgb(248, 248, 242),
+            spinner_fg: Color::Rgb(248, 248, 242),
+            pinned_fg: Color::Rgb(248, 248, 242),
+        },
+    }
+}
+
+struct ThemeColors {
+    bg: Color,
+    fg: Color,
+    header_bg: Color,
+    header_fg: Color,
+    mode_fg: Color,
+    selected_bg: Color,
+    selected_fg: Color,
+    selected_modifier: Modifier,
+    attr_fg: Color,
+    desc_fg: Color,
+    status_fg: Color,
+    accent_fg: Color,
+    detail_label_fg: Color,
+    detail_value_fg: Color,
+    overlay_bg: Color,
+    overlay_border: Color,
+    toast_bg: Color,
+    toast_fg: Color,
+    spinner_fg: Color,
+    pinned_fg: Color,
 }
 
 pub fn render(frame: &mut Frame<'_>, app: &App) {
@@ -26,18 +141,19 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         ])
         .split(size);
 
-    render_header(frame, chunks[0], app);
-    render_body(frame, chunks[1], app);
-    render_footer(frame, chunks[2], app);
+    let tc = theme_colors(app.theme);
+
+    render_header(frame, chunks[0], app, &tc);
+    render_body(frame, chunks[1], app, &tc);
+    render_footer(frame, chunks[2], app, &tc);
+    render_toasts(frame, app, &tc);
 }
 
-fn render_header(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
+fn render_header(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App, tc: &ThemeColors) {
     let mode_label = format!(" {} ", mode_name(app.mode));
     let mode_span = Span::styled(
         mode_label,
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(tc.mode_fg).add_modifier(Modifier::BOLD),
     );
 
     let input_text = if app.input.is_empty() {
@@ -50,27 +166,51 @@ fn render_header(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) 
 
     let paragraph = Paragraph::new(input_line)
         .block(Block::default().borders(Borders::ALL).title(" nixdex tui "))
-        .style(Style::default().fg(Color::White));
+        .style(Style::default().fg(tc.fg).bg(tc.bg));
 
     frame.render_widget(paragraph, area);
 }
 
-fn render_body(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
+fn render_body(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App, tc: &ThemeColors) {
+    if app.is_searching {
+        render_loading(frame, area, tc);
+        return;
+    }
+
     if let Some(detail) = &app.detail {
-        render_detail(frame, area, detail);
+        render_detail(frame, area, detail, tc);
     } else {
-        render_results(frame, area, app);
+        render_results(frame, area, app, tc);
     }
 }
 
-fn render_results(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
+fn render_loading(frame: &mut Frame<'_>, area: ratatui::layout::Rect, tc: &ThemeColors) {
+    let lines = vec![Line::from(vec![Span::styled(
+        " Searching... ",
+        Style::default()
+            .fg(tc.spinner_fg)
+            .add_modifier(Modifier::BOLD),
+    )])];
+    let text = Text::from(lines);
+    let paragraph = Paragraph::new(text)
+        .block(Block::default().borders(Borders::ALL).title(" Search "))
+        .style(Style::default().fg(tc.fg).bg(tc.bg))
+        .alignment(Alignment::Center);
+
+    frame.render_widget(paragraph, area);
+}
+
+fn render_results(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App, tc: &ThemeColors) {
     let items: Vec<ListItem> = app
         .results
         .iter()
         .enumerate()
         .map(|(i, result)| {
             let line = if app.search_name_only {
-                Line::from(vec![Span::raw(&result.attr)])
+                Line::from(vec![Span::styled(
+                    &result.attr,
+                    Style::default().fg(tc.attr_fg),
+                )])
             } else if app.search_json {
                 Line::from(vec![Span::raw(format!(
                     "{}  {}  {}",
@@ -80,10 +220,12 @@ fn render_results(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App)
                 let attr_span = if i == app.selected {
                     Span::styled(
                         &result.attr,
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(tc.selected_fg)
+                            .add_modifier(tc.selected_modifier),
                     )
                 } else {
-                    Span::raw(&result.attr)
+                    Span::styled(&result.attr, Style::default().fg(tc.attr_fg))
                 };
                 let name_span = Span::raw(format!("  {}", result.name));
                 let desc_span = Span::raw(format!("  {}", result.description));
@@ -100,35 +242,47 @@ fn render_results(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App)
         .block(Block::default().borders(Borders::NONE))
         .highlight_style(
             Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
+                .bg(tc.selected_bg)
+                .fg(tc.selected_fg)
+                .add_modifier(tc.selected_modifier),
         )
         .highlight_symbol("▶ ");
 
     frame.render_stateful_widget(list, area, &mut list_state);
 }
 
-fn render_detail(frame: &mut Frame<'_>, area: ratatui::layout::Rect, detail: &DetailView) {
+fn render_detail(
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+    detail: &DetailView,
+    tc: &ThemeColors,
+) {
     let lines = {
         let mut lines = Vec::new();
         lines.push(Line::from(vec![
             Span::styled(
                 "Attribute:",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(tc.detail_label_fg)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!("  {}", detail.attr)),
         ]));
         lines.push(Line::from(vec![
             Span::styled(
                 "Name:",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(tc.detail_label_fg)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!("  {}", detail.name)),
         ]));
         lines.push(Line::from(vec![
             Span::styled(
                 "Description:",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(tc.detail_label_fg)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!("  {}", detail.description)),
         ]));
@@ -136,7 +290,9 @@ fn render_detail(frame: &mut Frame<'_>, area: ratatui::layout::Rect, detail: &De
             lines.push(Line::from(vec![
                 Span::styled(
                     "Path:",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(tc.detail_label_fg)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!("  {}", path)),
             ]));
@@ -145,7 +301,9 @@ fn render_detail(frame: &mut Frame<'_>, area: ratatui::layout::Rect, detail: &De
             lines.push(Line::from(vec![
                 Span::styled(
                     "Size:",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(tc.detail_label_fg)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!("  {} bytes", size)),
             ]));
@@ -154,7 +312,9 @@ fn render_detail(frame: &mut Frame<'_>, area: ratatui::layout::Rect, detail: &De
             lines.push(Line::from(vec![
                 Span::styled(
                     "License:",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(tc.detail_label_fg)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!("  {}", license)),
             ]));
@@ -163,7 +323,9 @@ fn render_detail(frame: &mut Frame<'_>, area: ratatui::layout::Rect, detail: &De
             lines.push(Line::from(vec![
                 Span::styled(
                     "Homepage:",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(tc.detail_label_fg)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!("  {}", homepage)),
             ]));
@@ -172,7 +334,9 @@ fn render_detail(frame: &mut Frame<'_>, area: ratatui::layout::Rect, detail: &De
             lines.push(Line::from(vec![
                 Span::styled(
                     "Maintainers:",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(tc.detail_label_fg)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!("  {}", detail.maintainers.join(", "))),
             ]));
@@ -181,9 +345,22 @@ fn render_detail(frame: &mut Frame<'_>, area: ratatui::layout::Rect, detail: &De
             lines.push(Line::from(vec![
                 Span::styled(
                     "Main program:",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(tc.detail_label_fg)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!("  {}", main_program)),
+            ]));
+        }
+        if detail.pinned {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "PINNED",
+                    Style::default()
+                        .fg(tc.pinned_fg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  (press Space to unpin)"),
             ]));
         }
         lines
@@ -192,26 +369,44 @@ fn render_detail(frame: &mut Frame<'_>, area: ratatui::layout::Rect, detail: &De
     let text = Text::from(lines);
     let paragraph = Paragraph::new(text)
         .block(Block::default().borders(Borders::ALL).title(" Details "))
-        .style(Style::default().fg(Color::White))
+        .style(Style::default().fg(tc.detail_value_fg).bg(tc.bg))
         .wrap(Wrap { trim: true });
 
     frame.render_widget(paragraph, area);
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
+fn render_footer(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App, tc: &ThemeColors) {
     let result_count = app.result_count();
     let mode_label = mode_name(app.mode);
     let footer_text = format!(
         " {} | {} results | {} ",
-        app.status_message,
-        result_count,
-        mode_label
+        app.status_message, result_count, mode_label
     );
 
     let paragraph = Paragraph::new(footer_text)
         .block(Block::default().borders(Borders::TOP))
-        .style(Style::default().fg(Color::DarkGray))
+        .style(Style::default().fg(tc.status_fg).bg(tc.bg))
         .alignment(Alignment::Left);
 
     frame.render_widget(paragraph, area);
+}
+
+fn render_toasts(frame: &mut Frame<'_>, app: &App, tc: &ThemeColors) {
+    if app.toasts.is_empty() {
+        return;
+    }
+
+    let toast_area = ratatui::layout::Rect::new(
+        frame.size().width.saturating_sub(40),
+        frame.size().height.saturating_sub(3),
+        40,
+        1,
+    );
+
+    let latest = &app.toasts[app.toasts.len() - 1];
+    let paragraph = Paragraph::new(latest.message.as_str())
+        .block(Block::default().borders(Borders::ALL))
+        .style(Style::default().fg(tc.toast_fg).bg(tc.toast_bg));
+
+    frame.render_widget(paragraph, toast_area);
 }
