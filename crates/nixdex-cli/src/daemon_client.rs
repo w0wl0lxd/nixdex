@@ -218,7 +218,12 @@ fn format_grouped(n: u64) -> String {
 /// Render a daemon response into the same text/JSON/count lines the local
 /// search path would print. Colour highlighting is omitted because the daemon
 /// response does not carry per-match highlight ranges.
-pub(crate) fn render(response: &NixLocateResponse, json: bool, minimal: bool, null_output: bool) -> Vec<String> {
+pub(crate) fn render(
+    response: &NixLocateResponse,
+    json: bool,
+    minimal: bool,
+    null_output: bool,
+) -> Vec<String> {
     if let Some(count) = response.count {
         return vec![count.to_string()];
     }
@@ -279,7 +284,10 @@ pub(crate) fn render(response: &NixLocateResponse, json: bool, minimal: bool, nu
                 let size_str = format_grouped(size);
                 let sp = store_path_string(m);
                 let path = m.path.clone().unwrap_or_else(String::new);
-                format!("{:<40} {:>14} {:>1} {}{}{delim}", m.attr, size_str, kind, sp, path)
+                format!(
+                    "{:<40} {:>14} {:>1} {}{}{delim}",
+                    m.attr, size_str, kind, sp, path
+                )
             })
             .collect()
     }

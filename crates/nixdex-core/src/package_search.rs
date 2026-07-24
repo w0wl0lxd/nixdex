@@ -240,7 +240,15 @@ impl SearchDb {
                 } else {
                     Vec::new()
                 };
-            Self::sort_records(&mut matches, sort, pattern, regex, field, case_sensitive, exact);
+            Self::sort_records(
+                &mut matches,
+                sort,
+                pattern,
+                regex,
+                field,
+                case_sensitive,
+                exact,
+            );
             if let Some(limit) = limit {
                 matches.truncate(limit);
             }
@@ -280,7 +288,15 @@ impl SearchDb {
                 .collect()
         };
 
-        Self::sort_records(&mut matches, sort, pattern, regex, field, case_sensitive, exact);
+        Self::sort_records(
+            &mut matches,
+            sort,
+            pattern,
+            regex,
+            field,
+            case_sensitive,
+            exact,
+        );
 
         if let Some(limit) = limit {
             matches.truncate(limit);
@@ -486,7 +502,9 @@ fn literal_relevance(
 fn attr_literal_score(value: &str, needle: &str, case_sensitive: bool) -> u32 {
     if value_equals(value, needle, case_sensitive) {
         3000
-    } else if value.starts_with(needle) || (!case_sensitive && value.to_lowercase().starts_with(needle)) {
+    } else if value.starts_with(needle)
+        || (!case_sensitive && value.to_lowercase().starts_with(needle))
+    {
         2000
     } else if value_contains(value, needle, case_sensitive) {
         1000
@@ -498,7 +516,9 @@ fn attr_literal_score(value: &str, needle: &str, case_sensitive: bool) -> u32 {
 fn desc_literal_score(value: &str, needle: &str, case_sensitive: bool) -> u32 {
     if value_equals(value, needle, case_sensitive) {
         300
-    } else if value.starts_with(needle) || (!case_sensitive && value.to_lowercase().starts_with(needle)) {
+    } else if value.starts_with(needle)
+        || (!case_sensitive && value.to_lowercase().starts_with(needle))
+    {
         200
     } else if value_contains(value, needle, case_sensitive) {
         100
@@ -510,7 +530,9 @@ fn desc_literal_score(value: &str, needle: &str, case_sensitive: bool) -> u32 {
 fn main_literal_score(value: &str, needle: &str, case_sensitive: bool) -> u32 {
     if value_equals(value, needle, case_sensitive) {
         300
-    } else if value.starts_with(needle) || (!case_sensitive && value.to_lowercase().starts_with(needle)) {
+    } else if value.starts_with(needle)
+        || (!case_sensitive && value.to_lowercase().starts_with(needle))
+    {
         200
     } else if value_contains(value, needle, case_sensitive) {
         100
@@ -555,7 +577,11 @@ fn regex_relevance(
 }
 
 fn attr_regex_score(value: &str, pattern: &str, case_sensitive: bool, exact: bool) -> u32 {
-    let anchored = if exact { format!("^(?:{pattern})$") } else { pattern.to_string() };
+    let anchored = if exact {
+        format!("^(?:{pattern})$")
+    } else {
+        pattern.to_string()
+    };
     let re = RegexBuilder::new(&anchored)
         .case_insensitive(!case_sensitive)
         .size_limit(REGEX_SIZE_LIMIT)
@@ -576,7 +602,11 @@ fn attr_regex_score(value: &str, pattern: &str, case_sensitive: bool, exact: boo
 }
 
 fn desc_regex_score(value: &str, pattern: &str, case_sensitive: bool, exact: bool) -> u32 {
-    let anchored = if exact { format!("^(?:{pattern})$") } else { pattern.to_string() };
+    let anchored = if exact {
+        format!("^(?:{pattern})$")
+    } else {
+        pattern.to_string()
+    };
     let re = RegexBuilder::new(&anchored)
         .case_insensitive(!case_sensitive)
         .size_limit(REGEX_SIZE_LIMIT)
@@ -597,7 +627,11 @@ fn desc_regex_score(value: &str, pattern: &str, case_sensitive: bool, exact: boo
 }
 
 fn main_regex_score(value: &str, pattern: &str, case_sensitive: bool, exact: bool) -> u32 {
-    let anchored = if exact { format!("^(?:{pattern})$") } else { pattern.to_string() };
+    let anchored = if exact {
+        format!("^(?:{pattern})$")
+    } else {
+        pattern.to_string()
+    };
     let re = RegexBuilder::new(&anchored)
         .case_insensitive(!case_sensitive)
         .size_limit(REGEX_SIZE_LIMIT)
@@ -1207,7 +1241,15 @@ mod tests {
 
         let db = SearchDb::open(&path).expect("open");
         let hits = db
-            .search("mise", false, SearchField::Attr, false, false, SearchSort::None, None)
+            .search(
+                "mise",
+                false,
+                SearchField::Attr,
+                false,
+                false,
+                SearchSort::None,
+                None,
+            )
             .expect("search");
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].attr, "mise");
@@ -1229,7 +1271,15 @@ mod tests {
 
         let db = SearchDb::open(&path).expect("open");
         let hits = db
-            .search("mise", false, SearchField::Attr, false, false, SearchSort::None, None)
+            .search(
+                "mise",
+                false,
+                SearchField::Attr,
+                false,
+                false,
+                SearchSort::None,
+                None,
+            )
             .expect("search");
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].attr, "mise");
@@ -1250,7 +1300,15 @@ mod tests {
 
         let db = SearchDb::open(&path).expect("open");
         let hits = db
-            .search("mise", false, SearchField::Both, false, false, SearchSort::None, None)
+            .search(
+                "mise",
+                false,
+                SearchField::Both,
+                false,
+                false,
+                SearchSort::None,
+                None,
+            )
             .expect("search");
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].attr, "mise");
@@ -1269,7 +1327,15 @@ mod tests {
 
         let db = SearchDb::open(&path).expect("open");
         let hits = db
-            .search("version", false, SearchField::Both, false, false, SearchSort::None, None)
+            .search(
+                "version",
+                false,
+                SearchField::Both,
+                false,
+                false,
+                SearchSort::None,
+                None,
+            )
             .expect("search");
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].attr, "other");
@@ -1290,7 +1356,15 @@ mod tests {
 
         let db = SearchDb::open(&path).expect("open");
         let hits = db
-            .search("version", false, SearchField::Description, false, false, SearchSort::None, None)
+            .search(
+                "version",
+                false,
+                SearchField::Description,
+                false,
+                false,
+                SearchSort::None,
+                None,
+            )
             .expect("search");
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].attr, "alpha");
@@ -1312,7 +1386,15 @@ mod tests {
 
         let db = SearchDb::open(&path).expect("open");
         let hits = db
-            .search("mise", false, SearchField::Attr, false, false, SearchSort::None, None)
+            .search(
+                "mise",
+                false,
+                SearchField::Attr,
+                false,
+                false,
+                SearchSort::None,
+                None,
+            )
             .expect("search");
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].attr, "Mise");

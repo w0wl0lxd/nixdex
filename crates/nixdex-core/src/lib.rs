@@ -95,6 +95,15 @@ pub fn search_database(options: &database::SearchOptions<'_>) -> Result<()> {
     database::search(options)
 }
 
+/// Search the database for multiple patterns in a single invocation,
+/// reusing the DB reader across queries to avoid repeated open overhead.
+pub fn search_database_batch(
+    options: &database::SearchOptions<'_>,
+    patterns: &[String],
+) -> Result<()> {
+    database::search_batch(options, patterns)
+}
+
 /// Search the database and return matched `(StorePath, FileTreeEntry)` pairs.
 ///
 /// `resident` lets the daemon reuse already-loaded secondary indexes instead
