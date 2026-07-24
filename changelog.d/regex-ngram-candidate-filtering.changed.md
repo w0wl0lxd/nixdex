@@ -1,0 +1,1 @@
+- Extract both literal prefix and suffix from regex patterns (e.g. `bin/` and `test` from `bin/.*test$`) via `regex_syntax` AST analysis, intersect their n-gram candidate sets for tighter frame pruning, and extend the path-trigram fast path to regex queries with extracted literals.
