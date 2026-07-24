@@ -1707,7 +1707,7 @@ fn literal_suffix_from_ast(ast: &Ast) -> Option<String> {
             let mut suffix = String::new();
             for child in c.asts.iter().rev() {
                 match literal_suffix_from_ast(child) {
-                    Some(s) => suffix = format!("{s}{suffix}"),
+                    Some(s) => suffix.insert_str(0, &s),
                     None => break,
                 }
             }
@@ -2325,7 +2325,10 @@ fn resolve_ngram_ordinals_multi(
         if pat.len() < 3 {
             continue;
         }
-        let candidates = resolve_ngram_ordinals(reader, Some(pat))?;
+        let candidates = match resolve_ngram_ordinals(reader, Some(pat)) {
+            Some(c) => c,
+            None => continue,
+        };
         result = Some(match result {
             Some(bm) => bm & &candidates,
             None => candidates,
