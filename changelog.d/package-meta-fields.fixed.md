@@ -1,0 +1,1 @@
+Fix compilation errors by adding missing `license`, `homepage`, `maintainers`, and `platforms` fields to `PackageMeta`, implementing `extract_license`/`extract_maintainers` helpers, adding `EvalJob` accessor methods, and adding `null_output` to `SearchOptions`.

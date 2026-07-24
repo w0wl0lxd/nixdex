@@ -783,6 +783,18 @@ impl Reader {
             v1_decompressed: once_cell::sync::OnceCell::new(),
         })
     }
+
+    /// Touch every page of the mmap'd database file to eliminate minor page
+    /// faults during subsequent searches. Best called once during daemon
+    /// warm-up; for CLI use the cost is paid on every invocation so it is
+    /// left to the caller to decide.
+    ///
+    /// Uses `std::hint::black_box` to prevent the compiler from optimising
+    /// away the reads.
+    pub fn prefault(&self) {
+        prefault_mmap(&self.data);
+    }
+
     /// Return the path this reader was opened against.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -1044,6 +1056,11 @@ impl Reader {
 
     /// Fast literal-substring search using the path-level trigram + entry sidecars.
     ///
+    /// When `suffix_pattern` is provided (for regex queries with a fixed literal
+    /// suffix), candidate path-ids from both the prefix and suffix trigram lookups
+    /// are intersected before the candidate-limit check, dramatically reducing
+    /// false positives for common prefixes like `bin/`.
+    ///
     /// Returns `Ok(None)` if the sidecars are missing, the pattern is not a
     /// literal substring, or the trigram candidate set is empty. Otherwise returns
     /// `Ok(Some(results))` with all matching `(StorePath, FileTreeEntry)` pairs,
@@ -1052,6 +1069,7 @@ impl Reader {
     pub fn search_path_trigram(
         &self,
         pattern: &str,
+        suffix_pattern: Option<&str>,
         path_pattern: &Regex,
         package_pattern: Option<&Regex>,
         hash: Option<&str>,
@@ -1083,6 +1101,34 @@ impl Reader {
             }
         };
 
+        // For regex queries with a fixed literal suffix, intersect the suffix
+        // candidates with the prefix candidates. This narrows the set before
+        // the candidate-limit check, allowing the fast path to succeed even when
+        // the prefix alone (e.g. `bin/`) exceeds the limit.
+        let candidates = if let Some(suffix) = suffix_pattern {
+            if suffix.len() >= 3 && suffix != pattern {
+                match trigram.candidate_path_ids(suffix) {
+                    Ok(Some(suffix_ids)) => {
+                        let prefix_count = candidates.len();
+                        let suffix_count = suffix_ids.len();
+                        let intersected = candidates & &suffix_ids;
+                        tracing::debug!(
+                            prefix_count,
+                            suffix_count,
+                            intersected_count = intersected.len(),
+                            "intersecting prefix and suffix trigram candidates"
+                        );
+                        intersected
+                    }
+                    _ => candidates,
+                }
+            } else {
+                candidates
+            }
+        } else {
+            candidates
+        };
+
         if candidates.is_empty() {
             return Ok(Some(Vec::new()));
         }
@@ -1095,11 +1141,27 @@ impl Reader {
             return Ok(None);
         }
 
-        let needle = pattern.as_bytes();
+        let prefix_needle = pattern.as_bytes();
+        let suffix_needle = suffix_pattern
+            .filter(|s| s.len() >= 3 && s != &pattern)
+            .map(str::as_bytes);
         let mut results = Vec::new();
         for path_id in candidates {
             let path = entry.path_bytes(path_id).map_err(Error::PathEntryIndex)?;
-            if memchr::memmem::find(path, needle).is_none() {
+            if memchr::memmem::find(path, prefix_needle).is_none() {
+                continue;
+            }
+            if let Some(suffix_bytes) = suffix_needle
+                && memchr::memmem::find(path, suffix_bytes).is_none()
+            {
+                continue;
+            }
+            // For regex queries with a suffix, the prefix/suffix substring checks
+            // above are necessary but not sufficient: a path may contain both the
+            // prefix and suffix without matching the full regex (e.g. `bin/test_runner`
+            // contains `bin/` and `test` but doesn't match `bin/.*test$`). Verify
+            // the full regex here.
+            if suffix_needle.is_some() && !path_pattern.is_match(path) {
                 continue;
             }
 
@@ -2247,6 +2309,8 @@ pub struct SearchOptions<'a> {
     pub max_size: Option<u64>,
     /// Exclude results from FHS-style packages (`-fhs` / `-usr-target`).
     pub exclude_fhs: bool,
+    /// Emit null bytes between results instead of newlines.
+    pub null_output: bool,
 }
 
 /// Pre-loaded secondary indexes that a long-running holder (e.g. the daemon)
@@ -2333,6 +2397,28 @@ fn ngram_sidecars_exist(dir: &Path) -> bool {
     ]
     .iter()
     .any(|name| dir.join(name).is_file())
+}
+
+/// Touch every 4 KiB page in `data` to force minor page faults before the
+/// critical search path. The compiler is prevented from eliding the reads
+/// via [`std::hint::black_box`].
+fn prefault_mmap(data: &[u8]) {
+    const PAGE_SIZE: usize = 4096;
+    let len = data.len();
+    if len == 0 {
+        return;
+    }
+    let mut addr = 0usize;
+    while addr < len {
+        if let Some(byte) = data.get(addr) {
+            std::hint::black_box(byte);
+        }
+        addr += PAGE_SIZE;
+    }
+    // Touch the last byte in case len is not a multiple of PAGE_SIZE.
+    if let Some(byte) = data.get(len - 1) {
+        std::hint::black_box(byte);
+    }
 }
 
 /// Resolve the set of candidate package ordinals from the trigram (n-gram)
@@ -2466,6 +2552,18 @@ struct MatchJson {
     kind: String,
     path: String,
     store_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    license: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    homepage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    maintainers: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    platforms: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    main_program: Option<String>,
 }
 
 /// JSON-serializable minimal search result emitted by `--minimal --json`.
@@ -2482,6 +2580,7 @@ struct MinimalMatchJson {
 #[allow(clippy::print_stdout)] // search is a CLI-facing printer for now
 fn print_match(
     options: &SearchOptions<'_>,
+    package_db: Option<&crate::package_search::SearchDb>,
     path_pattern: &Regex,
     printed_attrs: &mut IndexSet<String>,
     store_path: &StorePath,
@@ -2490,7 +2589,7 @@ fn print_match(
     let attr = format_attr(store_path);
 
     if options.json {
-        print_match_json(options, printed_attrs, store_path, entry, &attr)
+        print_match_json(options, package_db, printed_attrs, store_path, entry, &attr)
     } else {
         print_match_text(
             options,
@@ -2506,11 +2605,13 @@ fn print_match(
 #[allow(clippy::print_stdout)]
 fn print_match_json(
     options: &SearchOptions<'_>,
+    package_db: Option<&crate::package_search::SearchDb>,
     printed_attrs: &mut IndexSet<String>,
     store_path: &StorePath,
     entry: &FileTreeEntry,
     attr: &str,
 ) -> bool {
+    let delim = if options.null_output { "\0" } else { "\n" };
     match options.mode {
         SearchMode::Minimal => {
             if printed_attrs.insert(attr.into()) {
@@ -2518,7 +2619,7 @@ fn print_match_json(
                     attr: attr.to_string(),
                 };
                 if let Ok(line) = sonic_rs::to_string(&record) {
-                    println!("{line}");
+                    print!("{line}{delim}");
                     return true;
                 }
             }
@@ -2532,15 +2633,22 @@ fn print_match_json(
                 FileNode::Directory { size, .. } => ("d", *size),
                 FileNode::Symlink { .. } => ("s", 0),
             };
+            let meta = package_db.and_then(|db| db.lookup_attr(store_path.origin().attr.as_str()));
             let record = MatchJson {
                 attr: attr.to_string(),
                 size,
                 kind: kind.to_string(),
                 path: String::from_utf8_lossy(&entry.path).into_owned(),
                 store_path: store_path.as_str(),
+                description: meta.and_then(|m| m.description.clone()),
+                license: meta.and_then(|m| m.license.clone()),
+                homepage: meta.and_then(|m| m.homepage.clone()),
+                maintainers: meta.and_then(|m| m.maintainers.clone()),
+                platforms: meta.and_then(|m| m.platforms.clone()),
+                main_program: meta.and_then(|m| m.main_program.clone()),
             };
             if let Ok(line) = sonic_rs::to_string(&record) {
-                println!("{line}");
+                print!("{line}{delim}");
                 true
             } else {
                 false
@@ -2558,10 +2666,11 @@ fn print_match_text(
     entry: &FileTreeEntry,
     attr: &str,
 ) -> bool {
+    let delim = if options.null_output { "\0" } else { "\n" };
     match options.mode {
         SearchMode::Minimal => {
             if printed_attrs.insert(attr.into()) {
-                println!("{attr}");
+                print!("{attr}{delim}");
                 return true;
             }
             false
@@ -2596,12 +2705,12 @@ fn print_match_text(
                     prev = mat.end();
                 }
                 if let Some(rest) = path_str.get(prev..) {
-                    println!("{rest}");
+                    print!("{rest}{delim}");
                 } else {
-                    println!();
+                    print!("{delim}");
                 }
             } else {
-                println!("{path_str}");
+                print!("{path_str}{delim}");
             }
             true
         }
@@ -2828,11 +2937,11 @@ pub fn search_results_with_reader(
 
     // 3. Literal substring: path-level trigram + entry cache.
     //    Also applies to regex queries whose AST yields a fixed literal prefix
-    //    or suffix (e.g. `bin/` and `test` from `bin/.*test$`): the path trigram
+    //    and/or suffix (e.g. `bin/` and `test` from `bin/.*test$`): the path trigram
     //    index narrows candidates and `should_include_match` applies the full
-    //    regex. We prefer the prefix because it is typically more selective for
-    //    path-trigram lookups (e.g. `bin/` is less common as a trigram window
-    //    than `test`).
+    //    regex. When both prefix and suffix are available, both are passed to
+    //    `search_path_trigram` so it can intersect their candidate sets before the
+    //    candidate-limit check, avoiding fallback to a full scan.
     if !used_fast_path
         && (options.literal_pattern.is_some()
             || regex_literal_prefix.is_some()
@@ -2848,8 +2957,16 @@ pub fn search_results_with_reader(
                 .or(regex_literal_suffix.as_deref())
                 .map_or(&options.pattern, |p| p),
         };
+        // For regex queries, pass the suffix alongside the prefix so the trigram
+        // index can intersect candidates. For literal queries, suffix is None.
+        let suffix_str = if options.literal_pattern.is_none() {
+            regex_literal_suffix.as_deref()
+        } else {
+            None
+        };
         match reader.search_path_trigram(
             pattern_str,
+            suffix_str,
             &path_pattern,
             package_re.as_ref(),
             options.hash.as_deref(),
@@ -2921,6 +3038,16 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
     let path_pattern = compile_search_regex(&options.pattern, "path")?;
     let results = search_results(options, None)?;
 
+    // Load package metadata sidecar for enriched JSON output, if available.
+    let package_db = (|| {
+        let path = options.database.join("packages.json");
+        if path.exists() {
+            crate::package_search::SearchDb::open(&path).ok()
+        } else {
+            None
+        }
+    })();
+
     // Track printed attrs for --minimal de-duplication (ordered set).
     let mut printed_attrs: IndexSet<String> = IndexSet::new();
 
@@ -2940,6 +3067,7 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
 
         if print_match(
             options,
+            package_db.as_ref(),
             &path_pattern,
             &mut printed_attrs,
             &store_path,
@@ -3193,6 +3321,10 @@ fn scan_decoder_for_packages<R: std::io::BufRead>(
                         name: pkg.name().to_string(),
                         description: None,
                         main_program: None,
+                        license: None,
+                        homepage: None,
+                        maintainers: None,
+                        platforms: None,
                     });
                     all_package_attrs.push((attr, output, pkg.hash().to_string()));
 
@@ -3408,6 +3540,7 @@ mod tests {
             min_size: None,
             max_size: None,
             exclude_fhs: false,
+            null_output: false,
         };
         search(&options).expect("search ok");
     }
@@ -3446,6 +3579,7 @@ mod tests {
             min_size: None,
             max_size: None,
             exclude_fhs: false,
+            null_output: false,
         };
 
         let hits = search_results(&options, None).expect("search");
@@ -3644,6 +3778,7 @@ mod tests {
                 min_size: None,
                 max_size: None,
                 exclude_fhs: false,
+                null_output: false,
             };
             let pruned = search_results(&options, None).expect("sidecar search");
 
@@ -3707,6 +3842,7 @@ mod tests {
             min_size: None,
             max_size: None,
             exclude_fhs: false,
+            null_output: false,
         };
         let pruned = search_results(&options, None).expect("entry-index search");
 
@@ -3806,6 +3942,7 @@ mod tests {
                 min_size: None,
                 max_size: None,
                 exclude_fhs: false,
+                null_output: false,
             };
             let pruned = search_results(&options, None).expect("sidecar search");
 
@@ -3886,6 +4023,7 @@ mod tests {
             min_size: None,
             max_size: None,
             exclude_fhs: false,
+            null_output: false,
         };
         let regex_baseline = reader
             .search_entries(&Regex::new("b.n").expect("regex"), None, None, None, None)
@@ -3899,7 +4037,7 @@ mod tests {
 
         // Short literal (<3 bytes): path trigram returns None, falls back.
         let short_options = SearchOptions {
-            database: dir.path().to_path_buf(),
+    null_output: false,
             pattern: "he".into(),
             literal_pattern: Some("he".into()),
             ..regex_options.clone()
@@ -3961,6 +4099,7 @@ mod tests {
             min_size: None,
             max_size: None,
             exclude_fhs: false,
+            null_output: false,
         };
         let pruned = search_results(&options, None).expect("fallback search");
 
@@ -4501,8 +4640,9 @@ mod tests {
             min_size: None,
             max_size: None,
             exclude_fhs: false,
+            null_output: false,
         };
-        let regex_pruned = search_results(&regex_options).expect("regex search");
+        let regex_pruned = search_results(&regex_options, None).expect("regex search");
 
         let normalize = |v: Vec<(StorePath, FileTreeEntry)>| {
             let mut v: Vec<_> = v.into_iter().map(|(_, e)| e.path).collect();
@@ -4514,6 +4654,94 @@ mod tests {
             normalize(regex_pruned),
             normalize(baseline),
             "regex with literal prefix must match full scan"
+        );
+    }
+
+    #[test]
+    fn regex_with_prefix_and_suffix_uses_trigram_intersection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+
+        let hello = sample_store_path();
+        let hello_tree = sample_tree();
+        let coreutils = StorePath::new(
+            "/nix/store".into(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            "coreutils-9.11".into(),
+            Origin {
+                attr: "coreutils".into(),
+                output: "out".into(),
+                toplevel: true,
+                system: Some("x86_64-linux".into()),
+            },
+        );
+        // Build a tree with paths that contain both `bin/` and `test` in various
+        // positions so the regex `bin/.*test$` has matches.
+        let coreutils_tree = FileTree::directory(vec![(
+            Bytes::from_static(b"bin"),
+            FileTree::directory(vec![
+                (Bytes::from_static(b"ls"), FileTree::regular(0, true)),
+                (Bytes::from_static(b"test_runner"), FileTree::regular(0, true)),
+                (Bytes::from_static(b"test"), FileTree::regular(0, true)),
+            ]),
+        )]);
+
+        {
+            let mut writer = Writer::create(&db_path, 3).expect("create");
+            writer.add(&hello, &hello_tree, b"").expect("add hello");
+            writer
+                .add(&coreutils, &coreutils_tree, b"")
+                .expect("add coreutils");
+            writer.finish().expect("finish");
+        }
+
+        generate_sidecars(&db_path).expect("sidecars");
+
+        let reader = Reader::open(&db_path).expect("reader");
+
+        // Full-scan baseline with a regex that has both a literal prefix `bin/`
+        // and a literal suffix `test`.
+        let re = Regex::new("bin/.*test$").expect("regex");
+        let baseline = reader
+            .search_entries(&re, None, None, None, None)
+            .expect("baseline");
+
+        // Regex query via search_results: `literal_pattern` is None, but the
+        // regex literal prefix `bin/` and suffix `test` should be extracted and
+        // both passed to search_path_trigram, which intersects their candidate
+        // sets before the candidate-limit check.
+        let regex_options = SearchOptions {
+            database: dir.path().to_path_buf(),
+            pattern: "bin/.*test$".into(),
+            hash: None,
+            package_pattern: None,
+            exact_basename: None,
+            exact_path: None,
+            path_prefix: None,
+            literal_pattern: None,
+            file_type: &[],
+            mode: SearchMode::Minimal,
+            json: false,
+            limit: None,
+            count: false,
+            sort: SearchSort::None,
+            min_size: None,
+            max_size: None,
+            exclude_fhs: false,
+            null_output: false,
+        };
+        let regex_pruned = search_results(&regex_options, None).expect("regex search");
+
+        let normalize = |v: Vec<(StorePath, FileTreeEntry)>| {
+            let mut v: Vec<_> = v.into_iter().map(|(_, e)| e.path).collect();
+            v.sort();
+            v
+        };
+
+        assert_eq!(
+            normalize(regex_pruned),
+            normalize(baseline),
+            "regex with prefix and suffix must match full scan"
         );
     }
 }

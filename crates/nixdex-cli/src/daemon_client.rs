@@ -38,6 +38,18 @@ pub struct NixLocateMatch {
     pub path: Option<String>,
     #[serde(default)]
     pub node: Option<NixLocateNode>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub license: Option<String>,
+    #[serde(default)]
+    pub homepage: Option<String>,
+    #[serde(default)]
+    pub maintainers: Option<Vec<String>>,
+    #[serde(default)]
+    pub platforms: Option<Vec<String>>,
+    #[serde(default)]
+    pub main_program: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -206,10 +218,12 @@ fn format_grouped(n: u64) -> String {
 /// Render a daemon response into the same text/JSON/count lines the local
 /// search path would print. Colour highlighting is omitted because the daemon
 /// response does not carry per-match highlight ranges.
-pub(crate) fn render(response: &NixLocateResponse, json: bool, minimal: bool) -> Vec<String> {
+pub(crate) fn render(response: &NixLocateResponse, json: bool, minimal: bool, null_output: bool) -> Vec<String> {
     if let Some(count) = response.count {
         return vec![count.to_string()];
     }
+
+    let delim = if null_output { "\0" } else { "\n" };
 
     if json {
         response
@@ -217,18 +231,45 @@ pub(crate) fn render(response: &NixLocateResponse, json: bool, minimal: bool) ->
             .iter()
             .map(|m| {
                 let (kind, size) = node_kind_size(m.node.as_ref());
-                sonic_rs::to_string(&sonic_rs::json!({
+                let mut obj = sonic_rs::json!({
                     "attr": m.attr,
                     "size": size,
                     "kind": kind,
                     "path": m.path.clone().unwrap_or_else(String::new),
                     "store_path": store_path_string(m),
-                }))
-                .unwrap_or_else(|_| String::new())
+                });
+                if let Some(ref desc) = m.description {
+                    obj.insert("description", sonic_rs::Value::copy_str(desc));
+                }
+                if let Some(ref lic) = m.license {
+                    obj.insert("license", sonic_rs::Value::copy_str(lic));
+                }
+                if let Some(ref hp) = m.homepage {
+                    obj.insert("homepage", sonic_rs::Value::copy_str(hp));
+                }
+                if let Some(ref maint) = m.maintainers {
+                    if let Ok(val) = sonic_rs::to_value(maint) {
+                        obj.insert("maintainers", val);
+                    }
+                }
+                if let Some(ref plats) = m.platforms {
+                    if let Ok(val) = sonic_rs::to_value(plats) {
+                        obj.insert("platforms", val);
+                    }
+                }
+                if let Some(ref mp) = m.main_program {
+                    obj.insert("main_program", sonic_rs::Value::copy_str(mp));
+                }
+                let line = sonic_rs::to_string(&obj).unwrap_or_else(|_| String::new());
+                format!("{line}{delim}")
             })
             .collect()
     } else if minimal {
-        response.matches.iter().map(|m| m.attr.clone()).collect()
+        response
+            .matches
+            .iter()
+            .map(|m| format!("{}{delim}", m.attr))
+            .collect()
     } else {
         response
             .matches
@@ -238,7 +279,7 @@ pub(crate) fn render(response: &NixLocateResponse, json: bool, minimal: bool) ->
                 let size_str = format_grouped(size);
                 let sp = store_path_string(m);
                 let path = m.path.clone().unwrap_or_else(String::new);
-                format!("{:<40} {:>14} {:>1} {}{}", m.attr, size_str, kind, sp, path)
+                format!("{:<40} {:>14} {:>1} {}{}{delim}", m.attr, size_str, kind, sp, path)
             })
             .collect()
     }
