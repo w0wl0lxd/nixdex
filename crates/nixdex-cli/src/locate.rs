@@ -149,6 +149,10 @@ pub struct Opts {
     #[arg(long)]
     pub exclude_fhs: bool,
 
+    /// Use NUL (`\0`) as the output delimiter instead of newline.
+    #[arg(long, short = '0', alias = "print0")]
+    pub null_output: bool,
+
     /// Disable the resident daemon and run a local search directly. The daemon
     /// keeps the index resident for warm sub-100ms queries; without it each
     /// invocation reloads the index from disk.
@@ -175,6 +179,7 @@ struct ProcessedArgs {
     min_size: Option<u64>,
     max_size: Option<u64>,
     exclude_fhs: bool,
+    null_output: bool,
 }
 
 fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
@@ -287,6 +292,7 @@ fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
         min_size: matches.min_size,
         max_size: matches.max_size,
         exclude_fhs: matches.exclude_fhs,
+        null_output: matches.null_output,
     })
 }
 
@@ -304,7 +310,7 @@ pub async fn run(matches: Opts) -> color_eyre::Result<()> {
         match locate_via_daemon(&matches).await {
             Ok(lines) => {
                 for line in lines {
-                    println!("{line}");
+                    print!("{line}");
                 }
                 return Ok(());
             }
@@ -334,6 +340,7 @@ pub async fn run(matches: Opts) -> color_eyre::Result<()> {
         min_size: args.min_size,
         max_size: args.max_size,
         exclude_fhs: args.exclude_fhs,
+        null_output: args.null_output,
     };
 
     nixdex_core::search_database(&options).wrap_err("nix-locate failed")?;
@@ -352,6 +359,7 @@ async fn locate_via_daemon(opts: &Opts) -> Result<Vec<String>, crate::daemon_cli
         &response,
         opts.json,
         opts.minimal,
+        opts.null_output,
     ))
 }
 
@@ -365,6 +373,7 @@ fn daemon_query(opts: &Opts) -> Vec<(String, String)> {
         ("minimal".into(), opts.minimal.to_string()),
         ("count".into(), opts.count.to_string()),
         ("exclude_fhs".into(), opts.exclude_fhs.to_string()),
+        ("null".into(), opts.null_output.to_string()),
     ];
     if let Some(p) = &opts.package {
         q.push(("package".into(), p.clone()));

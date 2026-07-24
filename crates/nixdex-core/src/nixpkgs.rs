@@ -106,6 +106,18 @@ pub struct Meta {
     /// The value of `meta.description`, if present and a string.
     #[serde(default)]
     pub description: Option<String>,
+    /// The value of `meta.license`, if present. May be a string, attrset, or list.
+    #[serde(default)]
+    pub license: Option<sonic_rs::Value>,
+    /// The value of `meta.homepage`, if present and a string.
+    #[serde(default)]
+    pub homepage: Option<String>,
+    /// The value of `meta.maintainers`, if present. May be a list of strings or attrsets.
+    #[serde(default)]
+    pub maintainers: Option<Vec<sonic_rs::Value>>,
+    /// The value of `meta.platforms`, if present.
+    #[serde(default)]
+    pub platforms: Option<Vec<String>>,
 }
 
 /// One successfully decoded derivation job from `nix-eval-jobs` NDJSON.
@@ -168,6 +180,14 @@ pub struct PackageMeta {
     pub description: Option<String>,
     /// `meta.mainProgram`, if present.
     pub main_program: Option<String>,
+    /// `meta.license`, if present (human-readable string).
+    pub license: Option<String>,
+    /// `meta.homepage`, if present.
+    pub homepage: Option<String>,
+    /// `meta.maintainers`, if present (list of names/emails).
+    pub maintainers: Option<Vec<String>>,
+    /// `meta.platforms`, if present.
+    pub platforms: Option<Vec<String>>,
 }
 
 /// One NDJSON line produced by `nix-eval-jobs`.
@@ -249,11 +269,95 @@ impl EvalJob {
         self.meta.as_ref()?.main_program.as_deref()
     }
 
-    /// Return the value of `meta.description`, if any.
+/// Return the value of `meta.description`, if any.
     #[must_use]
     pub fn description(&self) -> Option<&str> {
         self.meta.as_ref()?.description.as_deref()
     }
+
+    /// Return the value of `meta.license`, if present, as a human-readable string.
+    #[must_use]
+    pub fn license(&self) -> Option<String> {
+        self.meta.as_ref()?.license.as_ref().map(extract_license)
+    }
+
+    /// Return the value of `meta.homepage`, if present.
+    #[must_use]
+    pub fn homepage(&self) -> Option<&str> {
+        self.meta.as_ref()?.homepage.as_deref()
+    }
+
+    /// Return the value of `meta.maintainers`, if present, as a list of strings.
+    #[must_use]
+    pub fn maintainers(&self) -> Option<Vec<String>> {
+        self.meta.as_ref()?.maintainers.as_ref().map(|v| extract_maintainers(v))
+    }
+
+    /// Return the value of `meta.platforms`, if present.
+    #[must_use]
+    pub fn platforms(&self) -> Option<Vec<String>> {
+        self.meta.as_ref()?.platforms.clone()
+    }
+}
+
+/// Convert a nixpkgs `meta.license` value to a human-readable string.
+fn extract_license(value: &sonic_rs::Value) -> String {
+    match value.as_ref() {
+        sonic_rs::ValueRef::String(s) => s.to_string(),
+        sonic_rs::ValueRef::Object(map) => {
+            let mut result = String::new();
+            for (k, v) in map.iter() {
+                if k == "spdx-id" || k == "fullName" || k == "name" {
+                    if let sonic_rs::ValueRef::String(s) = v.as_ref() {
+                        result = s.to_string();
+                        break;
+                    }
+                }
+            }
+            if result.is_empty() {
+                sonic_rs::to_string(value).unwrap_or_else(|_| String::new())
+            } else {
+                result
+            }
+        }
+        sonic_rs::ValueRef::Array(arr) => arr
+            .iter()
+            .filter_map(|v| {
+                if let sonic_rs::ValueRef::String(s) = v.as_ref() {
+                    Some(s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => sonic_rs::to_string(value).unwrap_or_else(|_| String::new()),
+    }
+}
+
+/// Convert a nixpkgs `meta.maintainers` list to a list of strings.
+fn extract_maintainers(values: &Vec<sonic_rs::Value>) -> Vec<String> {
+    values
+        .iter()
+        .filter_map(|v| {
+            match v.as_ref() {
+                sonic_rs::ValueRef::String(s) => Some(s.to_string()),
+                sonic_rs::ValueRef::Object(map) => {
+                    let mut result = None;
+                    for (k, v) in map.iter() {
+                        if k == "email" || k == "github" || k == "name" {
+                            if let sonic_rs::ValueRef::String(s) = v.as_ref() {
+                                result = Some(s.to_string());
+                                break;
+                            }
+                        }
+                    }
+                    result
+                }
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Decode a single NDJSON line into an [`EvalJobLine`].
@@ -602,6 +706,10 @@ async fn stream_options_to_entries(
                 name: job.name.clone(),
                 description: job.description().map(String::from),
                 main_program: job.main_program().map(String::from),
+                license: job.license(),
+                homepage: job.homepage().map(String::from),
+                maintainers: job.maintainers(),
+                platforms: job.platforms(),
             };
             if meta_tx.send(meta).await.is_err() {
                 // Consumer dropped; stop reading.

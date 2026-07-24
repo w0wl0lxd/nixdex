@@ -240,7 +240,7 @@ impl SearchDb {
                 } else {
                     Vec::new()
                 };
-            Self::sort_records(&mut matches, sort);
+            Self::sort_records(&mut matches, sort, pattern, regex, field, case_sensitive, exact);
             if let Some(limit) = limit {
                 matches.truncate(limit);
             }
@@ -280,13 +280,24 @@ impl SearchDb {
                 .collect()
         };
 
-        Self::sort_records(&mut matches, sort);
+        Self::sort_records(&mut matches, sort, pattern, regex, field, case_sensitive, exact);
 
         if let Some(limit) = limit {
             matches.truncate(limit);
         }
 
         Ok(matches)
+    }
+
+    /// Look up package metadata by exact attribute path (case-insensitive).
+    ///
+    /// Returns the first matching record, or `None` if no record has the
+    /// given attribute.
+    pub fn lookup_attr(&self, attr: &str) -> Option<&PackageMeta> {
+        self.attr_index
+            .get(&attr.to_lowercase())
+            .and_then(|indices| indices.first().copied())
+            .and_then(|idx| self.records.get(idx))
     }
 
     /// Fuzzy-search package records using the frizbee SIMD fuzzy matcher.
@@ -350,8 +361,29 @@ impl SearchDb {
     }
 
     /// Sort a slice of package records in-place according to `sort`.
-    fn sort_records(matches: &mut Vec<&PackageMeta>, sort: SearchSort) {
+    ///
+    /// When `sort == SearchSort::None`, records are ordered by relevance
+    /// score computed from the search parameters.
+    fn sort_records(
+        matches: &mut Vec<&PackageMeta>,
+        sort: SearchSort,
+        pattern: &str,
+        regex: bool,
+        field: SearchField,
+        case_sensitive: bool,
+        exact: bool,
+    ) {
         if sort == SearchSort::None {
+            let needle = if case_sensitive {
+                pattern.to_string()
+            } else {
+                pattern.to_lowercase()
+            };
+            matches.sort_by(|a, b| {
+                let score_a = relevance_score(a, &needle, regex, field, case_sensitive, exact);
+                let score_b = relevance_score(b, &needle, regex, field, case_sensitive, exact);
+                score_b.cmp(&score_a).then_with(|| a.attr.cmp(&b.attr))
+            });
             return;
         }
         matches.sort_by(|a, b| Self::compare_records(a, b, sort));
@@ -398,6 +430,237 @@ fn value_equals(value: &str, pattern: &str, case_sensitive: bool) -> bool {
     } else {
         value.to_lowercase() == pattern.to_lowercase()
     }
+}
+
+fn relevance_score(
+    record: &PackageMeta,
+    needle: &str,
+    regex: bool,
+    field: SearchField,
+    case_sensitive: bool,
+    exact: bool,
+) -> u32 {
+    if regex {
+        regex_relevance(record, needle, field, case_sensitive, exact)
+    } else if exact {
+        exact_relevance(record, needle, field, case_sensitive)
+    } else {
+        literal_relevance(record, needle, field, case_sensitive)
+    }
+}
+
+fn literal_relevance(
+    record: &PackageMeta,
+    needle: &str,
+    field: SearchField,
+    case_sensitive: bool,
+) -> u32 {
+    let mut score = 0;
+    match field {
+        SearchField::Attr => {
+            score += attr_literal_score(&record.attr, needle, case_sensitive);
+        }
+        SearchField::Description => {
+            if let Some(desc) = record.description.as_deref() {
+                score += desc_literal_score(desc, needle, case_sensitive);
+            }
+        }
+        SearchField::MainProgram => {
+            if let Some(main) = record.main_program.as_deref() {
+                score += main_literal_score(main, needle, case_sensitive);
+            }
+        }
+        SearchField::Both => {
+            score += attr_literal_score(&record.attr, needle, case_sensitive);
+            if let Some(desc) = record.description.as_deref() {
+                score += desc_literal_score(desc, needle, case_sensitive);
+            }
+            if let Some(main) = record.main_program.as_deref() {
+                score += main_literal_score(main, needle, case_sensitive);
+            }
+        }
+    }
+    score
+}
+
+fn attr_literal_score(value: &str, needle: &str, case_sensitive: bool) -> u32 {
+    if value_equals(value, needle, case_sensitive) {
+        3000
+    } else if value.starts_with(needle) || (!case_sensitive && value.to_lowercase().starts_with(needle)) {
+        2000
+    } else if value_contains(value, needle, case_sensitive) {
+        1000
+    } else {
+        0
+    }
+}
+
+fn desc_literal_score(value: &str, needle: &str, case_sensitive: bool) -> u32 {
+    if value_equals(value, needle, case_sensitive) {
+        300
+    } else if value.starts_with(needle) || (!case_sensitive && value.to_lowercase().starts_with(needle)) {
+        200
+    } else if value_contains(value, needle, case_sensitive) {
+        100
+    } else {
+        0
+    }
+}
+
+fn main_literal_score(value: &str, needle: &str, case_sensitive: bool) -> u32 {
+    if value_equals(value, needle, case_sensitive) {
+        300
+    } else if value.starts_with(needle) || (!case_sensitive && value.to_lowercase().starts_with(needle)) {
+        200
+    } else if value_contains(value, needle, case_sensitive) {
+        100
+    } else {
+        0
+    }
+}
+
+fn regex_relevance(
+    record: &PackageMeta,
+    pattern: &str,
+    field: SearchField,
+    case_sensitive: bool,
+    exact: bool,
+) -> u32 {
+    let mut score = 0;
+    match field {
+        SearchField::Attr => {
+            score += attr_regex_score(&record.attr, pattern, case_sensitive, exact);
+        }
+        SearchField::Description => {
+            if let Some(desc) = record.description.as_deref() {
+                score += desc_regex_score(desc, pattern, case_sensitive, exact);
+            }
+        }
+        SearchField::MainProgram => {
+            if let Some(main) = record.main_program.as_deref() {
+                score += main_regex_score(main, pattern, case_sensitive, exact);
+            }
+        }
+        SearchField::Both => {
+            score += attr_regex_score(&record.attr, pattern, case_sensitive, exact);
+            if let Some(desc) = record.description.as_deref() {
+                score += desc_regex_score(desc, pattern, case_sensitive, exact);
+            }
+            if let Some(main) = record.main_program.as_deref() {
+                score += main_regex_score(main, pattern, case_sensitive, exact);
+            }
+        }
+    }
+    score
+}
+
+fn attr_regex_score(value: &str, pattern: &str, case_sensitive: bool, exact: bool) -> u32 {
+    let anchored = if exact { format!("^(?:{pattern})$") } else { pattern.to_string() };
+    let re = RegexBuilder::new(&anchored)
+        .case_insensitive(!case_sensitive)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .dfa_size_limit(REGEX_SIZE_LIMIT)
+        .build()
+        .unwrap();
+    if let Some(m) = re.find(value) {
+        if m.start() == 0 && m.end() == value.len() {
+            3000
+        } else if m.start() == 0 {
+            2000
+        } else {
+            1000
+        }
+    } else {
+        0
+    }
+}
+
+fn desc_regex_score(value: &str, pattern: &str, case_sensitive: bool, exact: bool) -> u32 {
+    let anchored = if exact { format!("^(?:{pattern})$") } else { pattern.to_string() };
+    let re = RegexBuilder::new(&anchored)
+        .case_insensitive(!case_sensitive)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .dfa_size_limit(REGEX_SIZE_LIMIT)
+        .build()
+        .unwrap();
+    if let Some(m) = re.find(value) {
+        if m.start() == 0 && m.end() == value.len() {
+            300
+        } else if m.start() == 0 {
+            200
+        } else {
+            100
+        }
+    } else {
+        0
+    }
+}
+
+fn main_regex_score(value: &str, pattern: &str, case_sensitive: bool, exact: bool) -> u32 {
+    let anchored = if exact { format!("^(?:{pattern})$") } else { pattern.to_string() };
+    let re = RegexBuilder::new(&anchored)
+        .case_insensitive(!case_sensitive)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .dfa_size_limit(REGEX_SIZE_LIMIT)
+        .build()
+        .unwrap();
+    if let Some(m) = re.find(value) {
+        if m.start() == 0 && m.end() == value.len() {
+            300
+        } else if m.start() == 0 {
+            200
+        } else {
+            100
+        }
+    } else {
+        0
+    }
+}
+
+fn exact_relevance(
+    record: &PackageMeta,
+    pattern: &str,
+    field: SearchField,
+    case_sensitive: bool,
+) -> u32 {
+    let mut score = 0;
+    match field {
+        SearchField::Attr => {
+            if value_equals(&record.attr, pattern, case_sensitive) {
+                score += 3000;
+            }
+        }
+        SearchField::Description => {
+            if let Some(desc) = record.description.as_deref() {
+                if value_equals(desc, pattern, case_sensitive) {
+                    score += 300;
+                }
+            }
+        }
+        SearchField::MainProgram => {
+            if let Some(main) = record.main_program.as_deref() {
+                if value_equals(main, pattern, case_sensitive) {
+                    score += 300;
+                }
+            }
+        }
+        SearchField::Both => {
+            if value_equals(&record.attr, pattern, case_sensitive) {
+                score += 3000;
+            }
+            if let Some(desc) = record.description.as_deref() {
+                if value_equals(desc, pattern, case_sensitive) {
+                    score += 300;
+                }
+            }
+            if let Some(main) = record.main_program.as_deref() {
+                if value_equals(main, pattern, case_sensitive) {
+                    score += 300;
+                }
+            }
+        }
+    }
+    score
 }
 
 fn record_matches_regex(record: &PackageMeta, re: &regex::Regex, field: SearchField) -> bool {
@@ -554,6 +817,10 @@ mod tests {
             name: attr.to_string(),
             description: Some(description.to_string()),
             main_program: None,
+            license: None,
+            homepage: None,
+            maintainers: None,
+            platforms: None,
         }
     }
 
@@ -923,5 +1190,132 @@ mod tests {
             .map(|r| r.main_program.as_deref().unwrap_or(""))
             .collect();
         assert_eq!(mains, vec!["", "alpha", "beta"]);
+    }
+
+    #[test]
+    fn relevance_exact_attr_match_ranks_above_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("packages.json");
+        write_fixture(
+            &path,
+            &[
+                test_record("mise", "A version manager"),
+                test_record("mise-tool", "A tool for mise"),
+                test_record("other", "Something else"),
+            ],
+        );
+
+        let db = SearchDb::open(&path).expect("open");
+        let hits = db
+            .search("mise", false, SearchField::Attr, false, false, SearchSort::None, None)
+            .expect("search");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].attr, "mise");
+        assert_eq!(hits[1].attr, "mise-tool");
+    }
+
+    #[test]
+    fn relevance_prefix_attr_match_ranks_above_substring() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("packages.json");
+        write_fixture(
+            &path,
+            &[
+                test_record("mise", "A version manager"),
+                test_record("emise", "Another version manager"),
+                test_record("other", "Something else"),
+            ],
+        );
+
+        let db = SearchDb::open(&path).expect("open");
+        let hits = db
+            .search("mise", false, SearchField::Attr, false, false, SearchSort::None, None)
+            .expect("search");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].attr, "mise");
+        assert_eq!(hits[1].attr, "emise");
+    }
+
+    #[test]
+    fn relevance_attr_match_ranks_above_description_match() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("packages.json");
+        write_fixture(
+            &path,
+            &[
+                test_record("other", "A mise manager"),
+                test_record("mise", "Something else"),
+            ],
+        );
+
+        let db = SearchDb::open(&path).expect("open");
+        let hits = db
+            .search("mise", false, SearchField::Both, false, false, SearchSort::None, None)
+            .expect("search");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].attr, "mise");
+        assert_eq!(hits[1].attr, "other");
+    }
+
+    #[test]
+    fn relevance_description_match_ranks_above_main_program_match() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("packages.json");
+        let mut with_desc = test_record("other", "version manager");
+        with_desc.main_program = Some("vm".to_string());
+        let mut with_main = test_record("other2", "Something else");
+        with_main.main_program = Some("version-manager".to_string());
+        write_fixture(&path, &[with_desc, with_main]);
+
+        let db = SearchDb::open(&path).expect("open");
+        let hits = db
+            .search("version", false, SearchField::Both, false, false, SearchSort::None, None)
+            .expect("search");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].attr, "other");
+        assert_eq!(hits[1].attr, "other2");
+    }
+
+    #[test]
+    fn relevance_tie_break_by_attr_ascending() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("packages.json");
+        write_fixture(
+            &path,
+            &[
+                test_record("beta", "A version manager"),
+                test_record("alpha", "A version manager"),
+            ],
+        );
+
+        let db = SearchDb::open(&path).expect("open");
+        let hits = db
+            .search("version", false, SearchField::Description, false, false, SearchSort::None, None)
+            .expect("search");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].attr, "alpha");
+        assert_eq!(hits[1].attr, "beta");
+    }
+
+    #[test]
+    fn relevance_case_insensitive_scoring() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("packages.json");
+        write_fixture(
+            &path,
+            &[
+                test_record("Mise", "A version manager"),
+                test_record("mise-tool", "A tool for mise"),
+                test_record("other", "Something else"),
+            ],
+        );
+
+        let db = SearchDb::open(&path).expect("open");
+        let hits = db
+            .search("mise", false, SearchField::Attr, false, false, SearchSort::None, None)
+            .expect("search");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].attr, "Mise");
+        assert_eq!(hits[1].attr, "mise-tool");
     }
 }

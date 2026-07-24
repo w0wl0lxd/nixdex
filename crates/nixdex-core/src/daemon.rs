@@ -400,6 +400,9 @@ fn load_and_store_index(cache_dir: &std::path::Path, index_state: &IndexState) {
         }
     };
 
+    // Pre-fault mmap pages so the first query doesn't pay page-fault latency.
+    reader.prefault();
+
     let package_db = {
         let packages_json = index_dir.join("packages.json");
         if packages_json.exists() {
@@ -667,11 +670,12 @@ async fn nix_locate_handler(
         ));
     }
 
-    let (database_dir, resident_path, resident_basename) = match read_snapshot(&index_state) {
+    let (database_dir, resident_path, resident_basename, package_db) = match read_snapshot(&index_state) {
         Some(snapshot) => (
             snapshot.database_dir,
             Some(std::sync::Arc::clone(&snapshot.path_index)),
             Some(std::sync::Arc::clone(&snapshot.basename)),
+            snapshot.package_db,
         ),
         None => {
             return Err(json_error(
@@ -765,6 +769,7 @@ async fn nix_locate_handler(
             min_size: params.min_size,
             max_size: params.max_size,
             exclude_fhs: params.exclude_fhs,
+            null_output: params.null_output,
             literal_pattern: (!params.regex && !params.at_root && !params.whole_name && !params.pattern.is_empty()).then(|| params.pattern.clone()),
         };
 
@@ -820,6 +825,30 @@ async fn nix_locate_handler(
                 hash: Some(store_path.hash().to_string()),
                 path: Some(String::from_utf8_lossy(&entry.path).to_string()),
                 node: Some(node),
+                description: package_db
+                    .as_deref()
+                    .and_then(|db| db.lookup_attr(store_path.origin().attr.as_str()))
+                    .and_then(|m| m.description.clone()),
+                license: package_db
+                    .as_deref()
+                    .and_then(|db| db.lookup_attr(store_path.origin().attr.as_str()))
+                    .and_then(|m| m.license.clone()),
+                homepage: package_db
+                    .as_deref()
+                    .and_then(|db| db.lookup_attr(store_path.origin().attr.as_str()))
+                    .and_then(|m| m.homepage.clone()),
+                maintainers: package_db
+                    .as_deref()
+                    .and_then(|db| db.lookup_attr(store_path.origin().attr.as_str()))
+                    .and_then(|m| m.maintainers.clone()),
+                platforms: package_db
+                    .as_deref()
+                    .and_then(|db| db.lookup_attr(store_path.origin().attr.as_str()))
+                    .and_then(|m| m.platforms.clone()),
+                main_program: package_db
+                    .as_deref()
+                    .and_then(|db| db.lookup_attr(store_path.origin().attr.as_str()))
+                    .and_then(|m| m.main_program.clone()),
             }
         })
         .collect();
@@ -839,6 +868,12 @@ async fn nix_locate_handler(
                         hash: None,
                         path: None,
                         node: None,
+                        description: None,
+                        license: None,
+                        homepage: None,
+                        maintainers: None,
+                        platforms: None,
+                        main_program: None,
                     })
                 } else {
                     None
@@ -930,6 +965,8 @@ struct NixLocateParams {
     max_size: Option<u64>,
     #[serde(default)]
     exclude_fhs: bool,
+    #[serde(default)]
+    null_output: bool,
 }
 
 #[cfg(feature = "daemon")]
@@ -971,6 +1008,18 @@ struct NixLocateMatch {
     path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     node: Option<NixLocateNode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    license: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    homepage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    maintainers: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    platforms: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    main_program: Option<String>,
 }
 
 #[cfg(feature = "daemon")]
