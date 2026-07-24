@@ -1680,6 +1680,45 @@ fn extract_regex_literal_prefix(pattern: &str) -> Option<String> {
     }
 }
 
+/// Extract the longest literal suffix from a regex pattern.
+///
+/// Mirrors [`extract_regex_literal_prefix`] but walks the `Concat` children in
+/// reverse, accumulating from the tail. For `bin/.*test$` this returns `test`.
+fn extract_regex_literal_suffix(pattern: &str) -> Option<String> {
+    let ast = regex_syntax::ast::parse::Parser::new().parse(pattern).ok()?;
+    let suffix = literal_suffix_from_ast(&ast)?;
+    if suffix.len() >= 3 {
+        Some(suffix)
+    } else {
+        None
+    }
+}
+
+fn literal_suffix_from_ast(ast: &Ast) -> Option<String> {
+    match ast {
+        Ast::Literal(lit) => {
+            if matches!(lit.kind, LiteralKind::Verbatim | LiteralKind::Meta) {
+                Some(lit.c.to_string())
+            } else {
+                None
+            }
+        }
+        Ast::Concat(c) => {
+            let mut suffix = String::new();
+            for child in c.asts.iter().rev() {
+                match literal_suffix_from_ast(child) {
+                    Some(s) => suffix = format!("{s}{suffix}"),
+                    None => break,
+                }
+            }
+            Some(suffix)
+        }
+        Ast::Group(g) => literal_suffix_from_ast(&g.ast),
+        Ast::Assertion(_) => Some(String::new()),
+        _ => None,
+    }
+}
+
 fn literal_prefix_from_ast(ast: &Ast) -> Option<String> {
     match ast {
         Ast::Literal(lit) => {
@@ -2269,6 +2308,32 @@ fn ngram_sidecars_exist(dir: &Path) -> bool {
 /// Resolve the set of candidate package ordinals from the trigram (n-gram)
 /// inverted path index for a LITERAL (non-regex) substring pattern.
 ///
+/// Resolve candidate package ordinals from the n-gram inverted index, intersecting
+/// results from up to three literal patterns (e.g. a literal substring query, or
+/// both the prefix and suffix extracted from a regex AST).
+///
+/// Returns `None` when no pattern is available, all patterns are too short, the
+/// sidecars are absent, or they are unreadable — callers fall back to a full scan.
+fn resolve_ngram_ordinals_multi(
+    reader: &Reader,
+    literal: Option<&str>,
+    regex_prefix: Option<&str>,
+    regex_suffix: Option<&str>,
+) -> Option<RoaringBitmap> {
+    let mut result: Option<RoaringBitmap> = None;
+    for pat in literal.into_iter().chain(regex_prefix).chain(regex_suffix) {
+        if pat.len() < 3 {
+            continue;
+        }
+        let candidates = resolve_ngram_ordinals(reader, Some(pat))?;
+        result = Some(match result {
+            Some(bm) => bm & &candidates,
+            None => candidates,
+        });
+    }
+    result
+}
+
 /// Returns `None` when the pattern is not literal (too short / regex-like), the
 /// sidecars are absent, or they are unreadable — callers fall back to a full scan.
 #[allow(clippy::cognitive_complexity)]
@@ -2588,19 +2653,27 @@ pub fn search_results_with_reader(
     // Narrow the candidate set further with the trigram inverted index when the
     // query is a literal substring. An empty intersection means nothing matches.
     //
-    // For regex queries (`literal_pattern` is `None`) we still try to extract a
-    // fixed literal prefix from the regex AST (e.g. `bin/` from `bin/.*test$`)
-    // so the n-gram index can prune frames that cannot possibly match.
+    // For regex queries (`literal_pattern` is `None`) we still try to extract
+    // fixed literal prefix and suffix from the regex AST (e.g. `bin/` and `test`
+    // from `bin/.*test$`) so the n-gram index can prune frames that cannot
+    // possibly match. When both are available we intersect their candidate
+    // sets for a tighter filter.
     let regex_literal_prefix = options
         .literal_pattern
         .is_none()
         .then(|| extract_regex_literal_prefix(&options.pattern))
         .flatten();
-    let ngram_literal = options
+    let regex_literal_suffix = options
         .literal_pattern
-        .as_deref()
-        .or(regex_literal_prefix.as_deref());
-    let ngram_ordinals = resolve_ngram_ordinals(reader, ngram_literal);
+        .is_none()
+        .then(|| extract_regex_literal_suffix(&options.pattern))
+        .flatten();
+    let ngram_ordinals = resolve_ngram_ordinals_multi(
+        reader,
+        options.literal_pattern.as_deref(),
+        regex_literal_prefix.as_deref(),
+        regex_literal_suffix.as_deref(),
+    );
 
     let package_ordinals: Option<RoaringBitmap> = match (base_ordinals, ngram_ordinals) {
         (Some(b), Some(ng)) => Some(b & &ng),
@@ -2711,15 +2784,26 @@ pub fn search_results_with_reader(
     }
 
     // 3. Literal substring: path-level trigram + entry cache.
+    //    Also applies to regex queries whose AST yields a fixed literal prefix
+    //    or suffix (e.g. `bin/` and `test` from `bin/.*test$`): the path trigram
+    //    index narrows candidates and `should_include_match` applies the full
+    //    regex. We prefer the prefix because it is typically more selective for
+    //    path-trigram lookups (e.g. `bin/` is less common as a trigram window
+    //    than `test`).
     if !used_fast_path
-        && options.literal_pattern.is_some()
+        && (options.literal_pattern.is_some()
+            || regex_literal_prefix.is_some()
+            || regex_literal_suffix.is_some())
         && options.exact_basename.is_none()
         && options.exact_path.is_none()
         && options.path_prefix.is_none()
     {
         let pattern_str: &str = match options.literal_pattern.as_deref() {
             Some(s) => s,
-            None => &options.pattern,
+            None => regex_literal_prefix
+                .as_deref()
+                .or(regex_literal_suffix.as_deref())
+                .unwrap_or(&options.pattern),
         };
         match reader.search_path_trigram(
             pattern_str,
@@ -4278,6 +4362,33 @@ mod tests {
         assert_eq!(extract_regex_literal_prefix("ab.*"), None);
         // Pure wildcard has no prefix.
         assert_eq!(extract_regex_literal_prefix(".*"), None);
+    }
+
+    #[test]
+    fn extract_regex_literal_suffix_extracts_trailing_literals() {
+        // Suffix from a regex with a leading repetition.
+        assert_eq!(
+            extract_regex_literal_suffix("bin/.*test$"),
+            Some("test".to_string())
+        );
+        // Anchored pattern: `$` is a zero-width assertion, skipped.
+        assert_eq!(
+            extract_regex_literal_suffix("^bin/ls$"),
+            Some("bin/ls".to_string())
+        );
+        // Escaped meta-characters are still literals.
+        assert_eq!(
+            extract_regex_literal_suffix(r"bin/.*\.config"),
+            Some(".config".to_string())
+        );
+        // Alternation has no common suffix.
+        assert_eq!(extract_regex_literal_suffix("(firefox|thunderbird)"), None);
+        // Repetition at the end means no fixed suffix.
+        assert_eq!(extract_regex_literal_suffix("bin/.*"), None);
+        // Short suffix (< 3 bytes) returns None.
+        assert_eq!(extract_regex_literal_suffix("bin/.*ab"), None);
+        // Pure wildcard has no suffix.
+        assert_eq!(extract_regex_literal_suffix(".*"), None);
     }
 
     #[test]
