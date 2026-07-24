@@ -55,6 +55,11 @@
             pkgs.clang
             pkgs.mold
             pkgs.pkg-config
+            # aws-lc-sys (transitive via rustls/reqwest) builds BoringSSL,
+            # which requires cmake, go, and perl.
+            pkgs.cmake
+            pkgs.go
+            pkgs.perl
           ];
 
           # The workspace `.cargo/config.toml` enables `sccache`, which is not
