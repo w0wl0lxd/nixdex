@@ -2803,7 +2803,7 @@ pub fn search_results_with_reader(
             None => regex_literal_prefix
                 .as_deref()
                 .or(regex_literal_suffix.as_deref())
-                .unwrap_or(&options.pattern),
+                .map_or(&options.pattern, |p| p),
         };
         match reader.search_path_trigram(
             pattern_str,
