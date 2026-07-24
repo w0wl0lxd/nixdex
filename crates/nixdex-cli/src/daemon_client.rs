@@ -223,7 +223,13 @@ pub(crate) fn render(
     json: bool,
     minimal: bool,
     null_output: bool,
+    quiet: bool,
+    details: bool,
 ) -> Vec<String> {
+    if quiet {
+        return Vec::new();
+    }
+
     if let Some(count) = response.count {
         return vec![count.to_string()];
     }
@@ -243,27 +249,29 @@ pub(crate) fn render(
                     "path": m.path.clone().unwrap_or_else(String::new),
                     "store_path": store_path_string(m),
                 });
-                if let Some(ref desc) = m.description {
-                    obj.insert("description", sonic_rs::Value::copy_str(desc));
-                }
-                if let Some(ref lic) = m.license {
-                    obj.insert("license", sonic_rs::Value::copy_str(lic));
-                }
-                if let Some(ref hp) = m.homepage {
-                    obj.insert("homepage", sonic_rs::Value::copy_str(hp));
-                }
-                if let Some(ref maint) = m.maintainers {
-                    if let Ok(val) = sonic_rs::to_value(maint) {
-                        obj.insert("maintainers", val);
+                if details {
+                    if let Some(ref desc) = m.description {
+                        obj.insert("description", sonic_rs::Value::copy_str(desc));
                     }
-                }
-                if let Some(ref plats) = m.platforms {
-                    if let Ok(val) = sonic_rs::to_value(plats) {
-                        obj.insert("platforms", val);
+                    if let Some(ref lic) = m.license {
+                        obj.insert("license", sonic_rs::Value::copy_str(lic));
                     }
-                }
-                if let Some(ref mp) = m.main_program {
-                    obj.insert("main_program", sonic_rs::Value::copy_str(mp));
+                    if let Some(ref hp) = m.homepage {
+                        obj.insert("homepage", sonic_rs::Value::copy_str(hp));
+                    }
+                    if let Some(ref maint) = m.maintainers {
+                        if let Ok(val) = sonic_rs::to_value(maint) {
+                            obj.insert("maintainers", val);
+                        }
+                    }
+                    if let Some(ref plats) = m.platforms {
+                        if let Ok(val) = sonic_rs::to_value(plats) {
+                            obj.insert("platforms", val);
+                        }
+                    }
+                    if let Some(ref mp) = m.main_program {
+                        obj.insert("main_program", sonic_rs::Value::copy_str(mp));
+                    }
                 }
                 let line = sonic_rs::to_string(&obj).unwrap_or_else(|_| String::new());
                 format!("{line}{delim}")
@@ -284,10 +292,28 @@ pub(crate) fn render(
                 let size_str = format_grouped(size);
                 let sp = store_path_string(m);
                 let path = m.path.clone().unwrap_or_else(String::new);
-                format!(
+                let mut line = format!(
                     "{:<40} {:>14} {:>1} {}{}{delim}",
                     m.attr, size_str, kind, sp, path
-                )
+                );
+                if details {
+                    if let Some(ref desc) = m.description {
+                        line.push_str(&format!(" desc={desc}"));
+                    }
+                    if let Some(ref lic) = m.license {
+                        line.push_str(&format!(" license={lic}"));
+                    }
+                    if let Some(ref hp) = m.homepage {
+                        line.push_str(&format!(" homepage={hp}"));
+                    }
+                    if let Some(ref maint) = m.maintainers {
+                        line.push_str(&format!(" maintainers={maint:?}"));
+                    }
+                    if let Some(ref mp) = m.main_program {
+                        line.push_str(&format!(" main_program={mp}"));
+                    }
+                }
+                line
             })
             .collect()
     }

@@ -106,7 +106,7 @@
                 $out/bin/nixdex generate-completions bash $out/share/bash-completion/completions
                 $out/bin/nixdex generate-completions zsh $out/share/zsh/site-functions
                 $out/bin/nixdex generate-completions fish $out/share/fish/vendor_completions.d
-                for cmd in nixdex nix-index nix-locate; do
+                for cmd in nixdex nix-index nix-locate nixdex-history nixdex-options; do
                   mv -f "$out/share/bash-completion/completions/$cmd.bash" "$out/share/bash-completion/completions/$cmd"
                 done
               fi

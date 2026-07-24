@@ -10,10 +10,12 @@
 //! Optional secondary index (nixdex): basename FST sidecars next to `files`
 //! (see [`crate::basename_index`]).
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io;
 use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use byteorder::{LittleEndian, WriteBytesExt};
 use grep::matcher::{LineMatchKind, Matcher, NoError};
@@ -87,6 +89,47 @@ const MAX_FRAME_COUNT: usize = 1024 * 1024;
 
 /// Defensive cap on the on-disk database file size.
 const MAX_DATABASE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Maximum number of entries in the ngram result cache.
+const NGRAM_CACHE_CAPACITY: usize = 256;
+
+/// A bounded LRU cache for ngram candidate bitmaps.
+///
+/// Uses a `HashMap` for O(1) lookups and a `Vec` to track insertion order
+/// for eviction. When the cache exceeds its capacity, the oldest entry is
+/// removed.
+#[derive(Debug)]
+struct NgramCache {
+    map: HashMap<String, Arc<RoaringBitmap>>,
+    order: Vec<String>,
+}
+
+impl NgramCache {
+    fn new() -> Self {
+        Self {
+            map: HashMap::with_capacity(NGRAM_CACHE_CAPACITY),
+            order: Vec::with_capacity(NGRAM_CACHE_CAPACITY),
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<Arc<RoaringBitmap>> {
+        self.map.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: String, value: Arc<RoaringBitmap>) {
+        if self.map.contains_key(&key) {
+            self.map.insert(key, value);
+            return;
+        }
+        if self.map.len() >= NGRAM_CACHE_CAPACITY {
+            if let Some(oldest) = self.order.pop() {
+                self.map.remove(&oldest);
+            }
+        }
+        self.order.insert(0, key.clone());
+        self.map.insert(key, value);
+    }
+}
 
 /// Errors that can occur when reading or writing a database.
 #[derive(Error, Debug)]
@@ -672,6 +715,10 @@ pub struct Reader {
     /// a single large zstd frame; caching the decoded bytes lets repeated
     /// searches (in particular the daemon) avoid decompressing it every query.
     v1_decompressed: once_cell::sync::OnceCell<Vec<u8>>,
+    /// Bounded LRU cache for ngram candidate bitmaps. Keyed by pattern string,
+    /// shared across queries in daemon mode. Invalidated when the database is
+    /// reloaded (a new `Reader` is created).
+    ngram_cache: once_cell::sync::OnceCell<Mutex<NgramCache>>,
 }
 
 impl Reader {
@@ -785,6 +832,7 @@ impl Reader {
             basename: once_cell::sync::OnceCell::new(),
             path_index: once_cell::sync::OnceCell::new(),
             v1_decompressed: once_cell::sync::OnceCell::new(),
+            ngram_cache: once_cell::sync::OnceCell::new(),
         })
     }
 
@@ -803,6 +851,14 @@ impl Reader {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Return a reference to the ngram result cache, initializing it on
+    /// first access. The cache is per-Reader and is invalidated when the
+    /// database is reloaded (a new `Reader` is created).
+    fn ngram_cache(&self) -> &Mutex<NgramCache> {
+        self.ngram_cache
+            .get_or_init(|| Mutex::new(NgramCache::new()))
     }
 
     /// Return the on-disk format version of the opened database.
@@ -2261,6 +2317,8 @@ pub enum SearchSort {
     SizeDesc,
     /// Sort by attribute path ascending.
     AttrAsc,
+    /// Reverse the current sort order.
+    Reverse,
 }
 
 impl std::str::FromStr for SearchSort {
@@ -2272,6 +2330,7 @@ impl std::str::FromStr for SearchSort {
             "size" | "size-asc" => Ok(Self::SizeAsc),
             "size-desc" => Ok(Self::SizeDesc),
             "attr" | "attr-asc" => Ok(Self::AttrAsc),
+            "reverse" | "rev" => Ok(Self::Reverse),
             _ => Err(crate::Error::Parse(format!("unknown sort order: {s}"))),
         }
     }
@@ -2319,6 +2378,10 @@ pub struct SearchOptions<'a> {
     pub exclude_fhs: bool,
     /// Emit null bytes between results instead of newlines.
     pub null_output: bool,
+    /// Suppress all non-error output.
+    pub quiet: bool,
+    /// Show expanded metadata (description, license, homepage, maintainers).
+    pub details: bool,
 }
 
 /// Pre-loaded secondary indexes that a long-running holder (e.g. the daemon)
@@ -2444,6 +2507,18 @@ fn resolve_ngram_ordinals_multi(
     regex_prefix: Option<&str>,
     regex_suffix: Option<&str>,
 ) -> Option<RoaringBitmap> {
+    let cache_key = format!(
+        "{}\0{}\0{}",
+        literal.unwrap_or(""),
+        regex_prefix.unwrap_or(""),
+        regex_suffix.unwrap_or("")
+    );
+
+    let cache = reader.ngram_cache();
+    if let Some(cached) = cache.lock().unwrap().get(&cache_key) {
+        return Some((*cached).clone());
+    }
+
     let mut result: Option<RoaringBitmap> = None;
     for pat in literal.into_iter().chain(regex_prefix).chain(regex_suffix) {
         if pat.len() < 3 {
@@ -2458,6 +2533,11 @@ fn resolve_ngram_ordinals_multi(
             None => candidates,
         });
     }
+
+    if let Some(ref bm) = result {
+        cache.lock().unwrap().insert(cache_key, Arc::new(bm.clone()));
+    }
+
     result
 }
 
@@ -2674,6 +2754,9 @@ fn print_match_text(
     entry: &FileTreeEntry,
     attr: &str,
 ) -> bool {
+    if options.quiet {
+        return false;
+    }
     let delim = if options.null_output { "\0" } else { "\n" };
     match options.mode {
         SearchMode::Minimal => {
@@ -2696,14 +2779,12 @@ fn print_match_text(
 
             let path_str = String::from_utf8_lossy(&entry.path);
             if color {
-                // Highlight all non-empty matches in the path.
                 let mut prev = 0usize;
                 let bytes = path_str.as_bytes();
                 for mat in path_pattern.find_iter(bytes) {
                     if mat.start() == mat.end() {
                         continue;
                     }
-                    // Safe because we only slice on byte offsets from the same str.
                     if let (Some(before), Some(matched)) = (
                         path_str.get(prev..mat.start()),
                         path_str.get(mat.start()..mat.end()),
@@ -2832,6 +2913,13 @@ pub fn search_results_with_reader(
         regex_literal_suffix.as_deref(),
     );
 
+    // Selectivity estimation: count ngram candidates to guide fast-path
+    // ordering. The path trigram fast path is most selective when candidates
+    // are below the limit.
+    let ngram_candidate_count = ngram_ordinals
+        .as_ref()
+        .map_or(0, |bm| bm.len() as usize);
+
     let package_ordinals: Option<RoaringBitmap> = match (base_ordinals, ngram_ordinals) {
         (Some(b), Some(ng)) => Some(b & &ng),
         (Some(b), None) => Some(b),
@@ -2852,12 +2940,24 @@ pub fn search_results_with_reader(
         return Ok(Vec::new());
     }
 
-    // Try the fast path sidecars in order of specificity:
-    // 1. exact full path, 2. exact basename, 3. literal substring.
+    // Try the fast path sidecars in order of estimated selectivity.
+    // We check the ngram candidate count first to determine the most
+    // selective path, then try fast paths from most to least selective.
     let mut results = Vec::new();
     let mut used_fast_path = false;
 
+    tracing::debug!(
+        ngram_candidate_count,
+        exact_path = options.exact_path.is_some(),
+        exact_basename = options.exact_basename.is_some(),
+        literal_pattern = options.literal_pattern.is_some(),
+        regex_prefix = regex_literal_prefix.is_some(),
+        regex_suffix = regex_literal_suffix.is_some(),
+        "search plan: selectivity estimation"
+    );
+
     // 1. Exact full path: prefer the per-path entry cache, then redb.
+    //    Most selective for exact path queries.
     if let Some(exact_path) = &options.exact_path {
         let bytes = exact_path.as_bytes();
         if let Some(path_entry) = reader.path_entry() {
@@ -2884,6 +2984,7 @@ pub fn search_results_with_reader(
             }
             results = hits;
             used_fast_path = true;
+            tracing::debug!(hits = results.len(), "search plan: exact path fast path");
         } else if let Some(redb) = reader.redb.get() {
             let mut hits = Vec::new();
             match redb.exact_path_entries(bytes) {
@@ -2903,6 +3004,7 @@ pub fn search_results_with_reader(
                     }
                     results = hits;
                     used_fast_path = true;
+                    tracing::debug!(hits = results.len(), "search plan: exact path (redb) fast path");
                 }
                 Ok(None) => {}
                 Err(err) => {
@@ -2913,6 +3015,7 @@ pub fn search_results_with_reader(
     }
 
     // 2. Exact basename (whole_name without --root, or basename portion only).
+    //    Most selective for basename-only queries.
     if !used_fast_path
         && options.exact_basename.is_some()
         && options.exact_path.is_none()
@@ -2932,6 +3035,7 @@ pub fn search_results_with_reader(
             Ok(Some(entry_results)) => {
                 results = entry_results;
                 used_fast_path = true;
+                tracing::debug!(hits = results.len(), "search plan: exact basename fast path");
             }
             Ok(None) => {}
             Err(err) => {
@@ -2940,14 +3044,12 @@ pub fn search_results_with_reader(
         }
     }
 
-    // 3. Literal substring: path-level trigram + entry cache.
-    //    Also applies to regex queries whose AST yields a fixed literal prefix
-    //    and/or suffix (e.g. `bin/` and `test` from `bin/.*test$`): the path trigram
-    //    index narrows candidates and `should_include_match` applies the full
-    //    regex. When both prefix and suffix are available, both are passed to
-    //    `search_path_trigram` so it can intersect their candidate sets before the
-    //    candidate-limit check, avoiding fallback to a full scan.
+    // 3. Literal substring / regex with trigram candidates: path trigram
+    //    + entry cache. Most selective for substring and regex queries
+    //    when ngram candidates are below the limit.
     if !used_fast_path
+        && ngram_candidate_count > 0
+        && ngram_candidate_count <= Reader::PATH_TRIGRAM_CANDIDATE_LIMIT as usize
         && (options.literal_pattern.is_some()
             || regex_literal_prefix.is_some()
             || regex_literal_suffix.is_some())
@@ -2980,8 +3082,11 @@ pub fn search_results_with_reader(
             Ok(Some(path_results)) => {
                 results = path_results;
                 used_fast_path = true;
+                tracing::debug!(hits = results.len(), "search plan: path trigram fast path");
             }
-            Ok(None) => {}
+            Ok(None) => {
+                tracing::debug!(ngram_candidate_count, "search plan: path trigram fell back to scan");
+            }
             Err(err) => {
                 tracing::debug!(%err, "path trigram search failed; falling back");
             }
@@ -3014,6 +3119,9 @@ pub fn search_results_with_reader(
         }
         SearchSort::AttrAsc => {
             results.sort_by(|(a, _), (b, _)| a.origin().attr.cmp(&b.origin().attr));
+        }
+        SearchSort::Reverse => {
+            results.reverse();
         }
     }
 
@@ -3066,6 +3174,10 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
             continue;
         }
 
+        if options.quiet {
+            continue;
+        }
+
         if options.limit.is_some_and(|limit| printed >= limit) {
             break;
         }
@@ -3082,7 +3194,7 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
         }
     }
 
-    if options.count {
+    if options.count && !options.quiet {
         println!("{matched}");
     }
 
@@ -3114,8 +3226,12 @@ pub fn search_batch(options: &SearchOptions<'_>, patterns: &[String]) -> crate::
 
         let results = search_results_with_reader(&reader, &index_file, &batch_options, None)?;
 
-        if batch_options.count {
+        if batch_options.count && !batch_options.quiet {
             println!("{}", results.len());
+            continue;
+        }
+
+        if batch_options.quiet {
             continue;
         }
 
