@@ -16,7 +16,7 @@ fn mode_name(mode: SearchMode) -> &'static str {
 
 fn theme_colors(theme: Theme) -> ThemeColors {
     match theme {
-        Theme::TokyoNight => ThemeColors {
+        Theme::TokyoNight | Theme::Nord => ThemeColors {
             bg: Color::Rgb(30, 30, 46),
             fg: Color::Rgb(220, 220, 220),
             header_bg: Color::Rgb(40, 40, 60),
@@ -60,28 +60,6 @@ fn theme_colors(theme: Theme) -> ThemeColors {
             spinner_fg: Color::Rgb(245, 224, 220),
             pinned_fg: Color::Rgb(245, 224, 220),
         },
-        Theme::Nord => ThemeColors {
-            bg: Color::Rgb(30, 30, 46),
-            fg: Color::Rgb(220, 220, 220),
-            header_bg: Color::Rgb(40, 40, 60),
-            header_fg: Color::Rgb(220, 220, 220),
-            mode_fg: Color::Rgb(136, 192, 208),
-            selected_bg: Color::Rgb(50, 50, 70),
-            selected_fg: Color::Rgb(240, 240, 240),
-            selected_modifier: Modifier::BOLD,
-            attr_fg: Color::Rgb(163, 216, 163),
-            desc_fg: Color::Rgb(150, 150, 170),
-            status_fg: Color::Rgb(120, 120, 140),
-            accent_fg: Color::Rgb(136, 192, 208),
-            detail_label_fg: Color::Rgb(136, 192, 208),
-            detail_value_fg: Color::Rgb(220, 220, 220),
-            overlay_bg: Color::Rgb(20, 20, 36),
-            overlay_border: Color::Rgb(80, 80, 120),
-            toast_bg: Color::Rgb(50, 50, 70),
-            toast_fg: Color::Rgb(220, 220, 220),
-            spinner_fg: Color::Rgb(240, 240, 240),
-            pinned_fg: Color::Rgb(240, 240, 240),
-        },
         Theme::Dracula => ThemeColors {
             bg: Color::Rgb(40, 40, 50),
             fg: Color::Rgb(220, 220, 220),
@@ -110,19 +88,25 @@ fn theme_colors(theme: Theme) -> ThemeColors {
 struct ThemeColors {
     bg: Color,
     fg: Color,
+    #[allow(dead_code)]
     header_bg: Color,
+    #[allow(dead_code)]
     header_fg: Color,
     mode_fg: Color,
     selected_bg: Color,
     selected_fg: Color,
     selected_modifier: Modifier,
     attr_fg: Color,
+    #[allow(dead_code)]
     desc_fg: Color,
     status_fg: Color,
+    #[allow(dead_code)]
     accent_fg: Color,
     detail_label_fg: Color,
     detail_value_fg: Color,
+    #[allow(dead_code)]
     overlay_bg: Color,
+    #[allow(dead_code)]
     overlay_border: Color,
     toast_bg: Color,
     toast_fg: Color,
@@ -143,10 +127,14 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
 
     let tc = theme_colors(app.theme);
 
-    render_header(frame, chunks[0], app, &tc);
-    render_body(frame, chunks[1], app, &tc);
-    render_footer(frame, chunks[2], app, &tc);
+    render_header(frame, chunks.first().copied().unwrap_or_else(ratatui::layout::Rect::default), app, &tc);
+    render_body(frame, chunks.get(1).copied().unwrap_or_else(ratatui::layout::Rect::default), app, &tc);
+    render_footer(frame, chunks.get(2).copied().unwrap_or_else(ratatui::layout::Rect::default), app, &tc);
     render_toasts(frame, app, &tc);
+
+    if app.show_help {
+        render_help_overlay(frame, size, &tc);
+    }
 }
 
 fn render_header(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App, tc: &ThemeColors) {
@@ -251,120 +239,58 @@ fn render_results(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App,
     frame.render_stateful_widget(list, area, &mut list_state);
 }
 
+fn detail_label_style(tc: &ThemeColors) -> Style {
+    Style::default()
+        .fg(tc.detail_label_fg)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn detail_line(label: &'static str, value: String, tc: &ThemeColors) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(label, detail_label_style(tc)),
+        Span::raw(format!("  {}", value)),
+    ])
+}
+
 fn render_detail(
     frame: &mut Frame<'_>,
     area: ratatui::layout::Rect,
     detail: &DetailView,
     tc: &ThemeColors,
 ) {
-    let lines = {
-        let mut lines = Vec::new();
+    let mut lines = Vec::new();
+    lines.push(detail_line("Attribute:", detail.attr.clone(), tc));
+    lines.push(detail_line("Name:", detail.name.clone(), tc));
+    lines.push(detail_line("Description:", detail.description.clone(), tc));
+    if let Some(path) = &detail.path {
+        lines.push(detail_line("Path:", path.clone(), tc));
+    }
+    if let Some(size) = detail.size {
+        lines.push(detail_line("Size:", format!("{} bytes", size), tc));
+    }
+    if let Some(license) = &detail.license {
+        lines.push(detail_line("License:", license.clone(), tc));
+    }
+    if let Some(homepage) = &detail.homepage {
+        lines.push(detail_line("Homepage:", homepage.clone(), tc));
+    }
+    if !detail.maintainers.is_empty() {
+        lines.push(detail_line("Maintainers:", detail.maintainers.join(", "), tc));
+    }
+    if let Some(main_program) = &detail.main_program {
+        lines.push(detail_line("Main program:", main_program.clone(), tc));
+    }
+    if detail.pinned {
         lines.push(Line::from(vec![
             Span::styled(
-                "Attribute:",
+                "PINNED",
                 Style::default()
-                    .fg(tc.detail_label_fg)
+                    .fg(tc.pinned_fg)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(format!("  {}", detail.attr)),
+            Span::raw("  (press Space to unpin)"),
         ]));
-        lines.push(Line::from(vec![
-            Span::styled(
-                "Name:",
-                Style::default()
-                    .fg(tc.detail_label_fg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!("  {}", detail.name)),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled(
-                "Description:",
-                Style::default()
-                    .fg(tc.detail_label_fg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!("  {}", detail.description)),
-        ]));
-        if let Some(path) = &detail.path {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    "Path:",
-                    Style::default()
-                        .fg(tc.detail_label_fg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!("  {}", path)),
-            ]));
-        }
-        if let Some(size) = detail.size {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    "Size:",
-                    Style::default()
-                        .fg(tc.detail_label_fg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!("  {} bytes", size)),
-            ]));
-        }
-        if let Some(license) = &detail.license {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    "License:",
-                    Style::default()
-                        .fg(tc.detail_label_fg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!("  {}", license)),
-            ]));
-        }
-        if let Some(homepage) = &detail.homepage {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    "Homepage:",
-                    Style::default()
-                        .fg(tc.detail_label_fg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!("  {}", homepage)),
-            ]));
-        }
-        if !detail.maintainers.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    "Maintainers:",
-                    Style::default()
-                        .fg(tc.detail_label_fg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!("  {}", detail.maintainers.join(", "))),
-            ]));
-        }
-        if let Some(main_program) = &detail.main_program {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    "Main program:",
-                    Style::default()
-                        .fg(tc.detail_label_fg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!("  {}", main_program)),
-            ]));
-        }
-        if detail.pinned {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    "PINNED",
-                    Style::default()
-                        .fg(tc.pinned_fg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  (press Space to unpin)"),
-            ]));
-        }
-        lines
-    };
+    }
 
     let text = Text::from(lines);
     let paragraph = Paragraph::new(text)
@@ -403,7 +329,9 @@ fn render_toasts(frame: &mut Frame<'_>, app: &App, tc: &ThemeColors) {
         1,
     );
 
-    let latest = &app.toasts[app.toasts.len() - 1];
+    let Some(latest) = app.toasts.last() else {
+        return;
+    };
     let paragraph = Paragraph::new(latest.message.as_str())
         .block(Block::default().borders(Borders::ALL))
         .style(Style::default().fg(tc.toast_fg).bg(tc.toast_bg));

@@ -10,7 +10,6 @@ use std::io::prelude::*;
 use std::path::{Path, PathBuf};
 
 use byteorder::{LittleEndian, WriteBytesExt};
-use mmap_guard;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -296,8 +295,7 @@ impl OptionsBuilder {
 
         // Validate size against defensive cap.
         let metadata = std::fs::metadata(&path)?;
-        let max_bytes = usize::try_from(MAX_OPTIONS_BYTES)
-            .map_err(|_| Error::Corrupt("size conversion overflow".into()))?;
+        let max_bytes = MAX_OPTIONS_BYTES;
         let max_bytes_u64 = u64::try_from(max_bytes)
             .map_err(|_| Error::Corrupt("size conversion overflow".into()))?;
         if metadata.len() > max_bytes_u64 {

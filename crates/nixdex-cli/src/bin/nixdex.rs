@@ -9,7 +9,6 @@ use std::sync::OnceLock;
 use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate, generate_to};
 use color_eyre::eyre::WrapErr;
-use tracing;
 use tracing_subscriber::EnvFilter;
 
 use nixdex_cli::{index, locate, tui};
@@ -126,8 +125,11 @@ enum Cmd {
 #[command(author, about, version)]
 struct SearchOpts {
     /// Pattern for which to search.
-    #[arg(value_name = "PATTERN")]
-    pattern: String,
+    ///
+    /// Multiple arguments are joined with spaces, so `nixdex search claude code`
+    /// is equivalent to `nixdex search "claude code"`.
+    #[arg(value_name = "PATTERN", num_args = 1..)]
+    pattern: Vec<String>,
 
     /// Directory where the index is stored.
     #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
@@ -214,6 +216,8 @@ enum OutputFormat {
     Ndjson,
     /// CSV format.
     Csv,
+    /// YAML format.
+    Yaml,
 }
 
 /// Show metadata for a single package attribute.
@@ -255,8 +259,11 @@ struct HistoryOpts {
 #[command(author, about, version)]
 struct OptionsOpts {
     /// Search pattern.
-    #[arg(value_name = "PATTERN")]
-    pattern: String,
+    ///
+    /// Multiple arguments are joined with spaces, so `nixdex options claude code`
+    /// is equivalent to `nixdex options "claude code"`.
+    #[arg(value_name = "PATTERN", num_args = 1..)]
+    pattern: Vec<String>,
 
     /// Directory where the index is stored.
     #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
@@ -521,9 +528,11 @@ fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
 
     let exclude_pattern = opts.exclude.as_deref().or(opts.exclude_regex.as_deref());
 
+    let pattern = opts.pattern.join(" ");
+
     let matches = if opts.fuzzy {
         db.search_fuzzy(
-            &opts.pattern,
+            &pattern,
             opts.field,
             opts.case_sensitive,
             sort,
@@ -531,7 +540,7 @@ fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
         )
     } else {
         db.search(
-            &opts.pattern,
+            &pattern,
             opts.regex,
             opts.field,
             opts.case_sensitive,
@@ -564,14 +573,20 @@ fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
         opts.color.use_color()
     };
 
+    output_search_results(&matches, &opts, use_color)
+}
+
+fn output_search_results(
+    matches: &[&nixdex_core::nixpkgs::PackageMeta],
+    opts: &SearchOpts,
+    use_color: bool,
+) -> color_eyre::Result<()> {
     match opts.format {
         OutputFormat::Ndjson => {
             for record in matches {
-                let line =
-                    sonic_rs::to_string(record).wrap_err("failed to serialize search result")?;
+                let line = sonic_rs::to_string(record).wrap_err("failed to serialize search result")?;
                 println!("{line}");
             }
-            return Ok(());
         }
         OutputFormat::Csv => {
             println!("attr,name,description,main_program");
@@ -580,40 +595,43 @@ fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
                 let main = record.main_program.as_deref().map_or("", |m| m);
                 println!("{},{},{},{}", record.attr, record.name, desc, main);
             }
-            return Ok(());
         }
-        OutputFormat::Table => {}
+        OutputFormat::Yaml => {
+            for record in matches {
+                let yaml = serde_yaml::to_string(record).wrap_err("failed to serialize search result as YAML")?;
+                println!("{yaml}");
+            }
+        }
+        OutputFormat::Table => {
+            if opts.json {
+                for record in matches {
+                    let line = sonic_rs::to_string(record).wrap_err("failed to serialize search result")?;
+                    println!("{line}");
+                }
+                return Ok(());
+            }
+            for record in matches {
+                let desc = record.description.as_deref().map_or("—", |d| d);
+                if opts.name_only {
+                    println!("{}", record.attr);
+                } else if use_color {
+                    println!(
+                        "{}\t{}\t{}",
+                        colored(record.attr.as_str(), "1;32"),
+                        colored(record.name.as_str(), "1"),
+                        desc
+                    );
+                } else {
+                    println!("{}\t{}\t{}", record.attr, record.name, desc);
+                }
+                if opts.stream {
+                    std::io::stdout()
+                        .flush()
+                        .wrap_err("failed to flush stdout")?;
+                }
+            }
+        }
     }
-
-    if opts.json {
-        for record in matches {
-            let line = sonic_rs::to_string(record).wrap_err("failed to serialize search result")?;
-            println!("{line}");
-        }
-        return Ok(());
-    }
-
-    for record in matches {
-        let desc = record.description.as_deref().map_or("—", |d| d);
-        if opts.name_only {
-            println!("{}", record.attr);
-        } else if use_color {
-            println!(
-                "{}\t{}\t{}",
-                colored(record.attr.as_str(), "1;32"),
-                colored(record.name.as_str(), "1"),
-                desc
-            );
-        } else {
-            println!("{}\t{}\t{}", record.attr, record.name, desc);
-        }
-        if opts.stream {
-            std::io::stdout()
-                .flush()
-                .wrap_err("failed to flush stdout")?;
-        }
-    }
-
     Ok(())
 }
 
@@ -701,7 +719,8 @@ fn run_options(opts: OptionsOpts) -> color_eyre::Result<()> {
     }
 
     let db = OptionsDb::open(&opts.database).wrap_err("failed to load options sidecar")?;
-    let mut results = db.search(&opts.pattern, opts.case_sensitive);
+    let pattern = opts.pattern.join(" ");
+    let mut results = db.search(&pattern, opts.case_sensitive);
 
     if let Some(limit) = opts.limit {
         results.truncate(limit);
@@ -872,17 +891,30 @@ async fn run_update(opts: UpdateOpts) -> color_eyre::Result<()> {
         .await
         .wrap_err("failed to download prebuilt index")?;
 
-    // Download version history and options sidecars alongside the prebuilt index.
-    let dest_dir = opts.database.clone();
-    if let Err(err) = download_history_sidecar(&config, &dest_dir).await {
-        tracing::warn!(error = %err, "failed to download history sidecar");
-    }
-    if let Err(err) = download_options_sidecar(&config, &dest_dir).await {
-        tracing::warn!(error = %err, "failed to download options sidecar");
-    }
+    download_sidecars(&config, &opts.database).await;
 
     println!("updated index at {}", opts.database.display());
     Ok(())
+}
+
+async fn download_sidecars(
+    config: &nixdex_core::prebuilt::PrebuiltConfig,
+    dest_dir: &std::path::Path,
+) {
+    log_sidecar_result(
+        download_history_sidecar(config, dest_dir).await,
+        "history",
+    );
+    log_sidecar_result(
+        download_options_sidecar(config, dest_dir).await,
+        "options",
+    );
+}
+
+fn log_sidecar_result(result: color_eyre::Result<()>, name: &str) {
+    if let Err(err) = result {
+        tracing::warn!(error = %err, "failed to download {} sidecar", name);
+    }
 }
 
 async fn download_history_sidecar(
@@ -1498,7 +1530,7 @@ struct Opts {
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
-    color_eyre::install()?;
+    let _ = color_eyre::install();
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
@@ -1527,7 +1559,8 @@ async fn main() -> color_eyre::Result<()> {
         Cmd::SidecarDiff(opts) => run_sidecar_diff(opts),
         Cmd::CommandNotFound(opts) => run_command_not_found(opts),
         Cmd::Tui(tui_opts) => {
-            return tui::run_tui(tui_opts.database).await;
+            tui::run_tui(tui_opts.database).await?;
+            Ok(())
         }
         Cmd::Daemon(daemon_opts) => run_daemon(daemon_opts).await,
     }
