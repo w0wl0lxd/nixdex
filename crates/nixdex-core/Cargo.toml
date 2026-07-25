@@ -21,12 +21,13 @@ tokio = { workspace = true }
 reqwest = { workspace = true }
 rayon = { workspace = true }
 sonic-rs = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
 fst = { workspace = true }
 roaring = { workspace = true }
 zstd = { workspace = true }
 memchr = { workspace = true }
 thiserror = { workspace = true }
-serde = { workspace = true }
 postcard = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }

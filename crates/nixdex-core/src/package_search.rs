@@ -427,19 +427,14 @@ impl SearchDb {
     /// Compare two records according to `sort`.
     fn compare_records(a: &PackageMeta, b: &PackageMeta, sort: SearchSort) -> std::cmp::Ordering {
         let ord = match sort {
-            SearchSort::None => std::cmp::Ordering::Equal,
-            SearchSort::Reverse => std::cmp::Ordering::Equal,
+            SearchSort::None | SearchSort::Reverse => std::cmp::Ordering::Equal,
             SearchSort::Attr | SearchSort::AttrDesc => a.attr.cmp(&b.attr),
             SearchSort::Name | SearchSort::NameDesc => a.name.cmp(&b.name),
             SearchSort::MainProgram | SearchSort::MainProgramDesc => {
-                let a_main = match a.main_program.as_deref() {
-                    Some(v) => v,
-                    None => "",
-                };
-                let b_main = match b.main_program.as_deref() {
-                    Some(v) => v,
-                    None => "",
-                };
+                #[allow(clippy::unnecessary_lazy_evaluations)]
+                let a_main = a.main_program.as_deref().unwrap_or_else(|| "");
+                #[allow(clippy::unnecessary_lazy_evaluations)]
+                let b_main = b.main_program.as_deref().unwrap_or_else(|| "");
                 a_main.cmp(b_main)
             }
         };
@@ -602,12 +597,14 @@ fn attr_regex_score(value: &str, pattern: &str, case_sensitive: bool, exact: boo
     } else {
         pattern.to_string()
     };
-    let re = RegexBuilder::new(&anchored)
+    let Ok(re) = RegexBuilder::new(&anchored)
         .case_insensitive(!case_sensitive)
         .size_limit(REGEX_SIZE_LIMIT)
         .dfa_size_limit(REGEX_SIZE_LIMIT)
         .build()
-        .unwrap();
+    else {
+        return 0;
+    };
     if let Some(m) = re.find(value) {
         if m.start() == 0 && m.end() == value.len() {
             3000
@@ -627,12 +624,14 @@ fn desc_regex_score(value: &str, pattern: &str, case_sensitive: bool, exact: boo
     } else {
         pattern.to_string()
     };
-    let re = RegexBuilder::new(&anchored)
+    let Ok(re) = RegexBuilder::new(&anchored)
         .case_insensitive(!case_sensitive)
         .size_limit(REGEX_SIZE_LIMIT)
         .dfa_size_limit(REGEX_SIZE_LIMIT)
         .build()
-        .unwrap();
+    else {
+        return 0;
+    };
     if let Some(m) = re.find(value) {
         if m.start() == 0 && m.end() == value.len() {
             300
@@ -652,12 +651,14 @@ fn main_regex_score(value: &str, pattern: &str, case_sensitive: bool, exact: boo
     } else {
         pattern.to_string()
     };
-    let re = RegexBuilder::new(&anchored)
+    let Ok(re) = RegexBuilder::new(&anchored)
         .case_insensitive(!case_sensitive)
         .size_limit(REGEX_SIZE_LIMIT)
         .dfa_size_limit(REGEX_SIZE_LIMIT)
         .build()
-        .unwrap();
+    else {
+        return 0;
+    };
     if let Some(m) = re.find(value) {
         if m.start() == 0 && m.end() == value.len() {
             300
@@ -685,33 +686,29 @@ fn exact_relevance(
             }
         }
         SearchField::Description => {
-            if let Some(desc) = record.description.as_deref() {
-                if value_equals(desc, pattern, case_sensitive) {
+            if let Some(desc) = record.description.as_deref()
+                && value_equals(desc, pattern, case_sensitive) {
                     score += 300;
                 }
-            }
         }
         SearchField::MainProgram => {
-            if let Some(main) = record.main_program.as_deref() {
-                if value_equals(main, pattern, case_sensitive) {
+            if let Some(main) = record.main_program.as_deref()
+                && value_equals(main, pattern, case_sensitive) {
                     score += 300;
                 }
-            }
         }
         SearchField::Both => {
             if value_equals(&record.attr, pattern, case_sensitive) {
                 score += 3000;
             }
-            if let Some(desc) = record.description.as_deref() {
-                if value_equals(desc, pattern, case_sensitive) {
+            if let Some(desc) = record.description.as_deref()
+                && value_equals(desc, pattern, case_sensitive) {
                     score += 300;
                 }
-            }
-            if let Some(main) = record.main_program.as_deref() {
-                if value_equals(main, pattern, case_sensitive) {
+            if let Some(main) = record.main_program.as_deref()
+                && value_equals(main, pattern, case_sensitive) {
                     score += 300;
                 }
-            }
         }
     }
     score

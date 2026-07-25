@@ -10,7 +10,7 @@
 //! Optional secondary index (nixdex): basename FST sidecars next to `files`
 //! (see [`crate::basename_index`]).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io;
 use std::io::{Seek, Write};
@@ -20,7 +20,6 @@ use std::sync::{Arc, Mutex};
 use byteorder::{LittleEndian, WriteBytesExt};
 use grep::matcher::{LineMatchKind, Matcher, NoError};
 use grep::regex::RegexMatcherBuilder;
-use libc;
 use memchr;
 use mmap_guard;
 use rayon::prelude::*;
@@ -106,19 +105,19 @@ const NGRAM_CACHE_CAPACITY: usize = 256;
 
 /// A bounded LRU cache for ngram candidate bitmaps.
 ///
-/// Uses a `HashMap` for O(1) lookups and a `Vec` to track insertion order
+/// Uses a `BTreeMap` for O(log n) lookups and a `Vec` to track insertion order
 /// for eviction. When the cache exceeds its capacity, the oldest entry is
 /// removed.
 #[derive(Debug)]
 struct NgramCache {
-    map: HashMap<String, Arc<RoaringBitmap>>,
+    map: BTreeMap<String, Arc<RoaringBitmap>>,
     order: Vec<String>,
 }
 
 impl NgramCache {
     fn new() -> Self {
         Self {
-            map: HashMap::with_capacity(NGRAM_CACHE_CAPACITY),
+            map: BTreeMap::new(),
             order: Vec::with_capacity(NGRAM_CACHE_CAPACITY),
         }
     }
@@ -136,11 +135,10 @@ impl NgramCache {
             self.order.insert(0, key);
             return;
         }
-        if self.map.len() >= NGRAM_CACHE_CAPACITY {
-            if let Some(oldest) = self.order.pop() {
+        if self.map.len() >= NGRAM_CACHE_CAPACITY
+            && let Some(oldest) = self.order.pop() {
                 self.map.remove(&oldest);
             }
-        }
         self.order.insert(0, key.clone());
         self.map.insert(key, value);
     }
@@ -761,7 +759,7 @@ impl Reader {
 
         #[cfg(feature = "huge_pages")]
         {
-            let ptr = data.as_ptr() as *mut libc::c_void;
+            let ptr = data.as_ptr();
             let len = data.len();
             huge_pages::advise_huge_pages(ptr, len);
         }
@@ -1774,7 +1772,11 @@ pub fn read_frame_hashes(db_dir: &Path) -> Result<Option<Vec<(u32, [u8; 32])>>> 
         let frame_idx = read_u32_le(&bytes, offset)?;
         offset += 4;
         let mut hash = [0u8; 32];
-        hash.copy_from_slice(&bytes[offset..offset + 32]);
+        let end = offset.checked_add(32);
+        match end.and_then(|e| bytes.get(offset..e)) {
+            Some(slice) => hash.copy_from_slice(slice),
+            None => return Err(Error::Corrupt("frame hashes sidecar has truncated hash")),
+        }
         offset += 32;
         frame_hashes.push((frame_idx, hash));
     }
@@ -1789,11 +1791,16 @@ fn compute_frame_hashes(reader: &Reader) -> Vec<(u32, [u8; 32])> {
         .iter()
         .enumerate()
         .map(|(i, (offset, len))| {
-            let frame_data = reader.data.get(*offset..*offset + *len).unwrap_or_default();
+            let frame_data = match reader.data.get(*offset..*offset + *len) {
+                Some(data) => data,
+                None => &[],
+            };
             let mut hasher = Sha256::new();
             hasher.update(frame_data);
             let hash: [u8; 32] = hasher.finalize().into();
-            (i as u32, hash)
+            #[allow(clippy::unnecessary_lazy_evaluations)]
+            let idx = u32::try_from(i).unwrap_or_else(|_| u32::MAX);
+            (idx, hash)
         })
         .collect()
 }
@@ -1806,12 +1813,11 @@ pub fn frame_hashes_diff(
     db_dir: &Path,
     current_hashes: &[(u32, [u8; 32])],
 ) -> Result<Option<Vec<u32>>> {
-    let stored = match read_frame_hashes(db_dir)? {
-        Some(h) => h,
-        None => return Ok(None),
+    let Some(stored) = read_frame_hashes(db_dir)? else {
+        return Ok(None);
     };
 
-    let stored_map: std::collections::HashMap<u32, [u8; 32]> = stored.into_iter().collect();
+    let stored_map: std::collections::BTreeMap<u32, [u8; 32]> = stored.into_iter().collect();
 
     let mut changed = Vec::new();
     for &(frame_idx, ref hash) in current_hashes {
@@ -2500,6 +2506,9 @@ pub struct SearchOptions<'a> {
     /// Emit each match as a JSON object (one per line) instead of the default
     /// human-readable format.
     pub json: bool,
+    /// Emit each match as a YAML document instead of the default
+    /// human-readable format.
+    pub yaml: bool,
     /// Maximum number of results to print. `None` means unlimited.
     pub limit: Option<usize>,
     /// Print the number of matching entries instead of the entries themselves.
@@ -2612,12 +2621,16 @@ fn ngram_sidecars_exist(dir: &Path) -> bool {
 fn prefault_mmap(data: &[u8]) {
     #[cfg(feature = "huge_pages")]
     {
-        let ptr = data.as_ptr() as *mut libc::c_void;
+        let ptr = data.as_ptr();
         let len = data.len();
         huge_pages::advise_willneed(ptr, len);
-        return;
     }
+    #[cfg(not(feature = "huge_pages"))]
+    prefault_mmap_pages(data);
+}
 
+#[cfg(not(feature = "huge_pages"))]
+fn prefault_mmap_pages(data: &[u8]) {
     const PAGE_SIZE: usize = 4096;
     let len = data.len();
     if len == 0 {
@@ -2651,15 +2664,17 @@ fn resolve_ngram_ordinals_multi(
     regex_prefix: Option<&str>,
     regex_suffix: Option<&str>,
 ) -> Option<RoaringBitmap> {
-    let cache_key = format!(
-        "{}\0{}\0{}",
-        literal.unwrap_or(""),
-        regex_prefix.unwrap_or(""),
-        regex_suffix.unwrap_or("")
-    );
+    #[allow(clippy::unnecessary_lazy_evaluations)]
+    let literal_str = literal.unwrap_or_else(|| "");
+    #[allow(clippy::unnecessary_lazy_evaluations)]
+    let regex_prefix_str = regex_prefix.unwrap_or_else(|| "");
+    #[allow(clippy::unnecessary_lazy_evaluations)]
+    let regex_suffix_str = regex_suffix.unwrap_or_else(|| "");
+    let cache_key = format!("{}\0{}\0{}", literal_str, regex_prefix_str, regex_suffix_str);
 
     let cache = reader.ngram_cache();
-    if let Some(cached) = cache.lock().unwrap().get(&cache_key) {
+    let guard = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(cached) = guard.get(&cache_key) {
         return Some((*cached).clone());
     }
 
@@ -2668,9 +2683,8 @@ fn resolve_ngram_ordinals_multi(
         if pat.len() < 3 {
             continue;
         }
-        let candidates = match resolve_ngram_ordinals(reader, Some(pat)) {
-            Some(c) => c,
-            None => continue,
+        let Some(candidates) = resolve_ngram_ordinals(reader, Some(pat)) else {
+            continue;
         };
         result = Some(match result {
             Some(bm) => bm & &candidates,
@@ -2679,10 +2693,8 @@ fn resolve_ngram_ordinals_multi(
     }
 
     if let Some(ref bm) = result {
-        cache
-            .lock()
-            .unwrap()
-            .insert(cache_key, Arc::new(bm.clone()));
+        let mut guard = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.insert(cache_key, Arc::new(bm.clone()));
     }
 
     result
@@ -2823,7 +2835,9 @@ fn print_match(
 ) -> bool {
     let attr = format_attr(store_path);
 
-    if options.json {
+    if options.yaml {
+        print_match_yaml(options, package_db, printed_attrs, store_path, entry, &attr)
+    } else if options.json {
         print_match_json(options, package_db, printed_attrs, store_path, entry, &attr)
     } else {
         print_match_text(
@@ -2884,6 +2898,119 @@ fn print_match_json(
             };
             if let Ok(line) = sonic_rs::to_string(&record) {
                 print!("{line}{delim}");
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
+#[allow(clippy::print_stdout)]
+fn print_match_yaml(
+    options: &SearchOptions<'_>,
+    package_db: Option<&crate::package_search::SearchDb>,
+    printed_attrs: &mut IndexSet<String>,
+    store_path: &StorePath,
+    entry: &FileTreeEntry,
+    attr: &str,
+) -> bool {
+    let delim = if options.null_output { "\0" } else { "\n" };
+    match options.mode {
+        SearchMode::Minimal => {
+            if printed_attrs.insert(attr.into()) {
+                let mut obj = serde_yaml::Mapping::new();
+                obj.insert(
+                    serde_yaml::Value::String("attr".into()),
+                    serde_yaml::Value::String(attr.to_string()),
+                );
+                if let Ok(yaml) = serde_yaml::to_string(&obj) {
+                    print!("{yaml}{delim}");
+                    return true;
+                }
+            }
+            false
+        }
+        SearchMode::Full { .. } => {
+            let (kind, size) = match &entry.node {
+                FileNode::Regular { executable, size } => {
+                    (if *executable { "x" } else { "r" }, *size)
+                }
+                FileNode::Directory { size, .. } => ("d", *size),
+                FileNode::Symlink { .. } => ("s", 0),
+            };
+            let meta = package_db.and_then(|db| db.lookup_attr(store_path.origin().attr.as_str()));
+            let mut obj = serde_yaml::Mapping::new();
+            obj.insert(
+                serde_yaml::Value::String("attr".into()),
+                serde_yaml::Value::String(attr.to_string()),
+            );
+            obj.insert(
+                serde_yaml::Value::String("size".into()),
+                serde_yaml::Value::Number(size.into()),
+            );
+            obj.insert(
+                serde_yaml::Value::String("kind".into()),
+                serde_yaml::Value::String(kind.to_string()),
+            );
+            obj.insert(
+                serde_yaml::Value::String("path".into()),
+                serde_yaml::Value::String(String::from_utf8_lossy(&entry.path).into_owned()),
+            );
+            obj.insert(
+                serde_yaml::Value::String("store_path".into()),
+                serde_yaml::Value::String(store_path.as_str()),
+            );
+            if options.details {
+                if let Some(ref desc) = meta.and_then(|m| m.description.clone()) {
+                    obj.insert(
+                        serde_yaml::Value::String("description".into()),
+                        serde_yaml::Value::String(desc.clone()),
+                    );
+                }
+                if let Some(ref lic) = meta.and_then(|m| m.license.clone()) {
+                    obj.insert(
+                        serde_yaml::Value::String("license".into()),
+                        serde_yaml::Value::String(lic.clone()),
+                    );
+                }
+                if let Some(ref hp) = meta.and_then(|m| m.homepage.clone()) {
+                    obj.insert(
+                        serde_yaml::Value::String("homepage".into()),
+                        serde_yaml::Value::String(hp.clone()),
+                    );
+                }
+                if let Some(ref maint) = meta.and_then(|m| m.maintainers.clone()) {
+                    let vals: Vec<serde_yaml::Value> = maint
+                        .iter()
+                        .cloned()
+                        .map(serde_yaml::Value::String)
+                        .collect();
+                    obj.insert(
+                        serde_yaml::Value::String("maintainers".into()),
+                        serde_yaml::Value::Sequence(vals),
+                    );
+                }
+                if let Some(ref plats) = meta.and_then(|m| m.platforms.clone()) {
+                    let vals: Vec<serde_yaml::Value> = plats
+                        .iter()
+                        .cloned()
+                        .map(serde_yaml::Value::String)
+                        .collect();
+                    obj.insert(
+                        serde_yaml::Value::String("platforms".into()),
+                        serde_yaml::Value::Sequence(vals),
+                    );
+                }
+                if let Some(ref mp) = meta.and_then(|m| m.main_program.clone()) {
+                    obj.insert(
+                        serde_yaml::Value::String("main_program".into()),
+                        serde_yaml::Value::String(mp.clone()),
+                    );
+                }
+            }
+            if let Ok(yaml) = serde_yaml::to_string(&obj) {
+                print!("{yaml}{delim}");
                 true
             } else {
                 false
@@ -3063,7 +3190,7 @@ pub fn search_results_with_reader(
     // Selectivity estimation: count ngram candidates to guide fast-path
     // ordering. The path trigram fast path is most selective when candidates
     // are below the limit.
-    let ngram_candidate_count = ngram_ordinals.as_ref().map_or(0, |bm| bm.len() as usize);
+    let ngram_candidate_count = ngram_ordinals.as_ref().map_or(0, roaring::RoaringBitmap::len);
 
     let package_ordinals: Option<RoaringBitmap> = match (base_ordinals, ngram_ordinals) {
         (Some(b), Some(ng)) => Some(b & &ng),
@@ -3200,7 +3327,7 @@ pub fn search_results_with_reader(
     //    when ngram candidates are below the limit.
     if !used_fast_path
         && ngram_candidate_count > 0
-        && ngram_candidate_count <= Reader::PATH_TRIGRAM_CANDIDATE_LIMIT as usize
+        && ngram_candidate_count <= Reader::PATH_TRIGRAM_CANDIDATE_LIMIT
         && (options.literal_pattern.is_some()
             || regex_literal_prefix.is_some()
             || regex_literal_suffix.is_some())
@@ -3306,14 +3433,14 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
     let results = search_results(options, None)?;
 
     // Load package metadata sidecar for enriched JSON output, if available.
-    let package_db = (|| {
+    let package_db = {
         let path = options.database.join("packages.json");
         if path.exists() {
             crate::package_search::SearchDb::open(&path).ok()
         } else {
             None
         }
-    })();
+    };
 
     // Track printed attrs for --minimal de-duplication (ordered set).
     let mut printed_attrs: IndexSet<String> = IndexSet::new();
@@ -3364,18 +3491,18 @@ pub fn search_batch(options: &SearchOptions<'_>, patterns: &[String]) -> crate::
         source: Box::new(source),
     })?;
 
-    let package_db = (|| {
+    let package_db = {
         let path = options.database.join("packages.json");
         if path.exists() {
             crate::package_search::SearchDb::open(&path).ok()
         } else {
             None
         }
-    })();
+    };
 
     for pattern in patterns {
         let mut batch_options = options.clone();
-        batch_options.pattern = pattern.clone();
+        batch_options.pattern.clone_from(pattern);
         batch_options.literal_pattern = None;
 
         let results = search_results_with_reader(&reader, &index_file, &batch_options, None)?;
@@ -3824,15 +3951,19 @@ fn format_grouped(n: u64) -> String {
     out
 }
 
+#[cfg(feature = "huge_pages")]
 mod huge_pages {
-    pub fn advise_huge_pages(ptr: *mut libc::c_void, len: usize) {
+    #![allow(clippy::as_conversions)]
+    pub fn advise_huge_pages(ptr: *const u8, len: usize) {
+        let ptr = ptr as *mut libc::c_void;
         unsafe {
             libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
             libc::madvise(ptr, len, libc::MADV_WILLNEED);
         }
     }
 
-    pub fn advise_willneed(ptr: *mut libc::c_void, len: usize) {
+    pub fn advise_willneed(ptr: *const u8, len: usize) {
+        let ptr = ptr as *mut libc::c_void;
         unsafe {
             libc::madvise(ptr, len, libc::MADV_WILLNEED);
         }

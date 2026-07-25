@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -13,18 +13,15 @@ pub enum SearchMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum Theme {
     CatppuccinMocha,
     Nord,
     Dracula,
+    #[default]
     TokyoNight,
 }
 
-impl Default for Theme {
-    fn default() -> Self {
-        Self::TokyoNight
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct SearchResult {
@@ -81,11 +78,12 @@ pub struct App {
     pub theme: Theme,
     pub detail_pinned: bool,
     pub expand_all: bool,
-    pub search_cache: HashMap<String, Vec<SearchResult>>,
-    pub cache_timestamps: HashMap<String, Instant>,
+    pub search_cache: BTreeMap<String, Vec<SearchResult>>,
+    pub cache_timestamps: BTreeMap<String, Instant>,
     pub cache_ttl: Duration,
     pub toasts: Vec<Toast>,
     pub is_searching: bool,
+    pub show_help: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -138,11 +136,12 @@ impl App {
             theme: Theme::CatppuccinMocha,
             detail_pinned: false,
             expand_all: false,
-            search_cache: HashMap::new(),
-            cache_timestamps: HashMap::new(),
+            search_cache: BTreeMap::new(),
+            cache_timestamps: BTreeMap::new(),
             cache_ttl: Duration::from_secs(30),
             toasts: Vec::new(),
             is_searching: false,
+            show_help: false,
         }
     }
 
@@ -207,11 +206,13 @@ impl App {
 
     pub fn ensure_visible(&mut self) {
         let screen_height = 20u16;
-        if (self.selected as u16) >= self.scroll + screen_height - 3 {
-            self.scroll = self.selected as u16 - screen_height + 4;
+        #[allow(clippy::unnecessary_lazy_evaluations)]
+        let selected_u16 = u16::try_from(self.selected).unwrap_or_else(|_| u16::MAX);
+        if selected_u16 >= self.scroll + screen_height - 3 {
+            self.scroll = selected_u16.saturating_sub(screen_height - 4);
         }
-        if (self.selected as u16) < self.scroll {
-            self.scroll = self.selected as u16;
+        if selected_u16 < self.scroll {
+            self.scroll = selected_u16;
         }
     }
 
@@ -233,6 +234,19 @@ impl App {
 
     pub fn toggle_expand_all(&mut self) {
         self.expand_all = !self.expand_all;
+    }
+
+    pub fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
+    }
+
+    pub fn cycle_theme(&mut self) {
+        self.theme = match self.theme {
+            Theme::CatppuccinMocha => Theme::Nord,
+            Theme::Nord => Theme::Dracula,
+            Theme::Dracula => Theme::TokyoNight,
+            Theme::TokyoNight => Theme::CatppuccinMocha,
+        };
     }
 
     pub fn set_status(&mut self, message: String) {
@@ -307,7 +321,10 @@ pub fn fuzzy_score(query: &str, target: &str) -> u32 {
     let mut last_match_idx = None;
 
     for (ti, tc) in target_chars.iter().enumerate() {
-        if query_idx < query_chars.len() && *tc == query_chars[query_idx] {
+        let Some(&qc) = query_chars.get(query_idx) else {
+            continue;
+        };
+        if *tc == qc {
             if let Some(last_idx) = last_match_idx {
                 if ti == last_idx + 1 {
                     score += 50;
@@ -338,8 +355,14 @@ fn is_word_boundary(chars: &[char], from: usize, to: usize) -> bool {
     if from == 0 {
         return true;
     }
-    let prev = chars[from];
-    let curr = chars[to];
+    let prev = match chars.get(from) {
+        Some(c) => *c,
+        None => return false,
+    };
+    let curr = match chars.get(to) {
+        Some(c) => *c,
+        None => return false,
+    };
     prev.is_ascii_whitespace()
         || prev == '_'
         || prev == '-'

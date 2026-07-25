@@ -804,6 +804,7 @@ async fn nix_locate_handler(
                 only_toplevel: !params.all,
             },
             json: false,
+            yaml: false,
             limit: Some(limit),
             count: false,
             sort,

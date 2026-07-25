@@ -67,8 +67,11 @@ Limitations
 #[command(name = "nix-locate", author, about, version, after_long_help = LONG_USAGE)]
 pub struct Opts {
     /// Pattern for which to search.
-    #[arg(value_name = "PATTERN")]
-    pub pattern: String,
+    ///
+    /// Multiple arguments are joined with spaces, so `nix-locate claude code`
+    /// is equivalent to `nix-locate "claude code"`.
+    #[arg(value_name = "PATTERN", num_args = 1..)]
+    pub pattern: Vec<String>,
 
     /// Directory where the index is stored.
     #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
@@ -127,6 +130,10 @@ pub struct Opts {
     /// human-readable format.
     #[arg(long)]
     pub json: bool,
+
+    /// Output results as YAML documents.
+    #[arg(long)]
+    pub yaml: bool,
 
     /// Maximum number of results to print.
     #[arg(short, long)]
@@ -191,6 +198,7 @@ struct ProcessedArgs {
     file_type: Vec<FileType>,
     mode: SearchMode,
     json: bool,
+    yaml: bool,
     limit: Option<usize>,
     count: bool,
     sort: nixdex_core::database::SearchSort,
@@ -203,25 +211,26 @@ struct ProcessedArgs {
 }
 
 fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
+    let pattern = matches.pattern.join(" ");
     let start_anchor = if matches.at_root { "^" } else { "" };
     let end_anchor = if matches.whole_name { "$" } else { "" };
     let as_regex = matches.regex;
 
     // Plain (non-anchored, non-regex) patterns can use a fast substring search.
     let literal_pattern =
-        if matches.regex || matches.at_root || matches.whole_name || matches.pattern.is_empty() {
+        if matches.regex || matches.at_root || matches.whole_name || pattern.is_empty() {
             None
         } else {
-            Some(matches.pattern.clone())
+            Some(pattern.clone())
         };
 
-    let exact_basename = if !matches.regex && matches.whole_name && !matches.pattern.is_empty() {
+    let exact_basename = if !matches.regex && matches.whole_name && !pattern.is_empty() {
         // The FST is an exact-basename index. It is only safe to use when the
         // whole-name pattern is anchored to a final path component (contains a
         // '/'); otherwise the regex `ls$` would also match basenames like
         // `als` and `xls`, which the FST lookup `ls` would omit.
-        let base = nixdex_core::basename_index::basename_of(matches.pattern.as_bytes());
-        if matches.pattern.contains('/') && !base.is_empty() {
+        let base = nixdex_core::basename_index::basename_of(pattern.as_bytes());
+        if pattern.contains('/') && !base.is_empty() {
             Some(String::from_utf8_lossy(base).into_owned())
         } else {
             None
@@ -232,12 +241,12 @@ fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
 
     // Determine if we can use the path index for rooted/prefix queries
     let (exact_path, path_prefix) =
-        if !matches.regex && matches.at_root && !matches.pattern.is_empty() {
+        if !matches.regex && matches.at_root && !pattern.is_empty() {
             // Normalize the pattern to ensure it starts with "/" for path index lookups
-            let normalized = if matches.pattern.starts_with('/') {
-                matches.pattern.clone()
+            let normalized = if pattern.starts_with('/') {
+                pattern.clone()
             } else {
-                format!("/{}", matches.pattern)
+                format!("/{}", pattern)
             };
 
             if matches.whole_name {
@@ -264,7 +273,7 @@ fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
         }
     };
 
-    let pattern = make_pattern(&matches.pattern, true);
+    let pattern = make_pattern(&pattern, true);
     let package_pattern = matches.package.as_deref().map(|p| make_pattern(p, false));
 
     let color = if matches.no_color {
@@ -310,6 +319,7 @@ fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
         file_type,
         mode,
         json: matches.json,
+        yaml: matches.yaml,
         limit: matches.limit,
         count: matches.count,
         sort,
@@ -346,6 +356,7 @@ pub async fn run(matches: Opts) -> color_eyre::Result<()> {
             file_type: &args.file_type,
             mode: args.mode,
             json: args.json,
+            yaml: args.yaml,
             limit: args.limit,
             count: args.count,
             sort: args.sort,
@@ -389,6 +400,7 @@ pub async fn run(matches: Opts) -> color_eyre::Result<()> {
         file_type: &args.file_type,
         mode: args.mode,
         json: args.json,
+        yaml: args.yaml,
         limit: args.limit,
         count: args.count,
         sort: args.sort,
@@ -428,18 +440,21 @@ async fn locate_via_daemon(opts: &Opts) -> Result<Vec<String>, crate::daemon_cli
     let response = client.locate(&query).await?;
     Ok(crate::daemon_client::render(
         &response,
-        opts.json,
-        opts.minimal,
-        opts.null_output,
-        opts.quiet,
-        opts.details,
+        &crate::daemon_client::RenderOpts {
+            json: opts.json,
+            yaml: opts.yaml,
+            minimal: opts.minimal,
+            null_output: opts.null_output,
+            quiet: opts.quiet,
+            details: opts.details,
+        },
     ))
 }
 
 /// Build the `/nix-locate` query parameters from the CLI options.
 fn daemon_query(opts: &Opts) -> Vec<(String, String)> {
     let mut q: Vec<(String, String)> = vec![
-        ("pattern".into(), opts.pattern.clone()),
+        ("pattern".into(), opts.pattern.join(" ")),
         ("regex".into(), opts.regex.to_string()),
         ("at_root".into(), opts.at_root.to_string()),
         ("whole_name".into(), opts.whole_name.to_string()),
