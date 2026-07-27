@@ -2917,7 +2917,7 @@ fn print_match_json(
     }
 }
 
-#[allow(clippy::print_stdout)]
+#[allow(clippy::print_stdout, clippy::too_many_lines)]
 fn print_match_yaml(
     options: &SearchOptions<'_>,
     package_db: Option<&crate::package_search::SearchDb>,
@@ -4080,6 +4080,7 @@ mod tests {
             file_type: &[],
             mode: SearchMode::Minimal,
             json: false,
+            yaml: false,
             limit: None,
             count: false,
             sort: SearchSort::None,
@@ -4121,6 +4122,7 @@ mod tests {
             file_type: &[],
             mode: SearchMode::Minimal,
             json: false,
+            yaml: false,
             limit: None,
             count: false,
             sort: SearchSort::None,
@@ -4322,6 +4324,7 @@ mod tests {
                 file_type: &[],
                 mode: SearchMode::Minimal,
                 json: false,
+                yaml: false,
                 limit: None,
                 count: false,
                 sort: SearchSort::None,
@@ -4388,6 +4391,7 @@ mod tests {
             file_type: &[],
             mode: SearchMode::Minimal,
             json: false,
+            yaml: false,
             limit: None,
             count: false,
             sort: SearchSort::None,
@@ -4490,6 +4494,7 @@ mod tests {
                 file_type: &[],
                 mode: SearchMode::Minimal,
                 json: false,
+                yaml: false,
                 limit: None,
                 count: false,
                 sort: SearchSort::None,
@@ -4573,6 +4578,7 @@ mod tests {
             file_type: &[],
             mode: SearchMode::Minimal,
             json: false,
+            yaml: false,
             limit: None,
             count: false,
             sort: SearchSort::None,
@@ -4653,6 +4659,7 @@ mod tests {
             file_type: &[],
             mode: SearchMode::Minimal,
             json: false,
+            yaml: false,
             limit: None,
             count: false,
             sort: SearchSort::None,
@@ -5196,6 +5203,7 @@ mod tests {
             file_type: &[],
             mode: SearchMode::Minimal,
             json: false,
+            yaml: false,
             limit: None,
             count: false,
             sort: SearchSort::None,
@@ -5289,6 +5297,7 @@ mod tests {
             file_type: &[],
             mode: SearchMode::Minimal,
             json: false,
+            yaml: false,
             limit: None,
             count: false,
             sort: SearchSort::None,
