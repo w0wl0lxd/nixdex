@@ -29,7 +29,7 @@ const MAX_OPTION_TYPE_BYTES: usize = 128;
 const MAX_OPTION_DESC_BYTES: usize = 4096;
 
 /// Magic for the options sidecar.
-const OPTIONS_MAGIC: &[u8] = b"NXOP";
+pub const OPTIONS_MAGIC: &[u8] = b"NXOP";
 /// Sidecar format version.
 const OPTIONS_VERSION: u32 = 1;
 

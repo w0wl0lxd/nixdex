@@ -3600,11 +3600,30 @@ fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
     // Check if sidecars are already up to date.
     if let Some(changed) = frame_hashes_diff(db_dir, &current_hashes)? {
         if changed.is_empty() {
-            tracing::info!(
+            let required_sidecars = [
+                crate::basename_index::NAMES_FILE,
+                crate::basename_index::POSTINGS_FILE,
+                crate::path_index::POSTINGS_FILE,
+                "packages.json",
+                ATTRS_FILE,
+            ];
+            let missing: Vec<&str> = required_sidecars
+                .iter()
+                .filter(|name| !db_dir.join(name).exists())
+                .copied()
+                .collect();
+            if missing.is_empty() {
+                tracing::info!(
+                    db_path = %db_path.display(),
+                    "sidecars are up to date; skipping regeneration"
+                );
+                return Ok(());
+            }
+            tracing::warn!(
                 db_path = %db_path.display(),
-                "sidecars are up to date; skipping regeneration"
+                missing = ?missing,
+                "frame hashes unchanged but sidecar files missing; rebuilding"
             );
-            return Ok(());
         }
         tracing::info!(
             db_path = %db_path.display(),
