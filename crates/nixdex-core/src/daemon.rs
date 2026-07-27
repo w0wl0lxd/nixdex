@@ -1392,6 +1392,13 @@ async fn info_handler(
 > {
     index_state.requests_total.fetch_add(1, Ordering::Relaxed);
 
+    if params.attr.len() > MAX_PATTERN_BYTES {
+        return Err(json_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("attr exceeds maximum length of {MAX_PATTERN_BYTES} bytes"),
+        ));
+    }
+
     let db = match read_snapshot(&index_state) {
         Some(snapshot) => snapshot.package_db,
         None => {
@@ -1477,6 +1484,13 @@ async fn history_handler(
 > {
     index_state.requests_total.fetch_add(1, Ordering::Relaxed);
 
+    if params.attr.len() > MAX_PATTERN_BYTES {
+        return Err(json_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("attr exceeds maximum length of {MAX_PATTERN_BYTES} bytes"),
+        ));
+    }
+
     let history_db = match read_snapshot(&index_state) {
         Some(snapshot) => snapshot.history_db,
         None => {
@@ -1537,6 +1551,13 @@ async fn options_handler(
 > {
     index_state.requests_total.fetch_add(1, Ordering::Relaxed);
 
+    if params.pattern.len() > MAX_PATTERN_BYTES {
+        return Err(json_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("pattern exceeds maximum length of {MAX_PATTERN_BYTES} bytes"),
+        ));
+    }
+
     let options_db = match read_snapshot(&index_state) {
         Some(snapshot) => snapshot.options_db,
         None => {
@@ -1566,7 +1587,11 @@ async fn options_handler(
     }
 
     let matched = options_db.search(&params.pattern, params.case_sensitive);
-    let results: Vec<nixdex_options::OptionRecord> = matched.into_iter().cloned().collect();
+    let results: Vec<nixdex_options::OptionRecord> = matched
+        .into_iter()
+        .take(limit)
+        .cloned()
+        .collect();
 
     Ok(axum::Json(OptionsResponse {
         pattern: params.pattern,

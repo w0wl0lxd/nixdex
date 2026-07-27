@@ -593,7 +593,13 @@ fn output_search_results(
             for record in matches {
                 let desc = record.description.as_deref().map_or("", |d| d);
                 let main = record.main_program.as_deref().map_or("", |m| m);
-                println!("{},{},{},{}", record.attr, record.name, desc, main);
+                println!(
+                    "{},{},{},{}",
+                    csv_escape(&record.attr),
+                    csv_escape(&record.name),
+                    csv_escape(desc),
+                    csv_escape(main),
+                );
             }
         }
         OutputFormat::Yaml => {
@@ -876,6 +882,14 @@ fn format_which_attr(store_path: &nixdex_core::StorePath) -> String {
     attr
 }
 
+fn csv_escape(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
 async fn run_update(opts: UpdateOpts) -> color_eyre::Result<()> {
     let config = nixdex_core::prebuilt::PrebuiltConfig {
         release_url: opts.release_url,
@@ -917,6 +931,8 @@ fn log_sidecar_result(result: color_eyre::Result<()>, name: &str) {
     }
 }
 
+const MAX_SIDECAR_RETRIES: usize = 3;
+
 async fn download_history_sidecar(
     config: &nixdex_core::prebuilt::PrebuiltConfig,
     dest_dir: &std::path::Path,
@@ -927,29 +943,8 @@ async fn download_history_sidecar(
         format!("index-{}.history", config.architecture)
     };
     let url = format!("{}/{}", config.release_url, filename);
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("nixdex/", env!("CARGO_PKG_VERSION")))
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|err| color_eyre::eyre::eyre!("failed to build HTTP client: {err}"))?;
     let dest = dest_dir.join(nixdex_history::HISTORY_FILE);
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|err| color_eyre::eyre::eyre!("failed to download history sidecar: {err}"))?;
-    if response.status().is_success() {
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|err| color_eyre::eyre::eyre!("failed to read history sidecar: {err}"))?;
-        tokio::fs::write(&dest, &bytes).await?;
-        tracing::info!(path = %dest.display(), "downloaded history sidecar");
-    }
-    Ok(())
+    download_sidecar_with_retry(&url, &dest, nixdex_history::HISTORY_MAGIC, "history").await
 }
 
 async fn download_options_sidecar(
@@ -962,28 +957,129 @@ async fn download_options_sidecar(
         format!("index-{}.options", config.architecture)
     };
     let url = format!("{}/{}", config.release_url, filename);
+    let dest = dest_dir.join(nixdex_options::OPTIONS_FILE);
+    download_sidecar_with_retry(&url, &dest, nixdex_options::OPTIONS_MAGIC, "options").await
+}
+
+async fn download_sidecar_with_retry(
+    url: &str,
+    dest: &std::path::Path,
+    expected_magic: &[u8],
+    name: &str,
+) -> color_eyre::Result<()> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("nixdex/", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|err| color_eyre::eyre::eyre!("failed to build HTTP client: {err}"))?;
-    let dest = dest_dir.join(nixdex_options::OPTIONS_FILE);
+
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let temp_path = sidecar_temp_path(dest);
+    retry_sidecar_download(&client, url, &temp_path, dest, expected_magic, name).await
+}
+
+fn sidecar_temp_path(dest: &std::path::Path) -> std::path::PathBuf {
+    let ext = dest
+        .extension()
+        .map_or_else(String::new, |e| e.to_string_lossy().to_string());
+    dest.with_extension(format!("{ext}.tmp"))
+}
+
+async fn retry_sidecar_download(
+    client: &reqwest::Client,
+    url: &str,
+    temp_path: &std::path::Path,
+    dest: &std::path::Path,
+    expected_magic: &[u8],
+    name: &str,
+) -> color_eyre::Result<()> {
+    let mut last_err = None;
+    for attempt in 1..=MAX_SIDECAR_RETRIES {
+        match download_sidecar_once(client, url, temp_path, expected_magic, name).await {
+            Ok(()) => match finalize_sidecar_download(temp_path, dest, name).await {
+                Ok(()) => return Ok(()),
+                Err(err) => last_err = Some(err),
+            },
+            Err(err) => {
+                tracing::warn!(error = %err, attempt, "failed to download {} sidecar", name);
+                last_err = Some(err);
+                if attempt < MAX_SIDECAR_RETRIES {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+
+    match last_err {
+        Some(err) => Err(err),
+        None => Err(color_eyre::eyre::eyre!(
+            "failed to download {} sidecar after {MAX_SIDECAR_RETRIES} attempts",
+            name
+        )),
+    }
+}
+
+async fn finalize_sidecar_download(
+    temp_path: &std::path::Path,
+    dest: &std::path::Path,
+    name: &str,
+) -> color_eyre::Result<()> {
+    tokio::fs::rename(temp_path, dest)
+        .await
+        .map_err(|err| {
+            tracing::warn!(error = %err, "failed to atomically rename {} sidecar", name);
+            color_eyre::eyre::eyre!("failed to rename {} sidecar: {err}", name)
+        })?;
+    tracing::info!(path = %dest.display(), "downloaded {} sidecar", name);
+    Ok(())
+}
+
+async fn download_sidecar_once(
+    client: &reqwest::Client,
+    url: &str,
+    temp_path: &std::path::Path,
+    expected_magic: &[u8],
+    name: &str,
+) -> color_eyre::Result<()> {
     let response = client
-        .get(&url)
+        .get(url)
         .send()
         .await
-        .map_err(|err| color_eyre::eyre::eyre!("failed to download options sidecar: {err}"))?;
-    if response.status().is_success() {
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|err| color_eyre::eyre::eyre!("failed to read options sidecar: {err}"))?;
-        tokio::fs::write(&dest, &bytes).await?;
-        tracing::info!(path = %dest.display(), "downloaded options sidecar");
+        .map_err(|err| color_eyre::eyre::eyre!("failed to download {} sidecar: {err}", name))?;
+
+    if !response.status().is_success() {
+        return Err(color_eyre::eyre::eyre!(
+            "failed to download {} sidecar: HTTP {}",
+            name,
+            response.status()
+        ));
     }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|err| color_eyre::eyre::eyre!("failed to read {} sidecar: {err}", name))?;
+
+    let magic_slice = match bytes.get(..expected_magic.len()) {
+        Some(slice) => slice,
+        None => &[],
+    };
+    if bytes.len() < expected_magic.len() || magic_slice != expected_magic {
+        return Err(color_eyre::eyre::eyre!(
+            "{} sidecar magic mismatch: expected {:?}, got {:?}",
+            name,
+            expected_magic,
+            magic_slice
+        ));
+    }
+
+    tokio::fs::write(temp_path, &bytes).await.map_err(|err| {
+        color_eyre::eyre::eyre!("failed to write {} sidecar to temp file: {err}", name)
+    })?;
+
     Ok(())
 }
 

@@ -10,7 +10,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use nixdex_core::database::{SearchOptions, SearchSort};
-use nixdex_core::package_search::{SearchDb, SearchSort as PkgSearchSort};
+use nixdex_core::package_search::SearchSort as PkgSearchSort;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::time::{interval, sleep};
@@ -109,7 +109,9 @@ fn handle_input_event(
             ..
         }) => {
             if !app.input.is_empty() || *c != ' ' {
-                let mut new_input = app.input.clone();
+                let mut new_input = pending_query
+                    .take()
+                    .unwrap_or_else(|| app.input.clone());
                 new_input.push(*c);
                 *pending_query = Some(new_input);
                 *debounce_deadline = Some(Instant::now() + DEBOUNCE_DELAY);
@@ -120,7 +122,9 @@ fn handle_input_event(
             modifiers: KeyModifiers::NONE,
             ..
         }) => {
-            let mut new_input = app.input.clone();
+            let mut new_input = pending_query
+                .take()
+                .unwrap_or_else(|| app.input.clone());
             new_input.pop();
             *pending_query = Some(new_input);
             *debounce_deadline = Some(Instant::now() + DEBOUNCE_DELAY);
@@ -410,20 +414,26 @@ fn perform_package_search(app: &mut App, query: &str) {
         return;
     }
 
-    let db = match SearchDb::open(&sidecar) {
+    let size_sort_unsupported = matches!(
+        app.search_sort,
+        SearchSort::SizeAsc | SearchSort::SizeDesc
+    );
+    if size_sort_unsupported {
+        app.set_status("Size sort is not available in package search mode".to_string());
+    }
+
+    let sort = match app.search_sort {
+        SearchSort::None | SearchSort::SizeAsc | SearchSort::SizeDesc => PkgSearchSort::None,
+        SearchSort::AttrAsc => PkgSearchSort::Attr,
+        SearchSort::Reverse => PkgSearchSort::Reverse,
+    };
+
+    let db = match app.search_db_cache.get_or_open(&sidecar) {
         Ok(db) => db,
         Err(err) => {
             app.set_status(format!("Failed to open package database: {}", err));
             return;
         }
-    };
-
-    let sort = match app.search_sort {
-        SearchSort::None => PkgSearchSort::None,
-        SearchSort::AttrAsc => PkgSearchSort::Attr,
-        SearchSort::SizeAsc => PkgSearchSort::Name,
-        SearchSort::SizeDesc => PkgSearchSort::NameDesc,
-        SearchSort::Reverse => PkgSearchSort::Reverse,
     };
 
     let matches = if app.search_tiered_fuzzy {

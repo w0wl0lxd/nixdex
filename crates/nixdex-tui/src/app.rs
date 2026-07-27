@@ -1,15 +1,46 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use nixdex_core::database::SearchSort;
-use nixdex_core::package_search::SearchField;
+use nixdex_core::package_search::{SearchDb, SearchField};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {
     Search,
     Locate,
     Which,
+}
+
+pub struct SearchDbCache {
+    db: Option<SearchDb>,
+}
+
+impl std::fmt::Debug for SearchDbCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SearchDbCache")
+            .field("db", &self.db.is_some())
+            .finish()
+    }
+}
+
+impl SearchDbCache {
+    fn new() -> Self {
+        Self { db: None }
+    }
+
+    pub fn get_or_open(&mut self, sidecar: &Path) -> Result<&SearchDb, String> {
+        if self.db.is_none() {
+            match SearchDb::open(sidecar) {
+                Ok(db) => self.db = Some(db),
+                Err(err) => return Err(err.to_string()),
+            }
+        }
+        match &self.db {
+            Some(db) => Ok(db),
+            None => Err("database was not opened".to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +115,7 @@ pub struct App {
     pub toasts: Vec<Toast>,
     pub is_searching: bool,
     pub show_help: bool,
+    pub search_db_cache: SearchDbCache,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +174,7 @@ impl App {
             toasts: Vec::new(),
             is_searching: false,
             show_help: false,
+            search_db_cache: SearchDbCache::new(),
         }
     }
 
@@ -271,17 +304,39 @@ impl App {
         self.results.len()
     }
 
+    pub fn cache_key(&self, query: &str) -> String {
+        format!(
+            "{:?}|{}|{:?}|{}|{}|{}|{}|{}|{:?}|{}|{}",
+            self.mode,
+            query,
+            self.search_field,
+            self.search_case_sensitive,
+            self.search_exact,
+            self.search_regex,
+            self.search_fuzzy,
+            self.search_tiered_fuzzy,
+            self.search_sort,
+            match self.search_limit {
+                Some(v) => v,
+                None => 0,
+            },
+            self.search_name_only,
+        )
+    }
+
     pub fn get_cached_results(&self, query: &str) -> Option<&Vec<SearchResult>> {
-        self.search_cache.get(query)
+        self.search_cache.get(&self.cache_key(query))
     }
 
     pub fn cache_results(&mut self, query: String, results: Vec<SearchResult>) {
-        self.search_cache.insert(query.clone(), results);
-        self.cache_timestamps.insert(query, Instant::now());
+        let key = self.cache_key(&query);
+        self.search_cache.insert(key.clone(), results);
+        self.cache_timestamps.insert(key, Instant::now());
     }
 
     pub fn is_cache_valid(&self, query: &str) -> bool {
-        if let Some(ts) = self.cache_timestamps.get(query) {
+        let key = self.cache_key(query);
+        if let Some(ts) = self.cache_timestamps.get(&key) {
             ts.elapsed() < self.cache_ttl
         } else {
             false
@@ -292,8 +347,8 @@ impl App {
         let now = Instant::now();
         self.cache_timestamps
             .retain(|_, ts| now.duration_since(*ts) < self.cache_ttl);
-        let valid_keys: Vec<String> = self.cache_timestamps.keys().cloned().collect();
-        self.search_cache.retain(|k, _| valid_keys.contains(k));
+        self.search_cache
+            .retain(|k, _| self.cache_timestamps.contains_key(k));
     }
 }
 

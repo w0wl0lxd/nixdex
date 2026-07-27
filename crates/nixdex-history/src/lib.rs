@@ -26,7 +26,7 @@ const MAX_VERSION_BYTES: usize = 128;
 const MAX_COMMIT_BYTES: usize = 64;
 
 /// Magic for the history sidecar.
-const HISTORY_MAGIC: &[u8] = b"NXHS";
+pub const HISTORY_MAGIC: &[u8] = b"NXHS";
 /// Sidecar format version.
 const HISTORY_VERSION: u32 = 1;
 

@@ -215,9 +215,11 @@ fn render_results(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App,
                 } else {
                     Span::styled(&result.attr, Style::default().fg(tc.attr_fg))
                 };
-                let name_span = Span::raw(format!("  {}", result.name));
-                let desc_span = Span::raw(format!("  {}", result.description));
-                Line::from(vec![attr_span, name_span, desc_span])
+                let name_span = Span::raw("  ");
+                let name_val = Span::raw(&result.name);
+                let desc_span = Span::raw("  ");
+                let desc_val = Span::raw(&result.description);
+                Line::from(vec![attr_span, name_span, name_val, desc_span, desc_val])
             };
             ListItem::new(line)
         })
@@ -337,4 +339,63 @@ fn render_toasts(frame: &mut Frame<'_>, app: &App, tc: &ThemeColors) {
         .style(Style::default().fg(tc.toast_fg).bg(tc.toast_bg));
 
     frame.render_widget(paragraph, toast_area);
+}
+
+fn centered_rect(area: ratatui::layout::Rect, percent_x: u16, percent_y: u16) -> ratatui::layout::Rect {
+    let vertical = ratatui::layout::Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([
+            ratatui::layout::Constraint::Percentage((100 - percent_y) / 2),
+            ratatui::layout::Constraint::Percentage(percent_y),
+            ratatui::layout::Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+
+    let middle = match vertical.get(1) {
+        Some(rect) => *rect,
+        None => return area,
+    };
+
+    match ratatui::layout::Layout::default()
+        .direction(ratatui::layout::Direction::Horizontal)
+        .constraints([
+            ratatui::layout::Constraint::Percentage((100 - percent_x) / 2),
+            ratatui::layout::Constraint::Percentage(percent_x),
+            ratatui::layout::Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(middle)
+        .get(1)
+    {
+        Some(rect) => *rect,
+        None => area,
+    }
+}
+
+fn render_help_overlay(frame: &mut Frame<'_>, area: ratatui::layout::Rect, tc: &ThemeColors) {
+    let help_text = [
+        " nixdex TUI Help ",
+        "",
+        "  /            Focus search input",
+        "  Tab          Switch search mode (Search/Locate/Which)",
+        "  Enter        Submit search",
+        "  Esc          Clear input / exit help",
+        "  Up/Down      Navigate results",
+        "  s            Cycle sort order",
+        "  f            Toggle fuzzy search",
+        "  r            Toggle regex search",
+        "  c            Toggle case sensitivity",
+        "  e            Toggle exact match",
+        "  n            Toggle name-only display",
+        "  j            Toggle JSON output",
+        "  ?            Toggle this help",
+        "  q            Quit",
+        "",
+        " Press any key or Esc to continue.",
+    ];
+    let paragraph = Paragraph::new(help_text.iter().map(|line| Line::raw(*line)).collect::<Vec<_>>())
+        .block(Block::default().borders(Borders::ALL).title(" Help "))
+        .style(Style::default().fg(tc.fg).bg(tc.overlay_bg));
+
+    let overlay_area = centered_rect(area, 60, 70);
+    frame.render_widget(paragraph, overlay_area);
 }
