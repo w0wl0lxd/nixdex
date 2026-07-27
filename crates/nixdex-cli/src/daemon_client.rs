@@ -228,10 +228,7 @@ pub(crate) struct RenderOpts {
 /// Render a daemon response into the same text/JSON/count lines the local
 /// search path would print. Colour highlighting is omitted because the daemon
 /// response does not carry per-match highlight ranges.
-pub(crate) fn render(
-    response: &NixLocateResponse,
-    opts: &RenderOpts,
-) -> Vec<String> {
+pub(crate) fn render(response: &NixLocateResponse, opts: &RenderOpts) -> Vec<String> {
     if opts.quiet {
         return Vec::new();
     }
@@ -345,13 +342,15 @@ pub(crate) fn render(
                         obj.insert("homepage", sonic_rs::Value::copy_str(hp));
                     }
                     if let Some(ref maint) = m.maintainers
-                        && let Ok(val) = sonic_rs::to_value(maint) {
-                            obj.insert("maintainers", val);
-                        }
+                        && let Ok(val) = sonic_rs::to_value(maint)
+                    {
+                        obj.insert("maintainers", val);
+                    }
                     if let Some(ref plats) = m.platforms
-                        && let Ok(val) = sonic_rs::to_value(plats) {
-                            obj.insert("platforms", val);
-                        }
+                        && let Ok(val) = sonic_rs::to_value(plats)
+                    {
+                        obj.insert("platforms", val);
+                    }
                     if let Some(ref mp) = m.main_program {
                         obj.insert("main_program", sonic_rs::Value::copy_str(mp));
                     }

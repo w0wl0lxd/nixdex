@@ -154,13 +154,13 @@ fn bench_locate_ngram_search(c: &mut Criterion) {
         sort: SearchSort::None,
         min_size: None,
         max_size: None,
-exclude_fhs: false,
-         null_output: false,
-         quiet: false,
-         details: false,
-     };
+        exclude_fhs: false,
+        null_output: false,
+        quiet: false,
+        details: false,
+    };
 
-     c.bench_function("locate search via ngram index", |b| {
+    c.bench_function("locate search via ngram index", |b| {
         b.iter(|| {
             let hits = search_results(&options, None).expect("search");
             black_box(hits);
@@ -233,12 +233,12 @@ fn search_results_baseline(c: &mut Criterion) {
                 sort: SearchSort::None,
                 min_size: None,
                 max_size: None,
-exclude_fhs: false,
-                 null_output: false,
-                 quiet: false,
-                 details: false,
-             };
-             group.bench_with_input(BenchmarkId::new(label, count), &opts, |b, opts| {
+                exclude_fhs: false,
+                null_output: false,
+                quiet: false,
+                details: false,
+            };
+            group.bench_with_input(BenchmarkId::new(label, count), &opts, |b, opts| {
                 b.iter(|| {
                     let hits = nixdex_core::search_database_results(black_box(opts), None)
                         .expect("search results");

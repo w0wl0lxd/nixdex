@@ -127,9 +127,33 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
 
     let tc = theme_colors(app.theme);
 
-    render_header(frame, chunks.first().copied().unwrap_or_else(ratatui::layout::Rect::default), app, &tc);
-    render_body(frame, chunks.get(1).copied().unwrap_or_else(ratatui::layout::Rect::default), app, &tc);
-    render_footer(frame, chunks.get(2).copied().unwrap_or_else(ratatui::layout::Rect::default), app, &tc);
+    render_header(
+        frame,
+        chunks
+            .first()
+            .copied()
+            .unwrap_or_else(ratatui::layout::Rect::default),
+        app,
+        &tc,
+    );
+    render_body(
+        frame,
+        chunks
+            .get(1)
+            .copied()
+            .unwrap_or_else(ratatui::layout::Rect::default),
+        app,
+        &tc,
+    );
+    render_footer(
+        frame,
+        chunks
+            .get(2)
+            .copied()
+            .unwrap_or_else(ratatui::layout::Rect::default),
+        app,
+        &tc,
+    );
     render_toasts(frame, app, &tc);
 
     if app.show_help {
@@ -277,7 +301,11 @@ fn render_detail(
         lines.push(detail_line("Homepage:", homepage.clone(), tc));
     }
     if !detail.maintainers.is_empty() {
-        lines.push(detail_line("Maintainers:", detail.maintainers.join(", "), tc));
+        lines.push(detail_line(
+            "Maintainers:",
+            detail.maintainers.join(", "),
+            tc,
+        ));
     }
     if let Some(main_program) = &detail.main_program {
         lines.push(detail_line("Main program:", main_program.clone(), tc));
@@ -341,7 +369,11 @@ fn render_toasts(frame: &mut Frame<'_>, app: &App, tc: &ThemeColors) {
     frame.render_widget(paragraph, toast_area);
 }
 
-fn centered_rect(area: ratatui::layout::Rect, percent_x: u16, percent_y: u16) -> ratatui::layout::Rect {
+fn centered_rect(
+    area: ratatui::layout::Rect,
+    percent_x: u16,
+    percent_y: u16,
+) -> ratatui::layout::Rect {
     let vertical = ratatui::layout::Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
         .constraints([
@@ -392,9 +424,14 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: ratatui::layout::Rect, tc: &
         "",
         " Press any key or Esc to continue.",
     ];
-    let paragraph = Paragraph::new(help_text.iter().map(|line| Line::raw(*line)).collect::<Vec<_>>())
-        .block(Block::default().borders(Borders::ALL).title(" Help "))
-        .style(Style::default().fg(tc.fg).bg(tc.overlay_bg));
+    let paragraph = Paragraph::new(
+        help_text
+            .iter()
+            .map(|line| Line::raw(*line))
+            .collect::<Vec<_>>(),
+    )
+    .block(Block::default().borders(Borders::ALL).title(" Help "))
+    .style(Style::default().fg(tc.fg).bg(tc.overlay_bg));
 
     let overlay_area = centered_rect(area, 60, 70);
     frame.render_widget(paragraph, overlay_area);

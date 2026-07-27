@@ -312,10 +312,11 @@ fn extract_license(value: &sonic_rs::Value) -> String {
             let mut result = String::new();
             for (k, v) in map {
                 if (k == "spdx-id" || k == "fullName" || k == "name")
-                    && let sonic_rs::ValueRef::String(s) = v.as_ref() {
-                        result = s.to_string();
-                        break;
-                    }
+                    && let sonic_rs::ValueRef::String(s) = v.as_ref()
+                {
+                    result = s.to_string();
+                    break;
+                }
             }
             if result.is_empty() {
                 sonic_rs::to_string(value).unwrap_or_else(|_| String::new())
@@ -348,10 +349,11 @@ fn extract_maintainers(values: &[sonic_rs::Value]) -> Vec<String> {
                 let mut result = None;
                 for (k, v) in map {
                     if (k == "email" || k == "github" || k == "name")
-                        && let sonic_rs::ValueRef::String(s) = v.as_ref() {
-                            result = Some(s.to_string());
-                            break;
-                        }
+                        && let sonic_rs::ValueRef::String(s) = v.as_ref()
+                    {
+                        result = Some(s.to_string());
+                        break;
+                    }
                 }
                 result
             }

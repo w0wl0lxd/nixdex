@@ -109,9 +109,7 @@ fn handle_input_event(
             ..
         }) => {
             if !app.input.is_empty() || *c != ' ' {
-                let mut new_input = pending_query
-                    .take()
-                    .unwrap_or_else(|| app.input.clone());
+                let mut new_input = pending_query.take().unwrap_or_else(|| app.input.clone());
                 new_input.push(*c);
                 *pending_query = Some(new_input);
                 *debounce_deadline = Some(Instant::now() + DEBOUNCE_DELAY);
@@ -122,9 +120,7 @@ fn handle_input_event(
             modifiers: KeyModifiers::NONE,
             ..
         }) => {
-            let mut new_input = pending_query
-                .take()
-                .unwrap_or_else(|| app.input.clone());
+            let mut new_input = pending_query.take().unwrap_or_else(|| app.input.clone());
             new_input.pop();
             *pending_query = Some(new_input);
             *debounce_deadline = Some(Instant::now() + DEBOUNCE_DELAY);
@@ -146,8 +142,17 @@ fn handle_event(app: &mut App, event: AppEvent) {
         if detail.pinned {
             if matches!(
                 event,
-                AppEvent::Key(KeyEvent { code: KeyCode::Esc, modifiers: KeyModifiers::NONE, ..
-} | KeyEvent { code: KeyCode::Char('q'), modifiers: KeyModifiers::NONE, .. })
+                AppEvent::Key(
+                    KeyEvent {
+                        code: KeyCode::Esc,
+                        modifiers: KeyModifiers::NONE,
+                        ..
+                    } | KeyEvent {
+                        code: KeyCode::Char('q'),
+                        modifiers: KeyModifiers::NONE,
+                        ..
+                    }
+                )
             ) {
                 app.close_detail();
             }
@@ -312,7 +317,11 @@ fn handle_space_key(app: &mut App, event: &AppEvent) {
     app.toggle_detail_pin();
     app.set_status(format!(
         "Detail {}",
-        if app.detail_pinned { "pinned" } else { "unpinned" }
+        if app.detail_pinned {
+            "pinned"
+        } else {
+            "unpinned"
+        }
     ));
 }
 
@@ -351,9 +360,23 @@ fn handle_mouse_event(app: &mut App, event: AppEvent) {
 
 fn handle_detail_event(app: &mut App, event: AppEvent) {
     match event {
-        AppEvent::Key(KeyEvent { code: KeyCode::Esc, modifiers: KeyModifiers::NONE, ..
-} | KeyEvent { code: KeyCode::Enter, modifiers: KeyModifiers::NONE, ..
-} | KeyEvent { code: KeyCode::Char('q'), modifiers: KeyModifiers::NONE, .. }) => {
+        AppEvent::Key(
+            KeyEvent {
+                code: KeyCode::Esc,
+                modifiers: KeyModifiers::NONE,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('q'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            },
+        ) => {
             app.close_detail();
         }
         AppEvent::Key(KeyEvent {
@@ -382,11 +405,12 @@ fn perform_search(app: &mut App, query: &str) {
     }
 
     if app.is_cache_valid(query)
-        && let Some(cached) = app.get_cached_results(query) {
-            app.set_results(cached.clone());
-            app.set_status(format!("Found {} result(s) (cached)", app.result_count()));
-            return;
-        }
+        && let Some(cached) = app.get_cached_results(query)
+    {
+        app.set_results(cached.clone());
+        app.set_status(format!("Found {} result(s) (cached)", app.result_count()));
+        return;
+    }
 
     app.is_searching = true;
 
@@ -414,10 +438,8 @@ fn perform_package_search(app: &mut App, query: &str) {
         return;
     }
 
-    let size_sort_unsupported = matches!(
-        app.search_sort,
-        SearchSort::SizeAsc | SearchSort::SizeDesc
-    );
+    let size_sort_unsupported =
+        matches!(app.search_sort, SearchSort::SizeAsc | SearchSort::SizeDesc);
     if size_sort_unsupported {
         app.set_status("Size sort is not available in package search mode".to_string());
     }

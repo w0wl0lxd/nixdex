@@ -26,25 +26,51 @@ impl AppEvent {
     pub fn is_quit(&self) -> bool {
         matches!(
             self,
-            Self::Key(KeyEvent {
-code: KeyCode::Char('c'), modifiers: KeyModifiers::CONTROL, .. } | KeyEvent {
-code: KeyCode::Char('q'), modifiers: KeyModifiers::NONE, .. })
+            Self::Key(
+                KeyEvent {
+                    code: KeyCode::Char('c'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } | KeyEvent {
+                    code: KeyCode::Char('q'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }
+            )
         )
     }
 
     pub fn is_up(&self) -> bool {
         matches!(
             self,
-            Self::Key(KeyEvent { code: KeyCode::Up, modifiers: KeyModifiers::NONE, .. } |
-KeyEvent { code: KeyCode::Char('k'), modifiers: KeyModifiers::NONE, .. })
+            Self::Key(
+                KeyEvent {
+                    code: KeyCode::Up,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                } | KeyEvent {
+                    code: KeyCode::Char('k'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }
+            )
         )
     }
 
     pub fn is_down(&self) -> bool {
         matches!(
             self,
-            Self::Key(KeyEvent { code: KeyCode::Down, modifiers: KeyModifiers::NONE, .. }
-| KeyEvent { code: KeyCode::Char('j'), modifiers: KeyModifiers::NONE, .. })
+            Self::Key(
+                KeyEvent {
+                    code: KeyCode::Down,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                } | KeyEvent {
+                    code: KeyCode::Char('j'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }
+            )
         )
     }
 
