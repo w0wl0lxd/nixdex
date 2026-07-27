@@ -1587,11 +1587,8 @@ async fn options_handler(
     }
 
     let matched = options_db.search(&params.pattern, params.case_sensitive);
-    let results: Vec<nixdex_options::OptionRecord> = matched
-        .into_iter()
-        .take(limit)
-        .cloned()
-        .collect();
+    let results: Vec<nixdex_options::OptionRecord> =
+        matched.into_iter().take(limit).cloned().collect();
 
     Ok(axum::Json(OptionsResponse {
         pattern: params.pattern,

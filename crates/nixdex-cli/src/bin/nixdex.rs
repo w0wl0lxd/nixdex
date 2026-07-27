@@ -531,13 +531,7 @@ fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
     let pattern = opts.pattern.join(" ");
 
     let matches = if opts.fuzzy {
-        db.search_fuzzy(
-            &pattern,
-            opts.field,
-            opts.case_sensitive,
-            sort,
-            opts.limit,
-        )
+        db.search_fuzzy(&pattern, opts.field, opts.case_sensitive, sort, opts.limit)
     } else {
         db.search(
             &pattern,
@@ -584,7 +578,8 @@ fn output_search_results(
     match opts.format {
         OutputFormat::Ndjson => {
             for record in matches {
-                let line = sonic_rs::to_string(record).wrap_err("failed to serialize search result")?;
+                let line =
+                    sonic_rs::to_string(record).wrap_err("failed to serialize search result")?;
                 println!("{line}");
             }
         }
@@ -604,14 +599,16 @@ fn output_search_results(
         }
         OutputFormat::Yaml => {
             for record in matches {
-                let yaml = serde_yaml::to_string(record).wrap_err("failed to serialize search result as YAML")?;
+                let yaml = serde_yaml::to_string(record)
+                    .wrap_err("failed to serialize search result as YAML")?;
                 println!("{yaml}");
             }
         }
         OutputFormat::Table => {
             if opts.json {
                 for record in matches {
-                    let line = sonic_rs::to_string(record).wrap_err("failed to serialize search result")?;
+                    let line = sonic_rs::to_string(record)
+                        .wrap_err("failed to serialize search result")?;
                     println!("{line}");
                 }
                 return Ok(());
@@ -915,14 +912,8 @@ async fn download_sidecars(
     config: &nixdex_core::prebuilt::PrebuiltConfig,
     dest_dir: &std::path::Path,
 ) {
-    log_sidecar_result(
-        download_history_sidecar(config, dest_dir).await,
-        "history",
-    );
-    log_sidecar_result(
-        download_options_sidecar(config, dest_dir).await,
-        "options",
-    );
+    log_sidecar_result(download_history_sidecar(config, dest_dir).await, "history");
+    log_sidecar_result(download_options_sidecar(config, dest_dir).await, "options");
 }
 
 fn log_sidecar_result(result: color_eyre::Result<()>, name: &str) {
@@ -1027,12 +1018,10 @@ async fn finalize_sidecar_download(
     dest: &std::path::Path,
     name: &str,
 ) -> color_eyre::Result<()> {
-    tokio::fs::rename(temp_path, dest)
-        .await
-        .map_err(|err| {
-            tracing::warn!(error = %err, "failed to atomically rename {} sidecar", name);
-            color_eyre::eyre::eyre!("failed to rename {} sidecar: {err}", name)
-        })?;
+    tokio::fs::rename(temp_path, dest).await.map_err(|err| {
+        tracing::warn!(error = %err, "failed to atomically rename {} sidecar", name);
+        color_eyre::eyre::eyre!("failed to rename {} sidecar: {err}", name)
+    })?;
     tracing::info!(path = %dest.display(), "downloaded {} sidecar", name);
     Ok(())
 }

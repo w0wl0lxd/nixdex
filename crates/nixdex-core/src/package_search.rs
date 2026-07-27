@@ -687,28 +687,32 @@ fn exact_relevance(
         }
         SearchField::Description => {
             if let Some(desc) = record.description.as_deref()
-                && value_equals(desc, pattern, case_sensitive) {
-                    score += 300;
-                }
+                && value_equals(desc, pattern, case_sensitive)
+            {
+                score += 300;
+            }
         }
         SearchField::MainProgram => {
             if let Some(main) = record.main_program.as_deref()
-                && value_equals(main, pattern, case_sensitive) {
-                    score += 300;
-                }
+                && value_equals(main, pattern, case_sensitive)
+            {
+                score += 300;
+            }
         }
         SearchField::Both => {
             if value_equals(&record.attr, pattern, case_sensitive) {
                 score += 3000;
             }
             if let Some(desc) = record.description.as_deref()
-                && value_equals(desc, pattern, case_sensitive) {
-                    score += 300;
-                }
+                && value_equals(desc, pattern, case_sensitive)
+            {
+                score += 300;
+            }
             if let Some(main) = record.main_program.as_deref()
-                && value_equals(main, pattern, case_sensitive) {
-                    score += 300;
-                }
+                && value_equals(main, pattern, case_sensitive)
+            {
+                score += 300;
+            }
         }
     }
     score

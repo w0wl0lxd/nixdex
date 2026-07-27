@@ -240,25 +240,24 @@ fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
     };
 
     // Determine if we can use the path index for rooted/prefix queries
-    let (exact_path, path_prefix) =
-        if !matches.regex && matches.at_root && !pattern.is_empty() {
-            // Normalize the pattern to ensure it starts with "/" for path index lookups
-            let normalized = if pattern.starts_with('/') {
-                pattern.clone()
-            } else {
-                format!("/{}", pattern)
-            };
-
-            if matches.whole_name {
-                // Pattern is anchored at end too, so it's an exact full path
-                (Some(normalized), None)
-            } else {
-                // Pattern may be a prefix; use prefix lookup
-                (None, Some(normalized))
-            }
+    let (exact_path, path_prefix) = if !matches.regex && matches.at_root && !pattern.is_empty() {
+        // Normalize the pattern to ensure it starts with "/" for path index lookups
+        let normalized = if pattern.starts_with('/') {
+            pattern.clone()
         } else {
-            (None, None)
+            format!("/{}", pattern)
         };
+
+        if matches.whole_name {
+            // Pattern is anchored at end too, so it's an exact full path
+            (Some(normalized), None)
+        } else {
+            // Pattern may be a prefix; use prefix lookup
+            (None, Some(normalized))
+        }
+    } else {
+        (None, None)
+    };
 
     let make_pattern = |s: &str, wrap: bool| {
         let body = if as_regex {

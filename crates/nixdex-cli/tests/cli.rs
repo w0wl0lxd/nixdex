@@ -251,13 +251,7 @@ fn locate_multi_word_without_quotes() {
 
     // Multiple positional args should be accepted (joined with spaces) rather
     // than rejected as "unexpected argument".
-    let output = run(&[
-        "locate",
-        "-d",
-        dir.path().to_str().unwrap(),
-        "bin",
-        "ls",
-    ]);
+    let output = run(&["locate", "-d", dir.path().to_str().unwrap(), "bin", "ls"]);
     assert!(
         output.status.success(),
         "nixdex locate with multi-word pattern should succeed: {output:?}"
@@ -333,7 +327,10 @@ fn search_multi_word_matches_quoted() {
         "friendly greeting",
     ]);
 
-    assert!(unquoted.status.success(), "unquoted search failed: {unquoted:?}");
+    assert!(
+        unquoted.status.success(),
+        "unquoted search failed: {unquoted:?}"
+    );
     assert!(quoted.status.success(), "quoted search failed: {quoted:?}");
 
     let unquoted_stdout = String::from_utf8_lossy(&unquoted.stdout);

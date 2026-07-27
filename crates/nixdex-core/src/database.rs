@@ -136,9 +136,10 @@ impl NgramCache {
             return;
         }
         if self.map.len() >= NGRAM_CACHE_CAPACITY
-            && let Some(oldest) = self.order.pop() {
-                self.map.remove(&oldest);
-            }
+            && let Some(oldest) = self.order.pop()
+        {
+            self.map.remove(&oldest);
+        }
         self.order.insert(0, key.clone());
         self.map.insert(key, value);
     }
@@ -2670,10 +2671,15 @@ fn resolve_ngram_ordinals_multi(
     let regex_prefix_str = regex_prefix.unwrap_or_else(|| "");
     #[allow(clippy::unnecessary_lazy_evaluations)]
     let regex_suffix_str = regex_suffix.unwrap_or_else(|| "");
-    let cache_key = format!("{}\0{}\0{}", literal_str, regex_prefix_str, regex_suffix_str);
+    let cache_key = format!(
+        "{}\0{}\0{}",
+        literal_str, regex_prefix_str, regex_suffix_str
+    );
 
     let cache = reader.ngram_cache();
-    let guard = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let guard = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(cached) = guard.get(&cache_key) {
         return Some((*cached).clone());
     }
@@ -2692,9 +2698,14 @@ fn resolve_ngram_ordinals_multi(
         });
     }
 
-    if let Some(ref bm) = result {
-        let mut guard = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.insert(cache_key, Arc::new(bm.clone()));
+    if result.is_some() {
+        drop(guard);
+        if let Some(ref bm) = result {
+            let mut guard = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.insert(cache_key, Arc::new(bm.clone()));
+        }
     }
 
     result
@@ -3190,7 +3201,9 @@ pub fn search_results_with_reader(
     // Selectivity estimation: count ngram candidates to guide fast-path
     // ordering. The path trigram fast path is most selective when candidates
     // are below the limit.
-    let ngram_candidate_count = ngram_ordinals.as_ref().map_or(0, roaring::RoaringBitmap::len);
+    let ngram_candidate_count = ngram_ordinals
+        .as_ref()
+        .map_or(0, roaring::RoaringBitmap::len);
 
     let package_ordinals: Option<RoaringBitmap> = match (base_ordinals, ngram_ordinals) {
         (Some(b), Some(ng)) => Some(b & &ng),

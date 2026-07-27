@@ -43,8 +43,7 @@ impl SearchDbCache {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Theme {
     CatppuccinMocha,
     Nord,
@@ -52,7 +51,6 @@ pub enum Theme {
     #[default]
     TokyoNight,
 }
-
 
 #[derive(Debug, Clone)]
 pub struct SearchResult {
