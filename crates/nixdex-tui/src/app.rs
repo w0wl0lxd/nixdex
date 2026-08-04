@@ -14,25 +14,36 @@ pub enum SearchMode {
 
 pub struct SearchDbCache {
     db: Option<SearchDb>,
+    path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for SearchDbCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SearchDbCache")
             .field("db", &self.db.is_some())
+            .field("path", &self.path)
             .finish()
     }
 }
 
 impl SearchDbCache {
     fn new() -> Self {
-        Self { db: None }
+        Self {
+            db: None,
+            path: None,
+        }
     }
 
     pub fn get_or_open(&mut self, sidecar: &Path) -> Result<&SearchDb, String> {
-        if self.db.is_none() {
+        let needs_open = self.db.is_none()
+            || self.path.as_deref() != Some(sidecar);
+
+        if needs_open {
             match SearchDb::open(sidecar) {
-                Ok(db) => self.db = Some(db),
+                Ok(db) => {
+                    self.db = Some(db);
+                    self.path = Some(sidecar.to_path_buf());
+                }
                 Err(err) => return Err(err.to_string()),
             }
         }
