@@ -170,6 +170,11 @@ fn handle_event(app: &mut App, event: AppEvent) {
 }
 
 fn handle_key_event(app: &mut App, event: AppEvent) {
+    if app.show_help {
+        app.show_help = false;
+        app.set_status(String::from("Help overlay closed"));
+        return;
+    }
     if event.is_quit() {
         app.set_status(String::from("Quitting..."));
         return;
@@ -525,7 +530,9 @@ fn perform_package_search(app: &mut App, query: &str) {
                 .collect();
             app.cache_results(query.to_string(), results.clone());
             app.set_results(results);
-            app.set_status(format!("Found {} result(s)", app.result_count()));
+            if !size_sort_unsupported {
+                app.set_status(format!("Found {} result(s)", app.result_count()));
+            }
         }
         Err(err) => {
             app.set_status(format!("Search error: {}", err));

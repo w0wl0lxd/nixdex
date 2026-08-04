@@ -3613,13 +3613,27 @@ fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
     // Check if sidecars are already up to date.
     if let Some(changed) = frame_hashes_diff(db_dir, &current_hashes)? {
         if changed.is_empty() {
-            let required_sidecars = [
+            let mut required_sidecars = vec![
                 crate::basename_index::NAMES_FILE,
                 crate::basename_index::POSTINGS_FILE,
+                crate::basename_index::FST_FILE,
                 crate::path_index::POSTINGS_FILE,
+                crate::path_index::FST_FILE,
                 "packages.json",
                 ATTRS_FILE,
             ];
+            if include_heavy {
+                required_sidecars.extend_from_slice(&[
+                    crate::entry_index::FST_FILE,
+                    crate::entry_index::POSTINGS_FILE,
+                    crate::path_entry_index::FST_FILE,
+                    crate::path_entry_index::ENTRIES_FILE,
+                    crate::path_trigram_index::FST_FILE,
+                    crate::path_trigram_index::POSTINGS_FILE,
+                    crate::ngram_index::FST_FILE,
+                    crate::ngram_index::POSTINGS_FILE,
+                ]);
+            }
             let missing: Vec<&str> = required_sidecars
                 .iter()
                 .filter(|name| !db_dir.join(name).exists())
@@ -3637,13 +3651,14 @@ fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
                 missing = ?missing,
                 "frame hashes unchanged but sidecar files missing; rebuilding"
             );
+        } else {
+            tracing::info!(
+                db_path = %db_path.display(),
+                changed_frames = changed.len(),
+                total_frames = reader.frames.len(),
+                "sidecar diff detected changed frames; rebuilding"
+            );
         }
-        tracing::info!(
-            db_path = %db_path.display(),
-            changed_frames = changed.len(),
-            total_frames = reader.frames.len(),
-            "sidecar diff detected changed frames; rebuilding"
-        );
     }
 
     // Scan all frames to extract package paths and build secondary indexes.

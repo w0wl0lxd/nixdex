@@ -935,7 +935,9 @@ async fn download_history_sidecar(
     };
     let url = format!("{}/{}", config.release_url, filename);
     let dest = dest_dir.join(nixdex_history::HISTORY_FILE);
-    download_sidecar_with_retry(&url, &dest, nixdex_history::HISTORY_MAGIC, "history").await
+    let max_bytes = 512 * 1024 * 1024; // MAX_HISTORY_BYTES
+    download_sidecar_with_retry(&url, &dest, nixdex_history::HISTORY_MAGIC, max_bytes, "history")
+        .await
 }
 
 async fn download_options_sidecar(
@@ -949,13 +951,16 @@ async fn download_options_sidecar(
     };
     let url = format!("{}/{}", config.release_url, filename);
     let dest = dest_dir.join(nixdex_options::OPTIONS_FILE);
-    download_sidecar_with_retry(&url, &dest, nixdex_options::OPTIONS_MAGIC, "options").await
+    let max_bytes = 1024 * 1024 * 1024; // MAX_OPTIONS_BYTES
+    download_sidecar_with_retry(&url, &dest, nixdex_options::OPTIONS_MAGIC, max_bytes, "options")
+        .await
 }
 
 async fn download_sidecar_with_retry(
     url: &str,
     dest: &std::path::Path,
     expected_magic: &[u8],
+    max_bytes: usize,
     name: &str,
 ) -> color_eyre::Result<()> {
     let client = reqwest::Client::builder()
@@ -969,7 +974,7 @@ async fn download_sidecar_with_retry(
     }
 
     let temp_path = sidecar_temp_path(dest);
-    retry_sidecar_download(&client, url, &temp_path, dest, expected_magic, name).await
+    retry_sidecar_download(&client, url, &temp_path, dest, expected_magic, max_bytes, name).await
 }
 
 fn sidecar_temp_path(dest: &std::path::Path) -> std::path::PathBuf {
@@ -985,11 +990,13 @@ async fn retry_sidecar_download(
     temp_path: &std::path::Path,
     dest: &std::path::Path,
     expected_magic: &[u8],
+    max_bytes: usize,
     name: &str,
 ) -> color_eyre::Result<()> {
     let mut last_err = None;
     for attempt in 1..=MAX_SIDECAR_RETRIES {
-        match download_sidecar_once(client, url, temp_path, expected_magic, name).await {
+        match download_sidecar_once(client, url, temp_path, expected_magic, max_bytes, name).await
+        {
             Ok(()) => match finalize_sidecar_download(temp_path, dest, name).await {
                 Ok(()) => return Ok(()),
                 Err(err) => last_err = Some(err),
@@ -1031,6 +1038,7 @@ async fn download_sidecar_once(
     url: &str,
     temp_path: &std::path::Path,
     expected_magic: &[u8],
+    max_bytes: usize,
     name: &str,
 ) -> color_eyre::Result<()> {
     let response = client
@@ -1047,10 +1055,34 @@ async fn download_sidecar_once(
         ));
     }
 
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|err| color_eyre::eyre::eyre!("failed to read {} sidecar: {err}", name))?;
+    // Check Content-Length header if present and reject if too large
+    if let Some(content_length) = response.content_length() {
+        if content_length > max_bytes as u64 {
+            return Err(color_eyre::eyre::eyre!(
+                "{} sidecar too large: Content-Length {} bytes exceeds limit of {} bytes",
+                name,
+                content_length,
+                max_bytes
+            ));
+        }
+    }
+
+    // Stream the response body with chunked reads to enforce size limit
+    use futures_util::StreamExt;
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .map_err(|err| color_eyre::eyre::eyre!("failed to read {} sidecar: {err}", name))?;
+        if bytes.len() + chunk.len() > max_bytes {
+            return Err(color_eyre::eyre::eyre!(
+                "{} sidecar too large: exceeds {} bytes during streaming",
+                name,
+                max_bytes
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
 
     let magic_slice = match bytes.get(..expected_magic.len()) {
         Some(slice) => slice,
