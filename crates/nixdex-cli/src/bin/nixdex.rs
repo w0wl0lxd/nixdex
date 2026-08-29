@@ -520,18 +520,10 @@ fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
 
     let db = SearchDb::open(&sidecar).wrap_err("failed to load package metadata sidecar")?;
 
-    let sort = if opts.reverse {
-        SearchSort::Reverse
-    } else {
-        opts.sort
-    };
-
-    let exclude_pattern = opts.exclude.as_deref().or(opts.exclude_regex.as_deref());
-
     let pattern = opts.pattern.join(" ");
 
     let matches = if opts.fuzzy {
-        db.search_fuzzy(&pattern, opts.field, opts.case_sensitive, sort, opts.limit)
+        db.search_fuzzy(&pattern, opts.field, opts.case_sensitive, opts.sort, opts.limit)
     } else {
         db.search(
             &pattern,
@@ -539,22 +531,45 @@ fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
             opts.field,
             opts.case_sensitive,
             opts.exact,
-            sort,
+            opts.sort,
             opts.limit,
         )
     }
     .wrap_err("search failed")?;
 
-    let matches: Vec<_> = if let Some(exclude) = exclude_pattern {
-        let regex = regex::Regex::new(exclude)
-            .wrap_err_with(|| format!("invalid exclude pattern: {exclude}"))?;
-        matches
-            .into_iter()
-            .filter(|r| !regex.is_match(&r.attr))
-            .collect()
-    } else {
-        matches
+    // `--exclude` is a literal substring match; `--exclude-regex` is a regex.
+    // Both are applied independently against the attr, name, and description.
+    let exclude_regex = match opts.exclude_regex.as_deref() {
+        Some(pat) => Some(
+            regex::Regex::new(pat)
+                .wrap_err_with(|| format!("invalid exclude-regex pattern: {pat}"))?,
+        ),
+        None => None,
     };
+    let exclude_literal = opts.exclude.as_deref();
+
+    let mut matches: Vec<_> = matches
+        .into_iter()
+        .filter(|r| {
+            let excluded_literal = exclude_literal.is_some_and(|lit| {
+                r.attr.contains(lit)
+                    || r.name.contains(lit)
+                    || r.description.as_deref().is_some_and(|d| d.contains(lit))
+            });
+            let excluded_regex = exclude_regex.as_ref().is_some_and(|re| {
+                re.is_match(&r.attr)
+                    || re.is_match(&r.name)
+                    || r.description.as_deref().is_some_and(|d| re.is_match(d))
+            });
+            !excluded_literal && !excluded_regex
+        })
+        .collect();
+
+    // `--reverse` inverts the requested sort order (or the natural order when no
+    // `--sort` is given) rather than replacing it.
+    if opts.reverse {
+        matches.reverse();
+    }
 
     if opts.count {
         println!("{}", matches.len());
