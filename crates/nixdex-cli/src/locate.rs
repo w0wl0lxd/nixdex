@@ -67,8 +67,11 @@ Limitations
 #[command(name = "nix-locate", author, about, version, after_long_help = LONG_USAGE)]
 pub struct Opts {
     /// Pattern for which to search.
-    #[arg(value_name = "PATTERN")]
-    pub pattern: String,
+    ///
+    /// Multiple arguments are joined with spaces, so `nix-locate claude code`
+    /// is equivalent to `nix-locate "claude code"`.
+    #[arg(value_name = "PATTERN", num_args = 1..)]
+    pub pattern: Vec<String>,
 
     /// Directory where the index is stored.
     #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
@@ -107,6 +110,10 @@ pub struct Opts {
     #[arg(long, value_enum, default_value = "auto")]
     pub color: Color,
 
+    /// Alias for `--color=never`.
+    #[arg(long)]
+    pub no_color: bool,
+
     /// Only print matches whose basename matches PATTERN exactly.
     #[arg(short = 'w', long)]
     pub whole_name: bool,
@@ -123,6 +130,10 @@ pub struct Opts {
     /// human-readable format.
     #[arg(long)]
     pub json: bool,
+
+    /// Output results as YAML documents.
+    #[arg(long)]
+    pub yaml: bool,
 
     /// Maximum number of results to print.
     #[arg(short, long)]
@@ -153,6 +164,15 @@ pub struct Opts {
     #[arg(long, short = '0', alias = "print0")]
     pub null_output: bool,
 
+    /// Suppress all non-error output.
+    #[arg(long)]
+    pub quiet: bool,
+
+    /// Show expanded metadata (description, license, homepage, maintainers)
+    /// alongside the standard locate output.
+    #[arg(long)]
+    pub details: bool,
+
     /// Read multiple search patterns from stdin (one per line) and
     /// process them in a single invocation, reusing the DB handle.
     #[arg(long)]
@@ -178,6 +198,7 @@ struct ProcessedArgs {
     file_type: Vec<FileType>,
     mode: SearchMode,
     json: bool,
+    yaml: bool,
     limit: Option<usize>,
     count: bool,
     sort: nixdex_core::database::SearchSort,
@@ -185,28 +206,31 @@ struct ProcessedArgs {
     max_size: Option<u64>,
     exclude_fhs: bool,
     null_output: bool,
+    quiet: bool,
+    details: bool,
 }
 
 fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
+    let pattern = matches.pattern.join(" ");
     let start_anchor = if matches.at_root { "^" } else { "" };
     let end_anchor = if matches.whole_name { "$" } else { "" };
     let as_regex = matches.regex;
 
     // Plain (non-anchored, non-regex) patterns can use a fast substring search.
     let literal_pattern =
-        if matches.regex || matches.at_root || matches.whole_name || matches.pattern.is_empty() {
+        if matches.regex || matches.at_root || matches.whole_name || pattern.is_empty() {
             None
         } else {
-            Some(matches.pattern.clone())
+            Some(pattern.clone())
         };
 
-    let exact_basename = if !matches.regex && matches.whole_name && !matches.pattern.is_empty() {
+    let exact_basename = if !matches.regex && matches.whole_name && !pattern.is_empty() {
         // The FST is an exact-basename index. It is only safe to use when the
         // whole-name pattern is anchored to a final path component (contains a
         // '/'); otherwise the regex `ls$` would also match basenames like
         // `als` and `xls`, which the FST lookup `ls` would omit.
-        let base = nixdex_core::basename_index::basename_of(matches.pattern.as_bytes());
-        if matches.pattern.contains('/') && !base.is_empty() {
+        let base = nixdex_core::basename_index::basename_of(pattern.as_bytes());
+        if pattern.contains('/') && !base.is_empty() {
             Some(String::from_utf8_lossy(base).into_owned())
         } else {
             None
@@ -216,25 +240,24 @@ fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
     };
 
     // Determine if we can use the path index for rooted/prefix queries
-    let (exact_path, path_prefix) =
-        if !matches.regex && matches.at_root && !matches.pattern.is_empty() {
-            // Normalize the pattern to ensure it starts with "/" for path index lookups
-            let normalized = if matches.pattern.starts_with('/') {
-                matches.pattern.clone()
-            } else {
-                format!("/{}", matches.pattern)
-            };
-
-            if matches.whole_name {
-                // Pattern is anchored at end too, so it's an exact full path
-                (Some(normalized), None)
-            } else {
-                // Pattern may be a prefix; use prefix lookup
-                (None, Some(normalized))
-            }
+    let (exact_path, path_prefix) = if !matches.regex && matches.at_root && !pattern.is_empty() {
+        // Normalize the pattern to ensure it starts with "/" for path index lookups
+        let normalized = if pattern.starts_with('/') {
+            pattern.clone()
         } else {
-            (None, None)
+            format!("/{}", pattern)
         };
+
+        if matches.whole_name {
+            // Pattern is anchored at end too, so it's an exact full path
+            (Some(normalized), None)
+        } else {
+            // Pattern may be a prefix; use prefix lookup
+            (None, Some(normalized))
+        }
+    } else {
+        (None, None)
+    };
 
     let make_pattern = |s: &str, wrap: bool| {
         let body = if as_regex {
@@ -249,13 +272,17 @@ fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
         }
     };
 
-    let pattern = make_pattern(&matches.pattern, true);
+    let pattern = make_pattern(&pattern, true);
     let package_pattern = matches.package.as_deref().map(|p| make_pattern(p, false));
 
-    let color = match matches.color {
-        Color::Auto => std::io::stdout().is_terminal(),
-        Color::Always => true,
-        Color::Never => false,
+    let color = if matches.no_color {
+        false
+    } else {
+        match matches.color {
+            Color::Auto => std::io::stdout().is_terminal(),
+            Color::Always => true,
+            Color::Never => false,
+        }
     };
 
     let file_type = match matches.r#type {
@@ -291,6 +318,7 @@ fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
         file_type,
         mode,
         json: matches.json,
+        yaml: matches.yaml,
         limit: matches.limit,
         count: matches.count,
         sort,
@@ -298,6 +326,8 @@ fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
         max_size: matches.max_size,
         exclude_fhs: matches.exclude_fhs,
         null_output: matches.null_output,
+        quiet: matches.quiet,
+        details: matches.details,
     })
 }
 
@@ -325,6 +355,7 @@ pub async fn run(matches: Opts) -> color_eyre::Result<()> {
             file_type: &args.file_type,
             mode: args.mode,
             json: args.json,
+            yaml: args.yaml,
             limit: args.limit,
             count: args.count,
             sort: args.sort,
@@ -332,6 +363,8 @@ pub async fn run(matches: Opts) -> color_eyre::Result<()> {
             max_size: args.max_size,
             exclude_fhs: args.exclude_fhs,
             null_output: args.null_output,
+            quiet: args.quiet,
+            details: args.details,
         };
         let patterns = read_batch_patterns()?;
         nixdex_core::search_database_batch(&options, &patterns).wrap_err("nix-locate failed")?;
@@ -366,6 +399,7 @@ pub async fn run(matches: Opts) -> color_eyre::Result<()> {
         file_type: &args.file_type,
         mode: args.mode,
         json: args.json,
+        yaml: args.yaml,
         limit: args.limit,
         count: args.count,
         sort: args.sort,
@@ -373,6 +407,8 @@ pub async fn run(matches: Opts) -> color_eyre::Result<()> {
         max_size: args.max_size,
         exclude_fhs: args.exclude_fhs,
         null_output: args.null_output,
+        quiet: args.quiet,
+        details: args.details,
     };
 
     nixdex_core::search_database(&options).wrap_err("nix-locate failed")?;
@@ -403,16 +439,21 @@ async fn locate_via_daemon(opts: &Opts) -> Result<Vec<String>, crate::daemon_cli
     let response = client.locate(&query).await?;
     Ok(crate::daemon_client::render(
         &response,
-        opts.json,
-        opts.minimal,
-        opts.null_output,
+        &crate::daemon_client::RenderOpts {
+            json: opts.json,
+            yaml: opts.yaml,
+            minimal: opts.minimal,
+            null_output: opts.null_output,
+            quiet: opts.quiet,
+            details: opts.details,
+        },
     ))
 }
 
 /// Build the `/nix-locate` query parameters from the CLI options.
 fn daemon_query(opts: &Opts) -> Vec<(String, String)> {
     let mut q: Vec<(String, String)> = vec![
-        ("pattern".into(), opts.pattern.clone()),
+        ("pattern".into(), opts.pattern.join(" ")),
         ("regex".into(), opts.regex.to_string()),
         ("at_root".into(), opts.at_root.to_string()),
         ("whole_name".into(), opts.whole_name.to_string()),
@@ -420,6 +461,8 @@ fn daemon_query(opts: &Opts) -> Vec<(String, String)> {
         ("count".into(), opts.count.to_string()),
         ("exclude_fhs".into(), opts.exclude_fhs.to_string()),
         ("null".into(), opts.null_output.to_string()),
+        ("quiet".into(), opts.quiet.to_string()),
+        ("details".into(), opts.details.to_string()),
     ];
     if let Some(p) = &opts.package {
         q.push(("package".into(), p.clone()));

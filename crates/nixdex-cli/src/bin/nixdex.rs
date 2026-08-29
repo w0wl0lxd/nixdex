@@ -2,6 +2,7 @@
 //! and description from the `packages.json` sidecar.
 
 use std::io::IsTerminal;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -10,8 +11,10 @@ use clap_complete::{Shell, generate, generate_to};
 use color_eyre::eyre::WrapErr;
 use tracing_subscriber::EnvFilter;
 
-use nixdex_cli::{index, locate};
+use nixdex_cli::{index, locate, tui};
 use nixdex_core::package_search::{SearchDb, SearchField, SearchSort};
+use nixdex_history::HistoryDb;
+use nixdex_options::OptionsDb;
 
 /// Detect which comma command is available on `$PATH` ("," or "comma").
 /// Returns the detected command token, or `None` if neither is available.
@@ -83,6 +86,10 @@ enum Cmd {
     Search(SearchOpts),
     /// Show metadata for a single attribute.
     Info(InfoOpts),
+    /// Show version history for a package attribute.
+    History(HistoryOpts),
+    /// Search NixOS module options.
+    Options(OptionsOpts),
     /// Print database statistics and sidecar status.
     Stats(StatsOpts),
     /// Generate shell completions.
@@ -103,8 +110,12 @@ enum Cmd {
     Update(UpdateOpts),
     /// Generate sidecar indexes for an existing `files` database.
     GenerateSidecars(GenerateSidecarsOpts),
+    /// Check which sidecars need rebuilding after a database update.
+    SidecarDiff(SidecarDiffOpts),
     /// Print a command-not-found hint for a missing command.
     CommandNotFound(CommandNotFoundOpts),
+    /// Run the interactive TUI.
+    Tui(tui::TuiOpts),
     /// Run the background daemon (alias for `nixdex-daemon`).
     Daemon(DaemonOpts),
 }
@@ -114,8 +125,11 @@ enum Cmd {
 #[command(author, about, version)]
 struct SearchOpts {
     /// Pattern for which to search.
-    #[arg(value_name = "PATTERN")]
-    pattern: String,
+    ///
+    /// Multiple arguments are joined with spaces, so `nixdex search claude code`
+    /// is equivalent to `nixdex search "claude code"`.
+    #[arg(value_name = "PATTERN", num_args = 1..)]
+    pattern: Vec<String>,
 
     /// Directory where the index is stored.
     #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
@@ -164,9 +178,46 @@ struct SearchOpts {
     #[arg(long)]
     json: bool,
 
+    /// Stream results as they are found, flushing after each line.
+    #[arg(long)]
+    stream: bool,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    format: OutputFormat,
+
     /// Whether to use colors in output.
     #[arg(long, value_enum, default_value = "auto")]
     color: Color,
+
+    /// Alias for `--color=never`.
+    #[arg(long)]
+    no_color: bool,
+
+    /// Exclude results matching PATTERN.
+    #[arg(long)]
+    exclude: Option<String>,
+
+    /// Exclude results matching REGEX pattern.
+    #[arg(long)]
+    exclude_regex: Option<String>,
+
+    /// Reverse the sort order.
+    #[arg(long)]
+    reverse: bool,
+}
+
+/// Output format for search results.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum OutputFormat {
+    /// Human-readable tabular format.
+    Table,
+    /// NDJSON (one JSON object per line).
+    Ndjson,
+    /// CSV format.
+    Csv,
+    /// YAML format.
+    Yaml,
 }
 
 /// Show metadata for a single package attribute.
@@ -180,6 +231,51 @@ struct InfoOpts {
     /// Directory where the index is stored.
     #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
     database: PathBuf,
+
+    /// Print the result as JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Show version history for a package attribute.
+#[derive(Debug, Parser)]
+#[command(author, about, version)]
+struct HistoryOpts {
+    /// Attribute path to look up.
+    #[arg(value_name = "ATTR")]
+    attr: String,
+
+    /// Directory where the index is stored.
+    #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
+    database: PathBuf,
+
+    /// Print the result as JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Search NixOS module options.
+#[derive(Debug, Parser)]
+#[command(author, about, version)]
+struct OptionsOpts {
+    /// Search pattern.
+    ///
+    /// Multiple arguments are joined with spaces, so `nixdex options claude code`
+    /// is equivalent to `nixdex options "claude code"`.
+    #[arg(value_name = "PATTERN", num_args = 1..)]
+    pattern: Vec<String>,
+
+    /// Directory where the index is stored.
+    #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
+    database: PathBuf,
+
+    /// Match case-sensitively.
+    #[arg(long)]
+    case_sensitive: bool,
+
+    /// Maximum number of results.
+    #[arg(short, long)]
+    limit: Option<usize>,
 
     /// Print the result as JSON.
     #[arg(long)]
@@ -293,6 +389,15 @@ struct GenerateSidecarsOpts {
     database: PathBuf,
 }
 
+/// Options for `nixdex sidecar diff`.
+#[derive(Debug, Parser)]
+#[command(author, about, version)]
+struct SidecarDiffOpts {
+    /// Directory where the index is stored.
+    #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
+    database: PathBuf,
+}
+
 /// Options for `nixdex command-not-found`.
 #[derive(Debug, Parser)]
 #[command(author, about, version)]
@@ -324,6 +429,15 @@ struct CommandNotFoundOpts {
     /// Output the suggestion as JSON.
     #[arg(long)]
     json: bool,
+}
+
+/// Options for `nixdex tui`.
+#[derive(Debug, Parser)]
+#[command(author, about, version)]
+struct TuiOpts {
+    /// Directory where the index is stored.
+    #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
+    database: PathBuf,
 }
 
 /// Options for running the background daemon.
@@ -405,17 +519,14 @@ fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
     }
 
     let db = SearchDb::open(&sidecar).wrap_err("failed to load package metadata sidecar")?;
+
+    let pattern = opts.pattern.join(" ");
+
     let matches = if opts.fuzzy {
-        db.search_fuzzy(
-            &opts.pattern,
-            opts.field,
-            opts.case_sensitive,
-            opts.sort,
-            opts.limit,
-        )
+        db.search_fuzzy(&pattern, opts.field, opts.case_sensitive, opts.sort, opts.limit)
     } else {
         db.search(
-            &opts.pattern,
+            &pattern,
             opts.regex,
             opts.field,
             opts.case_sensitive,
@@ -426,36 +537,119 @@ fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
     }
     .wrap_err("search failed")?;
 
+    // `--exclude` is a literal substring match; `--exclude-regex` is a regex.
+    // Both are applied independently against the attr, name, and description.
+    let exclude_regex = match opts.exclude_regex.as_deref() {
+        Some(pat) => Some(
+            regex::Regex::new(pat)
+                .wrap_err_with(|| format!("invalid exclude-regex pattern: {pat}"))?,
+        ),
+        None => None,
+    };
+    let exclude_literal = opts.exclude.as_deref();
+
+    let mut matches: Vec<_> = matches
+        .into_iter()
+        .filter(|r| {
+            let excluded_literal = exclude_literal.is_some_and(|lit| {
+                r.attr.contains(lit)
+                    || r.name.contains(lit)
+                    || r.description.as_deref().is_some_and(|d| d.contains(lit))
+            });
+            let excluded_regex = exclude_regex.as_ref().is_some_and(|re| {
+                re.is_match(&r.attr)
+                    || re.is_match(&r.name)
+                    || r.description.as_deref().is_some_and(|d| re.is_match(d))
+            });
+            !excluded_literal && !excluded_regex
+        })
+        .collect();
+
+    // `--reverse` inverts the requested sort order (or the natural order when no
+    // `--sort` is given) rather than replacing it.
+    if opts.reverse {
+        matches.reverse();
+    }
+
     if opts.count {
         println!("{}", matches.len());
         return Ok(());
     }
 
-    if opts.json {
-        for record in matches {
-            let line = sonic_rs::to_string(record).wrap_err("failed to serialize search result")?;
-            println!("{line}");
-        }
-        return Ok(());
-    }
+    let use_color = if opts.no_color {
+        false
+    } else {
+        opts.color.use_color()
+    };
 
-    let use_color = opts.color.use_color();
-    for record in matches {
-        let desc = record.description.as_deref().map_or("—", |d| d);
-        if opts.name_only {
-            println!("{}", record.attr);
-        } else if use_color {
-            println!(
-                "{}\t{}\t{}",
-                colored(record.attr.as_str(), "1;32"),
-                colored(record.name.as_str(), "1"),
-                desc
-            );
-        } else {
-            println!("{}\t{}\t{}", record.attr, record.name, desc);
+    output_search_results(&matches, &opts, use_color)
+}
+
+fn output_search_results(
+    matches: &[&nixdex_core::nixpkgs::PackageMeta],
+    opts: &SearchOpts,
+    use_color: bool,
+) -> color_eyre::Result<()> {
+    match opts.format {
+        OutputFormat::Ndjson => {
+            for record in matches {
+                let line =
+                    sonic_rs::to_string(record).wrap_err("failed to serialize search result")?;
+                println!("{line}");
+            }
+        }
+        OutputFormat::Csv => {
+            println!("attr,name,description,main_program");
+            for record in matches {
+                let desc = record.description.as_deref().map_or("", |d| d);
+                let main = record.main_program.as_deref().map_or("", |m| m);
+                println!(
+                    "{},{},{},{}",
+                    csv_escape(&record.attr),
+                    csv_escape(&record.name),
+                    csv_escape(desc),
+                    csv_escape(main),
+                );
+            }
+        }
+        OutputFormat::Yaml => {
+            for record in matches {
+                let yaml = serde_yaml::to_string(record)
+                    .wrap_err("failed to serialize search result as YAML")?;
+                println!("{yaml}");
+            }
+        }
+        OutputFormat::Table => {
+            if opts.json {
+                for record in matches {
+                    let line = sonic_rs::to_string(record)
+                        .wrap_err("failed to serialize search result")?;
+                    println!("{line}");
+                }
+                return Ok(());
+            }
+            for record in matches {
+                let desc = record.description.as_deref().map_or("—", |d| d);
+                if opts.name_only {
+                    println!("{}", record.attr);
+                } else if use_color {
+                    println!(
+                        "{}\t{}\t{}",
+                        colored(record.attr.as_str(), "1;32"),
+                        colored(record.name.as_str(), "1"),
+                        desc
+                    );
+                } else {
+                    println!("{}\t{}\t{}", record.attr, record.name, desc);
+                }
+                if opts.stream {
+                    std::io::stdout()
+                        .flush()
+                        .wrap_err("failed to flush stdout")?;
+                }
+            }
         }
     }
-
     Ok(())
 }
 
@@ -502,6 +696,80 @@ fn run_info(opts: InfoOpts) -> color_eyre::Result<()> {
     Ok(())
 }
 
+fn run_history(opts: HistoryOpts) -> color_eyre::Result<()> {
+    let history_file = opts.database.join("files.history");
+    if !history_file.exists() {
+        color_eyre::eyre::bail!(
+            "no version history sidecar found at {}. Run `nix-index` first.",
+            history_file.display()
+        );
+    }
+
+    let db = HistoryDb::open(&opts.database).wrap_err("failed to load history sidecar")?;
+    let versions = db.lookup_attr(&opts.attr);
+
+    if versions.is_empty() {
+        color_eyre::eyre::bail!("no version history found for attr {}", opts.attr);
+    }
+
+    if opts.json {
+        println!(
+            "{}",
+            sonic_rs::to_string(&versions).wrap_err("failed to serialize history")?
+        );
+    } else {
+        println!("{}:", opts.attr);
+        for entry in &versions {
+            println!("  {}  {}  {}", entry.version, entry.commit, entry.date);
+        }
+    }
+
+    Ok(())
+}
+
+fn run_options(opts: OptionsOpts) -> color_eyre::Result<()> {
+    let options_file = opts.database.join("files.options");
+    if !options_file.exists() {
+        color_eyre::eyre::bail!(
+            "no options sidecar found at {}. Run `nix-index --options` first.",
+            options_file.display()
+        );
+    }
+
+    let db = OptionsDb::open(&opts.database).wrap_err("failed to load options sidecar")?;
+    let pattern = opts.pattern.join(" ");
+    let mut results = db.search(&pattern, opts.case_sensitive);
+
+    if let Some(limit) = opts.limit {
+        results.truncate(limit);
+    }
+
+    if opts.json {
+        println!(
+            "{}",
+            sonic_rs::to_string(&results).wrap_err("failed to serialize options results")?
+        );
+    } else {
+        for record in &results {
+            println!("{}:", record.attr);
+            println!("  type: {}", record.r#type);
+            if let Some(desc) = record.description.strip_prefix("| ") {
+                println!("  description: {desc}");
+            } else {
+                println!("  description: {}", record.description);
+            }
+            if let Some(default) = &record.default {
+                println!("  default: {default}");
+            }
+            if let Some(example) = &record.example {
+                println!("  example: {example}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn run_stats(opts: StatsOpts) -> color_eyre::Result<()> {
     let files = opts.database.join("files");
     if !files.is_file() {
@@ -522,6 +790,8 @@ fn run_stats(opts: StatsOpts) -> color_eyre::Result<()> {
         "files.path.fst",
         "files.path.postings",
         "files.attrs",
+        "files.history",
+        "files.options",
         "packages.json",
     ];
     let mut sidecar_sizes = std::collections::BTreeMap::new();
@@ -624,6 +894,14 @@ fn format_which_attr(store_path: &nixdex_core::StorePath) -> String {
     attr
 }
 
+fn csv_escape(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
 async fn run_update(opts: UpdateOpts) -> color_eyre::Result<()> {
     let config = nixdex_core::prebuilt::PrebuiltConfig {
         release_url: opts.release_url,
@@ -639,7 +917,205 @@ async fn run_update(opts: UpdateOpts) -> color_eyre::Result<()> {
         .await
         .wrap_err("failed to download prebuilt index")?;
 
+    download_sidecars(&config, &opts.database).await;
+
     println!("updated index at {}", opts.database.display());
+    Ok(())
+}
+
+async fn download_sidecars(
+    config: &nixdex_core::prebuilt::PrebuiltConfig,
+    dest_dir: &std::path::Path,
+) {
+    log_sidecar_result(download_history_sidecar(config, dest_dir).await, "history");
+    log_sidecar_result(download_options_sidecar(config, dest_dir).await, "options");
+}
+
+fn log_sidecar_result(result: color_eyre::Result<()>, name: &str) {
+    if let Err(err) = result {
+        tracing::warn!(error = %err, "failed to download {} sidecar", name);
+    }
+}
+
+const MAX_SIDECAR_RETRIES: usize = 3;
+
+async fn download_history_sidecar(
+    config: &nixdex_core::prebuilt::PrebuiltConfig,
+    dest_dir: &std::path::Path,
+) -> color_eyre::Result<()> {
+    let filename = if config.small {
+        format!("index-{}-small.history", config.architecture)
+    } else {
+        format!("index-{}.history", config.architecture)
+    };
+    let url = format!("{}/{}", config.release_url, filename);
+    let dest = dest_dir.join(nixdex_history::HISTORY_FILE);
+    let max_bytes = 512 * 1024 * 1024; // MAX_HISTORY_BYTES
+    download_sidecar_with_retry(&url, &dest, nixdex_history::HISTORY_MAGIC, max_bytes, "history")
+        .await
+}
+
+async fn download_options_sidecar(
+    config: &nixdex_core::prebuilt::PrebuiltConfig,
+    dest_dir: &std::path::Path,
+) -> color_eyre::Result<()> {
+    let filename = if config.small {
+        format!("index-{}-small.options", config.architecture)
+    } else {
+        format!("index-{}.options", config.architecture)
+    };
+    let url = format!("{}/{}", config.release_url, filename);
+    let dest = dest_dir.join(nixdex_options::OPTIONS_FILE);
+    let max_bytes = 1024 * 1024 * 1024; // MAX_OPTIONS_BYTES
+    download_sidecar_with_retry(&url, &dest, nixdex_options::OPTIONS_MAGIC, max_bytes, "options")
+        .await
+}
+
+async fn download_sidecar_with_retry(
+    url: &str,
+    dest: &std::path::Path,
+    expected_magic: &[u8],
+    max_bytes: usize,
+    name: &str,
+) -> color_eyre::Result<()> {
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("nixdex/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|err| color_eyre::eyre::eyre!("failed to build HTTP client: {err}"))?;
+
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let temp_path = sidecar_temp_path(dest);
+    retry_sidecar_download(&client, url, &temp_path, dest, expected_magic, max_bytes, name).await
+}
+
+fn sidecar_temp_path(dest: &std::path::Path) -> std::path::PathBuf {
+    let ext = dest
+        .extension()
+        .map_or_else(String::new, |e| e.to_string_lossy().to_string());
+    dest.with_extension(format!("{ext}.tmp"))
+}
+
+async fn retry_sidecar_download(
+    client: &reqwest::Client,
+    url: &str,
+    temp_path: &std::path::Path,
+    dest: &std::path::Path,
+    expected_magic: &[u8],
+    max_bytes: usize,
+    name: &str,
+) -> color_eyre::Result<()> {
+    let mut last_err = None;
+    for attempt in 1..=MAX_SIDECAR_RETRIES {
+        match download_sidecar_once(client, url, temp_path, expected_magic, max_bytes, name).await
+        {
+            Ok(()) => match finalize_sidecar_download(temp_path, dest, name).await {
+                Ok(()) => return Ok(()),
+                Err(err) => last_err = Some(err),
+            },
+            Err(err) => {
+                tracing::warn!(error = %err, attempt, "failed to download {} sidecar", name);
+                last_err = Some(err);
+                if attempt < MAX_SIDECAR_RETRIES {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+
+    match last_err {
+        Some(err) => Err(err),
+        None => Err(color_eyre::eyre::eyre!(
+            "failed to download {} sidecar after {MAX_SIDECAR_RETRIES} attempts",
+            name
+        )),
+    }
+}
+
+async fn finalize_sidecar_download(
+    temp_path: &std::path::Path,
+    dest: &std::path::Path,
+    name: &str,
+) -> color_eyre::Result<()> {
+    tokio::fs::rename(temp_path, dest).await.map_err(|err| {
+        tracing::warn!(error = %err, "failed to atomically rename {} sidecar", name);
+        color_eyre::eyre::eyre!("failed to rename {} sidecar: {err}", name)
+    })?;
+    tracing::info!(path = %dest.display(), "downloaded {} sidecar", name);
+    Ok(())
+}
+
+async fn download_sidecar_once(
+    client: &reqwest::Client,
+    url: &str,
+    temp_path: &std::path::Path,
+    expected_magic: &[u8],
+    max_bytes: usize,
+    name: &str,
+) -> color_eyre::Result<()> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|err| color_eyre::eyre::eyre!("failed to download {} sidecar: {err}", name))?;
+
+    if !response.status().is_success() {
+        return Err(color_eyre::eyre::eyre!(
+            "failed to download {} sidecar: HTTP {}",
+            name,
+            response.status()
+        ));
+    }
+
+    // Check Content-Length header if present and reject if too large
+    if let Some(content_length) = response.content_length() {
+        if content_length > max_bytes as u64 {
+            return Err(color_eyre::eyre::eyre!(
+                "{} sidecar too large: Content-Length {} bytes exceeds limit of {} bytes",
+                name,
+                content_length,
+                max_bytes
+            ));
+        }
+    }
+
+    // Stream the response body with chunked reads to enforce size limit
+    use futures_util::StreamExt;
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .map_err(|err| color_eyre::eyre::eyre!("failed to read {} sidecar: {err}", name))?;
+        if bytes.len() + chunk.len() > max_bytes {
+            return Err(color_eyre::eyre::eyre!(
+                "{} sidecar too large: exceeds {} bytes during streaming",
+                name,
+                max_bytes
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+
+    let magic_slice = match bytes.get(..expected_magic.len()) {
+        Some(slice) => slice,
+        None => &[],
+    };
+    if bytes.len() < expected_magic.len() || magic_slice != expected_magic {
+        return Err(color_eyre::eyre::eyre!(
+            "{} sidecar magic mismatch: expected {:?}, got {:?}",
+            name,
+            expected_magic,
+            magic_slice
+        ));
+    }
+
+    tokio::fs::write(temp_path, &bytes).await.map_err(|err| {
+        color_eyre::eyre::eyre!("failed to write {} sidecar to temp file: {err}", name)
+    })?;
+
     Ok(())
 }
 
@@ -648,6 +1124,29 @@ fn run_generate_sidecars(opts: GenerateSidecarsOpts) -> color_eyre::Result<()> {
     nixdex_core::generate_sidecars(&files)
         .wrap_err_with(|| format!("failed to generate sidecars for {}", files.display()))?;
     println!("generated sidecars for {}", opts.database.display());
+    Ok(())
+}
+
+fn run_sidecar_diff(opts: SidecarDiffOpts) -> color_eyre::Result<()> {
+    let files = opts.database.join("files");
+    let diff = nixdex_core::sidecar_diff(&files)
+        .wrap_err_with(|| format!("failed to check sidecar diff for {}", files.display()))?;
+
+    match diff {
+        None => {
+            println!("no stored frame hashes found; full sidecar rebuild needed");
+        }
+        Some(changed) if changed.is_empty() => {
+            println!("all sidecars are up to date");
+        }
+        Some(changed) => {
+            println!("{} frame(s) need sidecar rebuild:", changed.len());
+            for idx in changed {
+                println!("  frame {idx}");
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1163,7 +1662,7 @@ struct Opts {
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
-    color_eyre::install()?;
+    let _ = color_eyre::install();
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
@@ -1175,6 +1674,8 @@ async fn main() -> color_eyre::Result<()> {
     match opts.cmd {
         Cmd::Search(search_opts) => run_search(search_opts),
         Cmd::Info(info_opts) => run_info(info_opts),
+        Cmd::History(history_opts) => run_history(history_opts),
+        Cmd::Options(options_opts) => run_options(options_opts),
         Cmd::Stats(stats_opts) => run_stats(stats_opts),
         Cmd::Completions(opts) => {
             run_completions(opts);
@@ -1187,7 +1688,12 @@ async fn main() -> color_eyre::Result<()> {
         Cmd::Which(which_opts) => run_which(which_opts),
         Cmd::Update(update_opts) => run_update(update_opts).await,
         Cmd::GenerateSidecars(opts) => run_generate_sidecars(opts),
+        Cmd::SidecarDiff(opts) => run_sidecar_diff(opts),
         Cmd::CommandNotFound(opts) => run_command_not_found(opts),
+        Cmd::Tui(tui_opts) => {
+            tui::run_tui(tui_opts.database).await?;
+            Ok(())
+        }
         Cmd::Daemon(daemon_opts) => run_daemon(daemon_opts).await,
     }
 }

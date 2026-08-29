@@ -10,10 +10,12 @@
 //! Optional secondary index (nixdex): basename FST sidecars next to `files`
 //! (see [`crate::basename_index`]).
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io;
 use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use byteorder::{LittleEndian, WriteBytesExt};
 use grep::matcher::{LineMatchKind, Matcher, NoError};
@@ -24,6 +26,7 @@ use rayon::prelude::*;
 use regex::bytes::{Regex, RegexBuilder};
 use regex_syntax::ast::{AssertionKind, Ast, LiteralKind};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sonic_rs;
 use thiserror::Error;
 
@@ -82,11 +85,65 @@ const ATTRS_VERSION: u32 = 1;
 /// Maximum size of the attrs sidecar (defensive cap).
 const MAX_ATTRS_BYTES: usize = 1024 * 1024 * 1024;
 
+/// Frame hashes sidecar filename for incremental builds.
+const FRAME_HASHES_FILE: &str = "files.frame_hashes";
+
+/// Magic for the frame hashes sidecar.
+const FRAME_HASHES_MAGIC: &[u8] = b"NFHS";
+
+/// Frame hashes sidecar version.
+const FRAME_HASHES_VERSION: u32 = 1;
+
 /// Defensive cap on the number of v2 frames (seek table entries).
 const MAX_FRAME_COUNT: usize = 1024 * 1024;
 
 /// Defensive cap on the on-disk database file size.
 const MAX_DATABASE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Maximum number of entries in the ngram result cache.
+const NGRAM_CACHE_CAPACITY: usize = 256;
+
+/// A bounded LRU cache for ngram candidate bitmaps.
+///
+/// Uses a `BTreeMap` for O(log n) lookups and a `Vec` to track insertion order
+/// for eviction. When the cache exceeds its capacity, the oldest entry is
+/// removed.
+#[derive(Debug)]
+struct NgramCache {
+    map: BTreeMap<String, Arc<RoaringBitmap>>,
+    order: Vec<String>,
+}
+
+impl NgramCache {
+    fn new() -> Self {
+        Self {
+            map: BTreeMap::new(),
+            order: Vec::with_capacity(NGRAM_CACHE_CAPACITY),
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<Arc<RoaringBitmap>> {
+        self.map.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: String, value: Arc<RoaringBitmap>) {
+        if self.map.contains_key(&key) {
+            self.map.insert(key.clone(), value);
+            if let Some(pos) = self.order.iter().position(|k| k == &key) {
+                self.order.remove(pos);
+            }
+            self.order.insert(0, key);
+            return;
+        }
+        if self.map.len() >= NGRAM_CACHE_CAPACITY
+            && let Some(oldest) = self.order.pop()
+        {
+            self.map.remove(&oldest);
+        }
+        self.order.insert(0, key.clone());
+        self.map.insert(key, value);
+    }
+}
 
 /// Errors that can occur when reading or writing a database.
 #[derive(Error, Debug)]
@@ -672,6 +729,10 @@ pub struct Reader {
     /// a single large zstd frame; caching the decoded bytes lets repeated
     /// searches (in particular the daemon) avoid decompressing it every query.
     v1_decompressed: once_cell::sync::OnceCell<Vec<u8>>,
+    /// Bounded LRU cache for ngram candidate bitmaps. Keyed by pattern string,
+    /// shared across queries in daemon mode. Invalidated when the database is
+    /// reloaded (a new `Reader` is created).
+    ngram_cache: once_cell::sync::OnceCell<Mutex<NgramCache>>,
 }
 
 impl Reader {
@@ -696,6 +757,13 @@ impl Reader {
         }
 
         let data = mmap_guard::map_file(&path_buf)?;
+
+        #[cfg(feature = "huge_pages")]
+        {
+            let ptr = data.as_ptr();
+            let len = data.len();
+            huge_pages::advise_huge_pages(ptr, len);
+        }
 
         if data.len() < DATA_START {
             return Err(Error::Corrupt("database file too short for header"));
@@ -785,6 +853,7 @@ impl Reader {
             basename: once_cell::sync::OnceCell::new(),
             path_index: once_cell::sync::OnceCell::new(),
             v1_decompressed: once_cell::sync::OnceCell::new(),
+            ngram_cache: once_cell::sync::OnceCell::new(),
         })
     }
 
@@ -803,6 +872,14 @@ impl Reader {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Return a reference to the ngram result cache, initializing it on
+    /// first access. The cache is per-Reader and is invalidated when the
+    /// database is reloaded (a new `Reader` is created).
+    fn ngram_cache(&self) -> &Mutex<NgramCache> {
+        self.ngram_cache
+            .get_or_init(|| Mutex::new(NgramCache::new()))
     }
 
     /// Return the on-disk format version of the opened database.
@@ -1631,6 +1708,128 @@ pub fn read_attrs_sidecar(db_dir: &Path) -> Result<Option<Vec<(String, String, S
     Ok(Some(attrs))
 }
 
+/// Write the frame hashes sidecar for incremental builds.
+///
+/// Stores SHA-256 hashes of each compressed frame so that
+/// unchanged frames can be skipped during sidecar regeneration.
+fn write_frame_hashes(db_dir: &Path, frame_hashes: &[(u32, [u8; 32])]) -> Result<()> {
+    let path = db_dir.join(FRAME_HASHES_FILE);
+    let mut file = File::create(&path)?;
+
+    file.write_all(FRAME_HASHES_MAGIC)?;
+    file.write_u32::<LittleEndian>(FRAME_HASHES_VERSION)?;
+    let count = u32::try_from(frame_hashes.len())
+        .map_err(|_| Error::Corrupt("frame hashes count overflow"))?;
+    file.write_u32::<LittleEndian>(count)?;
+
+    for &(frame_idx, ref hash) in frame_hashes {
+        file.write_u32::<LittleEndian>(frame_idx)?;
+        file.write_all(hash)?;
+    }
+
+    file.flush()?;
+    Ok(())
+}
+
+/// Read the frame hashes sidecar for incremental builds.
+///
+/// Returns `Ok(None)` if the file is missing or has an invalid magic/version.
+pub fn read_frame_hashes(db_dir: &Path) -> Result<Option<Vec<(u32, [u8; 32])>>> {
+    let path = db_dir.join(FRAME_HASHES_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+
+    if bytes.len() < FRAME_HASHES_MAGIC.len() + 8 {
+        return Ok(None);
+    }
+
+    let magic = bytes
+        .get(..FRAME_HASHES_MAGIC.len())
+        .ok_or(Error::Corrupt("frame hashes magic missing"))?;
+    if magic != FRAME_HASHES_MAGIC {
+        return Ok(None);
+    }
+
+    let version = read_u32_le(&bytes, FRAME_HASHES_MAGIC.len())?;
+    if version != FRAME_HASHES_VERSION {
+        return Ok(None);
+    }
+
+    let count = usize::try_from(read_u32_le(&bytes, FRAME_HASHES_MAGIC.len() + 4)?)
+        .map_err(|_| Error::Corrupt("frame hashes count overflow"))?;
+
+    let expected_len = FRAME_HASHES_MAGIC.len() + 8 + count * (4 + 32);
+    if bytes.len() != expected_len {
+        return Err(Error::Corrupt("frame hashes sidecar has invalid size"));
+    }
+
+    let mut frame_hashes = Vec::with_capacity(count);
+    let mut offset = FRAME_HASHES_MAGIC.len() + 8;
+
+    for _ in 0..count {
+        let frame_idx = read_u32_le(&bytes, offset)?;
+        offset += 4;
+        let mut hash = [0u8; 32];
+        let end = offset.checked_add(32);
+        match end.and_then(|e| bytes.get(offset..e)) {
+            Some(slice) => hash.copy_from_slice(slice),
+            None => return Err(Error::Corrupt("frame hashes sidecar has truncated hash")),
+        }
+        offset += 32;
+        frame_hashes.push((frame_idx, hash));
+    }
+
+    Ok(Some(frame_hashes))
+}
+
+/// Compute SHA-256 hashes for each frame in the reader.
+fn compute_frame_hashes(reader: &Reader) -> Vec<(u32, [u8; 32])> {
+    reader
+        .frames
+        .iter()
+        .enumerate()
+        .map(|(i, (offset, len))| {
+            let frame_data = match reader.data.get(*offset..*offset + *len) {
+                Some(data) => data,
+                None => &[],
+            };
+            let mut hasher = Sha256::new();
+            hasher.update(frame_data);
+            let hash: [u8; 32] = hasher.finalize().into();
+            #[allow(clippy::unnecessary_lazy_evaluations)]
+            let idx = u32::try_from(i).unwrap_or_else(|_| u32::MAX);
+            (idx, hash)
+        })
+        .collect()
+}
+
+/// Compare stored frame hashes with current hashes and return
+/// the indices of frames whose sidecars need rebuilding.
+///
+/// Returns `None` if no stored hashes exist (full rebuild needed).
+pub fn frame_hashes_diff(
+    db_dir: &Path,
+    current_hashes: &[(u32, [u8; 32])],
+) -> Result<Option<Vec<u32>>> {
+    let Some(stored) = read_frame_hashes(db_dir)? else {
+        return Ok(None);
+    };
+
+    let stored_map: std::collections::BTreeMap<u32, [u8; 32]> = stored.into_iter().collect();
+
+    let mut changed = Vec::new();
+    for &(frame_idx, ref hash) in current_hashes {
+        if stored_map.get(&frame_idx) != Some(hash) {
+            changed.push(frame_idx);
+        }
+    }
+
+    Ok(Some(changed))
+}
+
 /// Write a length-prefixed string (u32 LE length + UTF-8 bytes).
 fn write_length_prefixed_string<W: Write>(writer: &mut W, s: &str) -> Result<()> {
     let bytes = s.as_bytes();
@@ -2261,6 +2460,8 @@ pub enum SearchSort {
     SizeDesc,
     /// Sort by attribute path ascending.
     AttrAsc,
+    /// Reverse the current sort order.
+    Reverse,
 }
 
 impl std::str::FromStr for SearchSort {
@@ -2272,6 +2473,7 @@ impl std::str::FromStr for SearchSort {
             "size" | "size-asc" => Ok(Self::SizeAsc),
             "size-desc" => Ok(Self::SizeDesc),
             "attr" | "attr-asc" => Ok(Self::AttrAsc),
+            "reverse" | "rev" => Ok(Self::Reverse),
             _ => Err(crate::Error::Parse(format!("unknown sort order: {s}"))),
         }
     }
@@ -2305,6 +2507,9 @@ pub struct SearchOptions<'a> {
     /// Emit each match as a JSON object (one per line) instead of the default
     /// human-readable format.
     pub json: bool,
+    /// Emit each match as a YAML document instead of the default
+    /// human-readable format.
+    pub yaml: bool,
     /// Maximum number of results to print. `None` means unlimited.
     pub limit: Option<usize>,
     /// Print the number of matching entries instead of the entries themselves.
@@ -2319,6 +2524,10 @@ pub struct SearchOptions<'a> {
     pub exclude_fhs: bool,
     /// Emit null bytes between results instead of newlines.
     pub null_output: bool,
+    /// Suppress all non-error output.
+    pub quiet: bool,
+    /// Show expanded metadata (description, license, homepage, maintainers).
+    pub details: bool,
 }
 
 /// Pre-loaded secondary indexes that a long-running holder (e.g. the daemon)
@@ -2411,6 +2620,18 @@ fn ngram_sidecars_exist(dir: &Path) -> bool {
 /// critical search path. The compiler is prevented from eliding the reads
 /// via [`std::hint::black_box`].
 fn prefault_mmap(data: &[u8]) {
+    #[cfg(feature = "huge_pages")]
+    {
+        let ptr = data.as_ptr();
+        let len = data.len();
+        huge_pages::advise_willneed(ptr, len);
+    }
+    #[cfg(not(feature = "huge_pages"))]
+    prefault_mmap_pages(data);
+}
+
+#[cfg(not(feature = "huge_pages"))]
+fn prefault_mmap_pages(data: &[u8]) {
     const PAGE_SIZE: usize = 4096;
     let len = data.len();
     if len == 0 {
@@ -2444,20 +2665,53 @@ fn resolve_ngram_ordinals_multi(
     regex_prefix: Option<&str>,
     regex_suffix: Option<&str>,
 ) -> Option<RoaringBitmap> {
+    #[allow(clippy::unnecessary_lazy_evaluations)]
+    let literal_str = literal.unwrap_or_else(|| "");
+    #[allow(clippy::unnecessary_lazy_evaluations)]
+    let regex_prefix_str = regex_prefix.unwrap_or_else(|| "");
+    #[allow(clippy::unnecessary_lazy_evaluations)]
+    let regex_suffix_str = regex_suffix.unwrap_or_else(|| "");
+    let cache_key = format!(
+        "{}\0{}\0{}",
+        literal_str, regex_prefix_str, regex_suffix_str
+    );
+
+    let cache = reader.ngram_cache();
+
+    // Read the cache under the lock, then release it immediately so the
+    // (potentially expensive) candidate computation runs lock-free. Holding
+    // the lock across the computation would serialise all concurrent queries
+    // in the daemon.
+    {
+        let guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = guard.get(&cache_key) {
+            return Some((*cached).clone());
+        }
+    }
+
     let mut result: Option<RoaringBitmap> = None;
     for pat in literal.into_iter().chain(regex_prefix).chain(regex_suffix) {
         if pat.len() < 3 {
             continue;
         }
-        let candidates = match resolve_ngram_ordinals(reader, Some(pat)) {
-            Some(c) => c,
-            None => continue,
+        let Some(candidates) = resolve_ngram_ordinals(reader, Some(pat)) else {
+            continue;
         };
         result = Some(match result {
             Some(bm) => bm & &candidates,
             None => candidates,
         });
     }
+
+    if let Some(ref bm) = result {
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.insert(cache_key, Arc::new(bm.clone()));
+    }
+
     result
 }
 
@@ -2596,7 +2850,9 @@ fn print_match(
 ) -> bool {
     let attr = format_attr(store_path);
 
-    if options.json {
+    if options.yaml {
+        print_match_yaml(options, package_db, printed_attrs, store_path, entry, &attr)
+    } else if options.json {
         print_match_json(options, package_db, printed_attrs, store_path, entry, &attr)
     } else {
         print_match_text(
@@ -2665,6 +2921,119 @@ fn print_match_json(
     }
 }
 
+#[allow(clippy::print_stdout, clippy::too_many_lines)]
+fn print_match_yaml(
+    options: &SearchOptions<'_>,
+    package_db: Option<&crate::package_search::SearchDb>,
+    printed_attrs: &mut IndexSet<String>,
+    store_path: &StorePath,
+    entry: &FileTreeEntry,
+    attr: &str,
+) -> bool {
+    let delim = if options.null_output { "\0" } else { "\n" };
+    match options.mode {
+        SearchMode::Minimal => {
+            if printed_attrs.insert(attr.into()) {
+                let mut obj = serde_yaml::Mapping::new();
+                obj.insert(
+                    serde_yaml::Value::String("attr".into()),
+                    serde_yaml::Value::String(attr.to_string()),
+                );
+                if let Ok(yaml) = serde_yaml::to_string(&obj) {
+                    print!("{yaml}{delim}");
+                    return true;
+                }
+            }
+            false
+        }
+        SearchMode::Full { .. } => {
+            let (kind, size) = match &entry.node {
+                FileNode::Regular { executable, size } => {
+                    (if *executable { "x" } else { "r" }, *size)
+                }
+                FileNode::Directory { size, .. } => ("d", *size),
+                FileNode::Symlink { .. } => ("s", 0),
+            };
+            let meta = package_db.and_then(|db| db.lookup_attr(store_path.origin().attr.as_str()));
+            let mut obj = serde_yaml::Mapping::new();
+            obj.insert(
+                serde_yaml::Value::String("attr".into()),
+                serde_yaml::Value::String(attr.to_string()),
+            );
+            obj.insert(
+                serde_yaml::Value::String("size".into()),
+                serde_yaml::Value::Number(size.into()),
+            );
+            obj.insert(
+                serde_yaml::Value::String("kind".into()),
+                serde_yaml::Value::String(kind.to_string()),
+            );
+            obj.insert(
+                serde_yaml::Value::String("path".into()),
+                serde_yaml::Value::String(String::from_utf8_lossy(&entry.path).into_owned()),
+            );
+            obj.insert(
+                serde_yaml::Value::String("store_path".into()),
+                serde_yaml::Value::String(store_path.as_str()),
+            );
+            if options.details {
+                if let Some(ref desc) = meta.and_then(|m| m.description.clone()) {
+                    obj.insert(
+                        serde_yaml::Value::String("description".into()),
+                        serde_yaml::Value::String(desc.clone()),
+                    );
+                }
+                if let Some(ref lic) = meta.and_then(|m| m.license.clone()) {
+                    obj.insert(
+                        serde_yaml::Value::String("license".into()),
+                        serde_yaml::Value::String(lic.clone()),
+                    );
+                }
+                if let Some(ref hp) = meta.and_then(|m| m.homepage.clone()) {
+                    obj.insert(
+                        serde_yaml::Value::String("homepage".into()),
+                        serde_yaml::Value::String(hp.clone()),
+                    );
+                }
+                if let Some(ref maint) = meta.and_then(|m| m.maintainers.clone()) {
+                    let vals: Vec<serde_yaml::Value> = maint
+                        .iter()
+                        .cloned()
+                        .map(serde_yaml::Value::String)
+                        .collect();
+                    obj.insert(
+                        serde_yaml::Value::String("maintainers".into()),
+                        serde_yaml::Value::Sequence(vals),
+                    );
+                }
+                if let Some(ref plats) = meta.and_then(|m| m.platforms.clone()) {
+                    let vals: Vec<serde_yaml::Value> = plats
+                        .iter()
+                        .cloned()
+                        .map(serde_yaml::Value::String)
+                        .collect();
+                    obj.insert(
+                        serde_yaml::Value::String("platforms".into()),
+                        serde_yaml::Value::Sequence(vals),
+                    );
+                }
+                if let Some(ref mp) = meta.and_then(|m| m.main_program.clone()) {
+                    obj.insert(
+                        serde_yaml::Value::String("main_program".into()),
+                        serde_yaml::Value::String(mp.clone()),
+                    );
+                }
+            }
+            if let Ok(yaml) = serde_yaml::to_string(&obj) {
+                print!("{yaml}{delim}");
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
 #[allow(clippy::print_stdout)]
 fn print_match_text(
     options: &SearchOptions<'_>,
@@ -2674,6 +3043,9 @@ fn print_match_text(
     entry: &FileTreeEntry,
     attr: &str,
 ) -> bool {
+    if options.quiet {
+        return false;
+    }
     let delim = if options.null_output { "\0" } else { "\n" };
     match options.mode {
         SearchMode::Minimal => {
@@ -2696,14 +3068,12 @@ fn print_match_text(
 
             let path_str = String::from_utf8_lossy(&entry.path);
             if color {
-                // Highlight all non-empty matches in the path.
                 let mut prev = 0usize;
                 let bytes = path_str.as_bytes();
                 for mat in path_pattern.find_iter(bytes) {
                     if mat.start() == mat.end() {
                         continue;
                     }
-                    // Safe because we only slice on byte offsets from the same str.
                     if let (Some(before), Some(matched)) = (
                         path_str.get(prev..mat.start()),
                         path_str.get(mat.start()..mat.end()),
@@ -2832,6 +3202,13 @@ pub fn search_results_with_reader(
         regex_literal_suffix.as_deref(),
     );
 
+    // Selectivity estimation: count ngram candidates to guide fast-path
+    // ordering. The path trigram fast path is most selective when candidates
+    // are below the limit.
+    let ngram_candidate_count = ngram_ordinals
+        .as_ref()
+        .map_or(0, roaring::RoaringBitmap::len);
+
     let package_ordinals: Option<RoaringBitmap> = match (base_ordinals, ngram_ordinals) {
         (Some(b), Some(ng)) => Some(b & &ng),
         (Some(b), None) => Some(b),
@@ -2852,12 +3229,24 @@ pub fn search_results_with_reader(
         return Ok(Vec::new());
     }
 
-    // Try the fast path sidecars in order of specificity:
-    // 1. exact full path, 2. exact basename, 3. literal substring.
+    // Try the fast path sidecars in order of estimated selectivity.
+    // We check the ngram candidate count first to determine the most
+    // selective path, then try fast paths from most to least selective.
     let mut results = Vec::new();
     let mut used_fast_path = false;
 
+    tracing::debug!(
+        ngram_candidate_count,
+        exact_path = options.exact_path.is_some(),
+        exact_basename = options.exact_basename.is_some(),
+        literal_pattern = options.literal_pattern.is_some(),
+        regex_prefix = regex_literal_prefix.is_some(),
+        regex_suffix = regex_literal_suffix.is_some(),
+        "search plan: selectivity estimation"
+    );
+
     // 1. Exact full path: prefer the per-path entry cache, then redb.
+    //    Most selective for exact path queries.
     if let Some(exact_path) = &options.exact_path {
         let bytes = exact_path.as_bytes();
         if let Some(path_entry) = reader.path_entry() {
@@ -2884,6 +3273,7 @@ pub fn search_results_with_reader(
             }
             results = hits;
             used_fast_path = true;
+            tracing::debug!(hits = results.len(), "search plan: exact path fast path");
         } else if let Some(redb) = reader.redb.get() {
             let mut hits = Vec::new();
             match redb.exact_path_entries(bytes) {
@@ -2903,6 +3293,10 @@ pub fn search_results_with_reader(
                     }
                     results = hits;
                     used_fast_path = true;
+                    tracing::debug!(
+                        hits = results.len(),
+                        "search plan: exact path (redb) fast path"
+                    );
                 }
                 Ok(None) => {}
                 Err(err) => {
@@ -2913,6 +3307,7 @@ pub fn search_results_with_reader(
     }
 
     // 2. Exact basename (whole_name without --root, or basename portion only).
+    //    Most selective for basename-only queries.
     if !used_fast_path
         && options.exact_basename.is_some()
         && options.exact_path.is_none()
@@ -2932,6 +3327,10 @@ pub fn search_results_with_reader(
             Ok(Some(entry_results)) => {
                 results = entry_results;
                 used_fast_path = true;
+                tracing::debug!(
+                    hits = results.len(),
+                    "search plan: exact basename fast path"
+                );
             }
             Ok(None) => {}
             Err(err) => {
@@ -2940,13 +3339,13 @@ pub fn search_results_with_reader(
         }
     }
 
-    // 3. Literal substring: path-level trigram + entry cache.
-    //    Also applies to regex queries whose AST yields a fixed literal prefix
-    //    and/or suffix (e.g. `bin/` and `test` from `bin/.*test$`): the path trigram
-    //    index narrows candidates and `should_include_match` applies the full
-    //    regex. When both prefix and suffix are available, both are passed to
-    //    `search_path_trigram` so it can intersect their candidate sets before the
-    //    candidate-limit check, avoiding fallback to a full scan.
+    // 3. Literal substring / regex with trigram candidates: path trigram
+    //    + entry cache. `search_path_trigram` performs its own candidate-limit
+    //    check internally and returns `Ok(None)` (falling back to a full scan)
+    //    when the trigram sidecar is absent or the candidate set is too large.
+    //    We therefore attempt this path for any literal/regex query and let it
+    //    decide, rather than gating on `ngram_candidate_count` (which is an
+    //    ordinal count and is 0 for short patterns and sidecar-less databases).
     if !used_fast_path
         && (options.literal_pattern.is_some()
             || regex_literal_prefix.is_some()
@@ -2980,8 +3379,14 @@ pub fn search_results_with_reader(
             Ok(Some(path_results)) => {
                 results = path_results;
                 used_fast_path = true;
+                tracing::debug!(hits = results.len(), "search plan: path trigram fast path");
             }
-            Ok(None) => {}
+            Ok(None) => {
+                tracing::debug!(
+                    ngram_candidate_count,
+                    "search plan: path trigram fell back to scan"
+                );
+            }
             Err(err) => {
                 tracing::debug!(%err, "path trigram search failed; falling back");
             }
@@ -3015,6 +3420,9 @@ pub fn search_results_with_reader(
         SearchSort::AttrAsc => {
             results.sort_by(|(a, _), (b, _)| a.origin().attr.cmp(&b.origin().attr));
         }
+        SearchSort::Reverse => {
+            results.reverse();
+        }
     }
 
     let mut results: Vec<_> = results
@@ -3044,14 +3452,14 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
     let results = search_results(options, None)?;
 
     // Load package metadata sidecar for enriched JSON output, if available.
-    let package_db = (|| {
+    let package_db = {
         let path = options.database.join("packages.json");
         if path.exists() {
             crate::package_search::SearchDb::open(&path).ok()
         } else {
             None
         }
-    })();
+    };
 
     // Track printed attrs for --minimal de-duplication (ordered set).
     let mut printed_attrs: IndexSet<String> = IndexSet::new();
@@ -3063,6 +3471,10 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
         matched += 1;
 
         if options.count {
+            continue;
+        }
+
+        if options.quiet {
             continue;
         }
 
@@ -3082,7 +3494,7 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
         }
     }
 
-    if options.count {
+    if options.count && !options.quiet {
         println!("{matched}");
     }
 
@@ -3098,24 +3510,28 @@ pub fn search_batch(options: &SearchOptions<'_>, patterns: &[String]) -> crate::
         source: Box::new(source),
     })?;
 
-    let package_db = (|| {
+    let package_db = {
         let path = options.database.join("packages.json");
         if path.exists() {
             crate::package_search::SearchDb::open(&path).ok()
         } else {
             None
         }
-    })();
+    };
 
     for pattern in patterns {
         let mut batch_options = options.clone();
-        batch_options.pattern = pattern.clone();
+        batch_options.pattern.clone_from(pattern);
         batch_options.literal_pattern = None;
 
         let results = search_results_with_reader(&reader, &index_file, &batch_options, None)?;
 
-        if batch_options.count {
+        if batch_options.count && !batch_options.quiet {
             println!("{}", results.len());
+            continue;
+        }
+
+        if batch_options.quiet {
             continue;
         }
 
@@ -3162,6 +3578,22 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
     generate_sidecars_impl(db_path, true)
 }
 
+/// Compare stored frame hashes with current hashes and return
+/// the indices of frames whose sidecars need rebuilding.
+///
+/// Returns `Ok(None)` if no stored hashes exist (full rebuild needed).
+/// Returns `Ok(Some(vec![])` if all sidecars are up to date.
+pub fn sidecar_diff(db_path: &Path) -> Result<Option<Vec<u32>>> {
+    let reader = Reader::open(db_path)?;
+    let db_dir = db_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or(Error::Corrupt("database path has no parent directory"))?;
+
+    let current_hashes = compute_frame_hashes(&reader);
+    frame_hashes_diff(db_dir, &current_hashes)
+}
+
 /// Like [`generate_sidecars`], but when `include_heavy` is `false` the heavy
 /// entry/ngram secondary indexes are skipped. The daemon uses this in `Lru`
 /// cache mode to defer their construction; queries fall back to full scans
@@ -3180,6 +3612,60 @@ fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .ok_or(Error::Corrupt("database path has no parent directory"))?;
+
+    // Compute frame hashes for incremental update detection.
+    let current_hashes = compute_frame_hashes(&reader);
+
+    // Check if sidecars are already up to date.
+    if let Some(changed) = frame_hashes_diff(db_dir, &current_hashes)? {
+        if changed.is_empty() {
+            let mut required_sidecars = vec![
+                crate::basename_index::NAMES_FILE,
+                crate::basename_index::POSTINGS_FILE,
+                crate::basename_index::FST_FILE,
+                crate::path_index::POSTINGS_FILE,
+                crate::path_index::FST_FILE,
+                "packages.json",
+                ATTRS_FILE,
+            ];
+            if include_heavy {
+                required_sidecars.extend_from_slice(&[
+                    crate::entry_index::FST_FILE,
+                    crate::entry_index::POSTINGS_FILE,
+                    crate::path_entry_index::FST_FILE,
+                    crate::path_entry_index::ENTRIES_FILE,
+                    crate::path_trigram_index::FST_FILE,
+                    crate::path_trigram_index::POSTINGS_FILE,
+                    crate::ngram_index::FST_FILE,
+                    crate::ngram_index::POSTINGS_FILE,
+                ]);
+            }
+            let missing: Vec<&str> = required_sidecars
+                .iter()
+                .filter(|name| !db_dir.join(name).exists())
+                .copied()
+                .collect();
+            if missing.is_empty() {
+                tracing::info!(
+                    db_path = %db_path.display(),
+                    "sidecars are up to date; skipping regeneration"
+                );
+                return Ok(());
+            }
+            tracing::warn!(
+                db_path = %db_path.display(),
+                missing = ?missing,
+                "frame hashes unchanged but sidecar files missing; rebuilding"
+            );
+        } else {
+            tracing::info!(
+                db_path = %db_path.display(),
+                changed_frames = changed.len(),
+                total_frames = reader.frames.len(),
+                "sidecar diff detected changed frames; rebuilding"
+            );
+        }
+    }
 
     // Scan all frames to extract package paths and build secondary indexes.
     let mut builder = BasenameIndexBuilder::new();
@@ -3309,6 +3795,9 @@ fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
 
     // Write attrs sidecar so prebuilt indexes can be reused for incremental builds.
     write_attrs_sidecar(db_dir, &all_package_attrs)?;
+
+    // Write frame hashes sidecar for incremental update detection.
+    write_frame_hashes(db_dir, &current_hashes)?;
 
     tracing::info!(
         db_path = %db_path.display(),
@@ -3515,6 +4004,25 @@ fn format_grouped(n: u64) -> String {
     out
 }
 
+#[cfg(feature = "huge_pages")]
+mod huge_pages {
+    #![allow(clippy::as_conversions)]
+    pub fn advise_huge_pages(ptr: *const u8, len: usize) {
+        let ptr = ptr as *mut libc::c_void;
+        unsafe {
+            libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
+            libc::madvise(ptr, len, libc::MADV_WILLNEED);
+        }
+    }
+
+    pub fn advise_willneed(ptr: *const u8, len: usize) {
+        let ptr = ptr as *mut libc::c_void;
+        unsafe {
+            libc::madvise(ptr, len, libc::MADV_WILLNEED);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3593,6 +4101,7 @@ mod tests {
             file_type: &[],
             mode: SearchMode::Minimal,
             json: false,
+            yaml: false,
             limit: None,
             count: false,
             sort: SearchSort::None,
@@ -3600,6 +4109,8 @@ mod tests {
             max_size: None,
             exclude_fhs: false,
             null_output: false,
+            quiet: false,
+            details: false,
         };
         search(&options).expect("search ok");
     }
@@ -3632,6 +4143,7 @@ mod tests {
             file_type: &[],
             mode: SearchMode::Minimal,
             json: false,
+            yaml: false,
             limit: None,
             count: false,
             sort: SearchSort::None,
@@ -3639,6 +4151,8 @@ mod tests {
             max_size: None,
             exclude_fhs: false,
             null_output: false,
+            quiet: false,
+            details: false,
         };
 
         let hits = search_results(&options, None).expect("search");
@@ -3831,6 +4345,7 @@ mod tests {
                 file_type: &[],
                 mode: SearchMode::Minimal,
                 json: false,
+                yaml: false,
                 limit: None,
                 count: false,
                 sort: SearchSort::None,
@@ -3838,6 +4353,8 @@ mod tests {
                 max_size: None,
                 exclude_fhs: false,
                 null_output: false,
+                quiet: false,
+                details: false,
             };
             let pruned = search_results(&options, None).expect("sidecar search");
 
@@ -3895,6 +4412,7 @@ mod tests {
             file_type: &[],
             mode: SearchMode::Minimal,
             json: false,
+            yaml: false,
             limit: None,
             count: false,
             sort: SearchSort::None,
@@ -3902,6 +4420,8 @@ mod tests {
             max_size: None,
             exclude_fhs: false,
             null_output: false,
+            quiet: false,
+            details: false,
         };
         let pruned = search_results(&options, None).expect("entry-index search");
 
@@ -3995,6 +4515,7 @@ mod tests {
                 file_type: &[],
                 mode: SearchMode::Minimal,
                 json: false,
+                yaml: false,
                 limit: None,
                 count: false,
                 sort: SearchSort::None,
@@ -4002,6 +4523,8 @@ mod tests {
                 max_size: None,
                 exclude_fhs: false,
                 null_output: false,
+                quiet: false,
+                details: false,
             };
             let pruned = search_results(&options, None).expect("sidecar search");
 
@@ -4076,6 +4599,7 @@ mod tests {
             file_type: &[],
             mode: SearchMode::Minimal,
             json: false,
+            yaml: false,
             limit: None,
             count: false,
             sort: SearchSort::None,
@@ -4083,6 +4607,8 @@ mod tests {
             max_size: None,
             exclude_fhs: false,
             null_output: false,
+            quiet: false,
+            details: false,
         };
         let regex_baseline = reader
             .search_entries(&Regex::new("b.n").expect("regex"), None, None, None, None)
@@ -4097,6 +4623,8 @@ mod tests {
         // Short literal (<3 bytes): path trigram returns None, falls back.
         let short_options = SearchOptions {
             null_output: false,
+            quiet: false,
+            details: false,
             pattern: "he".into(),
             literal_pattern: Some("he".into()),
             ..regex_options.clone()
@@ -4152,6 +4680,7 @@ mod tests {
             file_type: &[],
             mode: SearchMode::Minimal,
             json: false,
+            yaml: false,
             limit: None,
             count: false,
             sort: SearchSort::None,
@@ -4159,6 +4688,8 @@ mod tests {
             max_size: None,
             exclude_fhs: false,
             null_output: false,
+            quiet: false,
+            details: false,
         };
         let pruned = search_results(&options, None).expect("fallback search");
 
@@ -4693,6 +5224,7 @@ mod tests {
             file_type: &[],
             mode: SearchMode::Minimal,
             json: false,
+            yaml: false,
             limit: None,
             count: false,
             sort: SearchSort::None,
@@ -4700,6 +5232,8 @@ mod tests {
             max_size: None,
             exclude_fhs: false,
             null_output: false,
+            quiet: false,
+            details: false,
         };
         let regex_pruned = search_results(&regex_options, None).expect("regex search");
 
@@ -4784,6 +5318,7 @@ mod tests {
             file_type: &[],
             mode: SearchMode::Minimal,
             json: false,
+            yaml: false,
             limit: None,
             count: false,
             sort: SearchSort::None,
@@ -4791,6 +5326,8 @@ mod tests {
             max_size: None,
             exclude_fhs: false,
             null_output: false,
+            quiet: false,
+            details: false,
         };
         let regex_pruned = search_results(&regex_options, None).expect("regex search");
 

@@ -5,6 +5,9 @@ members = [
   "crates/nixdex-core",
   "crates/nixdex-cli",
   "crates/nixdex-daemon",
+  "crates/nixdex-history",
+  "crates/nixdex-options",
+  "crates/nixdex-tui",
 ]
 
 [workspace.package]
@@ -15,7 +18,7 @@ license = "AGPL-3.0-only"
 repository = "https://github.com/w0wl0lxd/nixdex"
 description = "Modern rewrite of nix-index / nix-locate"
 categories = ["development-tools", "command-line-utilities"]
-rust-version = "1.85.0"
+rust-version = "1.99.0"
 
 [workspace.dependencies]
 # Core async runtime and networking
@@ -35,6 +38,7 @@ rayon = "1.10"
 # Serialization and compression
 sonic-rs = "0.5"
 serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
 zstd = "0.13"
 bytes = { version = "1", features = ["serde"] }
 byteorder = "1"
@@ -50,7 +54,12 @@ indicatif = { version = "0.18.4", default-features = false, features = [
 
 # Databases and indexing
 fst = "0.4"
-roaring = "0.10"
+mmap-guard = "0.2.2"
+libc = "0.2"
+roaring = "0.11.4"
+
+# Workspace crates
+nixdex-core = { path = "crates/nixdex-core", version = "0.1.0" }
 
 # Concurrency and collections
 memchr = "2.7"
@@ -82,11 +91,15 @@ proptest = "1"
 criterion = "0.5"
 divan = "0.1"
 
-# Workspace crates
-nixdex-core = { path = "crates/nixdex-core", version = "0.1.0" }
+# TUI
+ratatui = "0.25"
+crossterm = { version = "0.27", features = ["event-stream"] }
+nixdex-tui = { path = "crates/nixdex-tui", version = "0.1.0" }
+nixdex-history = { path = "crates/nixdex-history", version = "0.1.0" }
+nixdex-options = { path = "crates/nixdex-options", version = "0.1.0" }
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "warn"
 unused_must_use = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
 

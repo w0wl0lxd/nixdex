@@ -1,0 +1,20 @@
+[package]
+name = "nixdex-history"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Package version history sidecar for nixdex"
+publish = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+sonic-rs = { workspace = true }
+thiserror = { workspace = true }
+mmap-guard = { workspace = true }
+byteorder = { workspace = true }
+
+[lints]
+workspace = true

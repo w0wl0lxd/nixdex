@@ -215,34 +215,138 @@ fn format_grouped(n: u64) -> String {
     out
 }
 
+/// Options for rendering daemon responses.
+pub(crate) struct RenderOpts {
+    pub json: bool,
+    pub yaml: bool,
+    pub minimal: bool,
+    pub null_output: bool,
+    pub quiet: bool,
+    pub details: bool,
+}
+
 /// Render a daemon response into the same text/JSON/count lines the local
 /// search path would print. Colour highlighting is omitted because the daemon
 /// response does not carry per-match highlight ranges.
-pub(crate) fn render(
-    response: &NixLocateResponse,
-    json: bool,
-    minimal: bool,
-    null_output: bool,
-) -> Vec<String> {
+pub(crate) fn render(response: &NixLocateResponse, opts: &RenderOpts) -> Vec<String> {
+    if opts.quiet {
+        return Vec::new();
+    }
+
     if let Some(count) = response.count {
         return vec![count.to_string()];
     }
 
-    let delim = if null_output { "\0" } else { "\n" };
+    let delim = if opts.null_output { "\0" } else { "\n" };
 
-    if json {
-        response
-            .matches
+    if opts.yaml {
+        render_daemon_yaml(&response.matches, opts, delim)
+    } else if opts.json {
+        render_daemon_json(&response.matches, opts, delim)
+    } else if opts.minimal {
+        render_daemon_minimal(&response.matches, delim)
+    } else {
+        render_daemon_text(&response.matches, opts, delim)
+    }
+}
+
+fn render_daemon_yaml(matches: &[NixLocateMatch], opts: &RenderOpts, delim: &str) -> Vec<String> {
+    matches
+        .iter()
+        .map(|m| {
+            let (kind, size) = node_kind_size(m.node.as_ref());
+            let mut obj = serde_yaml::Mapping::new();
+            obj.insert(
+                serde_yaml::Value::String("attr".into()),
+                serde_yaml::Value::String(m.attr.clone()),
+            );
+            obj.insert(
+                serde_yaml::Value::String("size".into()),
+                serde_yaml::Value::Number(size.into()),
+            );
+            obj.insert(
+                serde_yaml::Value::String("kind".into()),
+                serde_yaml::Value::String(kind.to_string()),
+            );
+            obj.insert(
+                serde_yaml::Value::String("path".into()),
+                serde_yaml::Value::String(m.path.clone().unwrap_or_else(String::new)),
+            );
+            obj.insert(
+                serde_yaml::Value::String("store_path".into()),
+                serde_yaml::Value::String(store_path_string(m)),
+            );
+            if opts.details {
+                append_daemon_yaml_details(&mut obj, m);
+            }
+            let yaml = serde_yaml::to_string(&obj).unwrap_or_else(|_| String::new());
+            format!("{yaml}{delim}")
+        })
+        .collect()
+}
+
+fn append_daemon_yaml_details(obj: &mut serde_yaml::Mapping, m: &NixLocateMatch) {
+    if let Some(ref desc) = m.description {
+        obj.insert(
+            serde_yaml::Value::String("description".into()),
+            serde_yaml::Value::String(desc.clone()),
+        );
+    }
+    if let Some(ref lic) = m.license {
+        obj.insert(
+            serde_yaml::Value::String("license".into()),
+            serde_yaml::Value::String(lic.clone()),
+        );
+    }
+    if let Some(ref hp) = m.homepage {
+        obj.insert(
+            serde_yaml::Value::String("homepage".into()),
+            serde_yaml::Value::String(hp.clone()),
+        );
+    }
+    if let Some(ref maint) = m.maintainers {
+        let vals: Vec<serde_yaml::Value> = maint
             .iter()
-            .map(|m| {
-                let (kind, size) = node_kind_size(m.node.as_ref());
-                let mut obj = sonic_rs::json!({
-                    "attr": m.attr,
-                    "size": size,
-                    "kind": kind,
-                    "path": m.path.clone().unwrap_or_else(String::new),
-                    "store_path": store_path_string(m),
-                });
+            .cloned()
+            .map(serde_yaml::Value::String)
+            .collect();
+        obj.insert(
+            serde_yaml::Value::String("maintainers".into()),
+            serde_yaml::Value::Sequence(vals),
+        );
+    }
+    if let Some(ref plats) = m.platforms {
+        let vals: Vec<serde_yaml::Value> = plats
+            .iter()
+            .cloned()
+            .map(serde_yaml::Value::String)
+            .collect();
+        obj.insert(
+            serde_yaml::Value::String("platforms".into()),
+            serde_yaml::Value::Sequence(vals),
+        );
+    }
+    if let Some(ref mp) = m.main_program {
+        obj.insert(
+            serde_yaml::Value::String("main_program".into()),
+            serde_yaml::Value::String(mp.clone()),
+        );
+    }
+}
+
+fn render_daemon_json(matches: &[NixLocateMatch], opts: &RenderOpts, delim: &str) -> Vec<String> {
+    matches
+        .iter()
+        .map(|m| {
+            let (kind, size) = node_kind_size(m.node.as_ref());
+            let mut obj = sonic_rs::json!({
+                "attr": m.attr,
+                "size": size,
+                "kind": kind,
+                "path": m.path.clone().unwrap_or_else(String::new),
+                "store_path": store_path_string(m),
+            });
+            if opts.details {
                 if let Some(ref desc) = m.description {
                     obj.insert("description", sonic_rs::Value::copy_str(desc));
                 }
@@ -252,43 +356,68 @@ pub(crate) fn render(
                 if let Some(ref hp) = m.homepage {
                     obj.insert("homepage", sonic_rs::Value::copy_str(hp));
                 }
-                if let Some(ref maint) = m.maintainers {
-                    if let Ok(val) = sonic_rs::to_value(maint) {
-                        obj.insert("maintainers", val);
-                    }
+                if let Some(ref maint) = m.maintainers
+                    && let Ok(val) = sonic_rs::to_value(maint)
+                {
+                    obj.insert("maintainers", val);
                 }
-                if let Some(ref plats) = m.platforms {
-                    if let Ok(val) = sonic_rs::to_value(plats) {
-                        obj.insert("platforms", val);
-                    }
+                if let Some(ref plats) = m.platforms
+                    && let Ok(val) = sonic_rs::to_value(plats)
+                {
+                    obj.insert("platforms", val);
                 }
                 if let Some(ref mp) = m.main_program {
                     obj.insert("main_program", sonic_rs::Value::copy_str(mp));
                 }
-                let line = sonic_rs::to_string(&obj).unwrap_or_else(|_| String::new());
-                format!("{line}{delim}")
-            })
-            .collect()
-    } else if minimal {
-        response
-            .matches
-            .iter()
-            .map(|m| format!("{}{delim}", m.attr))
-            .collect()
-    } else {
-        response
-            .matches
-            .iter()
-            .map(|m| {
-                let (kind, size) = node_kind_size(m.node.as_ref());
-                let size_str = format_grouped(size);
-                let sp = store_path_string(m);
-                let path = m.path.clone().unwrap_or_else(String::new);
-                format!(
-                    "{:<40} {:>14} {:>1} {}{}{delim}",
-                    m.attr, size_str, kind, sp, path
-                )
-            })
-            .collect()
-    }
+            }
+            let line = sonic_rs::to_string(&obj).unwrap_or_else(|_| String::new());
+            format!("{line}{delim}")
+        })
+        .collect()
+}
+
+fn render_daemon_minimal(matches: &[NixLocateMatch], delim: &str) -> Vec<String> {
+    matches
+        .iter()
+        .map(|m| format!("{}{delim}", m.attr))
+        .collect()
+}
+
+fn render_daemon_text(matches: &[NixLocateMatch], opts: &RenderOpts, delim: &str) -> Vec<String> {
+    matches
+        .iter()
+        .map(|m| {
+            let (kind, size) = node_kind_size(m.node.as_ref());
+            let size_str = format_grouped(size);
+            let sp = store_path_string(m);
+            let path = m.path.clone().unwrap_or_else(String::new);
+            let mut line = format!(
+                "{:<40} {:>14} {:>1} {}{}{delim}",
+                m.attr, size_str, kind, sp, path
+            );
+            if opts.details {
+                if let Some(ref desc) = m.description {
+                    use std::fmt::Write;
+                    let _ = write!(line, " desc={desc}");
+                }
+                if let Some(ref lic) = m.license {
+                    use std::fmt::Write;
+                    let _ = write!(line, " license={lic}");
+                }
+                if let Some(ref hp) = m.homepage {
+                    use std::fmt::Write;
+                    let _ = write!(line, " homepage={hp}");
+                }
+                if let Some(ref maint) = m.maintainers {
+                    use std::fmt::Write;
+                    let _ = write!(line, " maintainers={maint:?}");
+                }
+                if let Some(ref mp) = m.main_program {
+                    use std::fmt::Write;
+                    let _ = write!(line, " main_program={mp}");
+                }
+            }
+            line
+        })
+        .collect()
 }

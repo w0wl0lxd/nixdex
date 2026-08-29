@@ -245,6 +245,25 @@ fn locate_finds_entries() {
 }
 
 #[test]
+fn locate_multi_word_without_quotes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_fixture_database(dir.path());
+
+    // Multiple positional args should be accepted (joined with spaces) rather
+    // than rejected as "unexpected argument".
+    let output = run(&["locate", "-d", dir.path().to_str().unwrap(), "bin", "ls"]);
+    assert!(
+        output.status.success(),
+        "nixdex locate with multi-word pattern should succeed: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "multi-word locate should not error on extra args: {stderr}"
+    );
+}
+
+#[test]
 fn search_main_program_field() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_fixture_database(dir.path());
@@ -263,6 +282,62 @@ fn search_main_program_field() {
     assert!(
         !stdout.contains("coreutils"),
         "coreutils should not match main-program search"
+    );
+}
+
+#[test]
+fn search_multi_word_without_quotes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_fixture_database(dir.path());
+
+    let output = run(&[
+        "search",
+        "-d",
+        dir.path().to_str().unwrap(),
+        "friendly",
+        "greeting",
+    ]);
+    assert!(
+        output.status.success(),
+        "nixdex search with multi-word pattern failed: {output:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hello"),
+        "expected hello match for multi-word search: {stdout}"
+    );
+}
+
+#[test]
+fn search_multi_word_matches_quoted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_fixture_database(dir.path());
+
+    let unquoted = run(&[
+        "search",
+        "-d",
+        dir.path().to_str().unwrap(),
+        "friendly",
+        "greeting",
+    ]);
+    let quoted = run(&[
+        "search",
+        "-d",
+        dir.path().to_str().unwrap(),
+        "friendly greeting",
+    ]);
+
+    assert!(
+        unquoted.status.success(),
+        "unquoted search failed: {unquoted:?}"
+    );
+    assert!(quoted.status.success(), "quoted search failed: {quoted:?}");
+
+    let unquoted_stdout = String::from_utf8_lossy(&unquoted.stdout);
+    let quoted_stdout = String::from_utf8_lossy(&quoted.stdout);
+    assert_eq!(
+        unquoted_stdout, quoted_stdout,
+        "multi-word search without quotes should match quoted search"
     );
 }
 

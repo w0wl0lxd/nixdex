@@ -81,6 +81,7 @@ paths.cache
 .devin/
 .maki/
 .opencode/
+.kilo/
 .kilocode/
 .agent/
 .agents/
