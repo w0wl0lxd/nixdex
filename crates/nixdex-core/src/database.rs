@@ -2677,11 +2677,18 @@ fn resolve_ngram_ordinals_multi(
     );
 
     let cache = reader.ngram_cache();
-    let guard = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(cached) = guard.get(&cache_key) {
-        return Some((*cached).clone());
+
+    // Read the cache under the lock, then release it immediately so the
+    // (potentially expensive) candidate computation runs lock-free. Holding
+    // the lock across the computation would serialise all concurrent queries
+    // in the daemon.
+    {
+        let guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = guard.get(&cache_key) {
+            return Some((*cached).clone());
+        }
     }
 
     let mut result: Option<RoaringBitmap> = None;
@@ -2698,14 +2705,11 @@ fn resolve_ngram_ordinals_multi(
         });
     }
 
-    if result.is_some() {
-        drop(guard);
-        if let Some(ref bm) = result {
-            let mut guard = cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.insert(cache_key, Arc::new(bm.clone()));
-        }
+    if let Some(ref bm) = result {
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.insert(cache_key, Arc::new(bm.clone()));
     }
 
     result
@@ -3336,11 +3340,13 @@ pub fn search_results_with_reader(
     }
 
     // 3. Literal substring / regex with trigram candidates: path trigram
-    //    + entry cache. Most selective for substring and regex queries
-    //    when ngram candidates are below the limit.
+    //    + entry cache. `search_path_trigram` performs its own candidate-limit
+    //    check internally and returns `Ok(None)` (falling back to a full scan)
+    //    when the trigram sidecar is absent or the candidate set is too large.
+    //    We therefore attempt this path for any literal/regex query and let it
+    //    decide, rather than gating on `ngram_candidate_count` (which is an
+    //    ordinal count and is 0 for short patterns and sidecar-less databases).
     if !used_fast_path
-        && ngram_candidate_count > 0
-        && ngram_candidate_count <= Reader::PATH_TRIGRAM_CANDIDATE_LIMIT
         && (options.literal_pattern.is_some()
             || regex_literal_prefix.is_some()
             || regex_literal_suffix.is_some())

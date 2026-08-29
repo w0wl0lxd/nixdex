@@ -239,45 +239,45 @@ impl AppEvent {
         )
     }
 
-    pub fn is_char_a(&self) -> bool {
+    pub fn is_ctrl_a(&self) -> bool {
         matches!(
             self,
             Self::Key(KeyEvent {
                 code: KeyCode::Char('a'),
-                modifiers: KeyModifiers::NONE,
+                modifiers: KeyModifiers::CONTROL,
                 ..
             })
         )
     }
 
-    pub fn is_char_y(&self) -> bool {
+    pub fn is_ctrl_y(&self) -> bool {
         matches!(
             self,
             Self::Key(KeyEvent {
                 code: KeyCode::Char('y'),
-                modifiers: KeyModifiers::NONE,
+                modifiers: KeyModifiers::CONTROL,
                 ..
             })
         )
     }
 
-    pub fn is_char_e(&self) -> bool {
+    pub fn is_ctrl_e(&self) -> bool {
         matches!(
             self,
             Self::Key(KeyEvent {
                 code: KeyCode::Char('e'),
-                modifiers: KeyModifiers::NONE,
+                modifiers: KeyModifiers::CONTROL,
                 ..
             })
         )
     }
 
-    pub fn is_char_p(&self) -> bool {
+    pub fn is_ctrl_p(&self) -> bool {
         matches!(
             self,
             Self::Key(KeyEvent {
                 code: KeyCode::Char('p'),
-                modifiers: KeyModifiers::NONE,
+                modifiers: KeyModifiers::CONTROL,
                 ..
             })
         )

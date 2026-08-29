@@ -179,6 +179,15 @@ fn handle_key_event(app: &mut App, event: AppEvent) {
         app.set_status(String::from("Quitting..."));
         return;
     }
+    // Plain printable characters are search input, not commands. They are
+    // already accumulated into the query by `handle_input_event`, so we must
+    // not also treat them as command keys here (otherwise typing a word
+    // containing e.g. `q`, `a`, `y`, `j`, or `k` would quit the app or fire
+    // unrelated actions). Command shortcuts therefore use modifiers or
+    // non-character keys. `Esc`/`Space` are handled as input/detail keys below.
+    if event.as_char().is_some() {
+        return;
+    }
     if event.is_slash() {
         app.set_status(String::from(
             "Focus: search input — type to search, Esc to clear",
@@ -263,7 +272,7 @@ fn handle_search_toggle_key(app: &mut App, event: &AppEvent) {
             "JSON output {}",
             if app.search_json { "on" } else { "off" }
         ));
-    } else if event.is_char_a() {
+    } else if event.is_ctrl_a() {
         app.toggle_expand_all();
         app.set_status(format!(
             "Expand all {}",
@@ -273,23 +282,33 @@ fn handle_search_toggle_key(app: &mut App, event: &AppEvent) {
 }
 
 fn handle_clipboard_key(app: &mut App, event: &AppEvent) {
-    if !event.is_char_y() && !event.is_char_e() && !event.is_char_p() {
+    if !event.is_ctrl_y() && !event.is_ctrl_e() && !event.is_ctrl_p() {
         return;
     }
     let Some(result) = app.selected_result() else {
         return;
     };
-    if event.is_char_y() {
-        copy_to_clipboard(&result.attr);
-        app.add_toast(format!("Copied: {}", result.attr));
-    } else if event.is_char_e() {
+    if event.is_ctrl_y() {
+        let attr = result.attr.clone();
+        let copied = copy_to_clipboard(&attr);
+        app.add_toast(clipboard_toast(copied, &format!("Copied: {attr}")));
+    } else if event.is_ctrl_e() {
         let cmd = format!("nix-env -iA nixpkgs.{}", result.attr);
-        copy_to_clipboard(&cmd);
-        app.add_toast(String::from("Copied install command"));
-    } else if event.is_char_p() {
+        let copied = copy_to_clipboard(&cmd);
+        app.add_toast(clipboard_toast(copied, "Copied install command"));
+    } else if event.is_ctrl_p() {
         let cmd = format!("nix profile install nixpkgs#{}", result.attr);
-        copy_to_clipboard(&cmd);
-        app.add_toast(String::from("Copied profile command"));
+        let copied = copy_to_clipboard(&cmd);
+        app.add_toast(clipboard_toast(copied, "Copied profile command"));
+    }
+}
+
+/// Build a toast message for a clipboard action based on whether it succeeded.
+fn clipboard_toast(copied: bool, success_message: &str) -> String {
+    if copied {
+        success_message.to_string()
+    } else {
+        String::from("Clipboard unavailable (no xclip/wl-copy/pbcopy/clip found)")
     }
 }
 
@@ -636,42 +655,46 @@ fn perform_which_search(app: &mut App, query: &str) {
     }
 }
 
-fn copy_to_clipboard(text: &str) {
+/// Spawn `command` (with optional args), feed `text` to its stdin, and wait for
+/// it to finish. Returns `true` if the copy succeeded.
+fn pipe_to_clipboard_command(command: &str, args: &[&str], text: &str) -> bool {
+    let Ok(mut child) = std::process::Command::new(command)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(text.as_bytes()).is_err() {
+            return false;
+        }
+        // Drop stdin so the child sees EOF before we wait on it.
+        drop(stdin);
+    }
+    child.wait().is_ok()
+}
+
+/// Copy `text` to the system clipboard. Returns `true` if a clipboard backend
+/// accepted the text. Never writes to stdout/stderr, which would corrupt the
+/// TUI while the terminal is in raw mode + the alternate screen.
+fn copy_to_clipboard(text: &str) -> bool {
     #[cfg(target_os = "linux")]
     {
-        if let Ok(mut cmd) = std::process::Command::new("xclip")
-            .args(["-selection", "clipboard"])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-        {
-            if let Some(mut stdin) = cmd.stdin.take() {
-                let _ = stdin.write_all(text.as_bytes());
-            }
-            let _ = cmd.wait();
-            return;
-        }
-        if let Ok(mut cmd) = std::process::Command::new("wl-copy")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-        {
-            if let Some(mut stdin) = cmd.stdin.take() {
-                let _ = stdin.write_all(text.as_bytes());
-            }
-            let _ = cmd.wait();
-            return;
-        }
+        pipe_to_clipboard_command("xclip", &["-selection", "clipboard"], text)
+            || pipe_to_clipboard_command("wl-copy", &[], text)
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("pbcopy")
-            .stdin(std::process::Stdio::piped())
-            .spawn();
+        pipe_to_clipboard_command("pbcopy", &[], text)
     }
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("clip")
-            .stdin(std::process::Stdio::piped())
-            .spawn();
+        pipe_to_clipboard_command("clip", &[], text)
     }
-    eprintln!("{}", text);
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = text;
+        false
+    }
 }
