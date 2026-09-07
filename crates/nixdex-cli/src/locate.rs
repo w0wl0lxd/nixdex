@@ -197,8 +197,25 @@ struct ProcessedArgs {
     details: bool,
 }
 
+/// Say what a multi-word invocation actually searched for.
+///
+/// `num_args = 1..` lets `nix-locate claude code` work, but it also makes a
+/// misplaced flag or a shell glob expand into several arguments that are then
+/// joined with spaces. Naming the joined pattern turns a silent no-match into
+/// something the user can see.
+fn warn_on_joined_pattern(parts: &[String], joined: &str, quiet: bool) {
+    if quiet || parts.len() < 2 {
+        return;
+    }
+    eprintln!(
+        "nix-locate: {} arguments joined into the pattern {joined:?}; quote it to silence this",
+        parts.len()
+    );
+}
+
 fn process_args(matches: Opts) -> color_eyre::Result<ProcessedArgs> {
     let pattern = matches.pattern.join(" ");
+    warn_on_joined_pattern(&matches.pattern, &pattern, matches.quiet);
     let start_anchor = if matches.at_root { "^" } else { "" };
     let end_anchor = if matches.whole_name { "$" } else { "" };
     let as_regex = matches.regex;

@@ -1,3 +1,9 @@
+//! Benchmarks for the package-metadata search (`nixdex_core::package_search`):
+//! opening a `packages.json` sidecar, literal search and fuzzy search over it.
+//!
+//! The parallel trigram path and the n-gram cache live in `database.rs` and are
+//! not exercised here.
+
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::io::Write;
