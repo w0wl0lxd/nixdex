@@ -23,20 +23,21 @@ impl From<Event> for AppEvent {
 }
 
 impl AppEvent {
+    /// Whether this event asks the application to quit.
+    ///
+    /// Only `Ctrl+C`. The search box always has focus, so a plain `q` is a
+    /// character the user is typing: matching it here quit the application in
+    /// the middle of any query containing the letter. The detail overlay is a
+    /// modal with no text entry and still closes on `q`, which it matches for
+    /// itself.
     pub fn is_quit(&self) -> bool {
         matches!(
             self,
-            Self::Key(
-                KeyEvent {
-                    code: KeyCode::Char('c'),
-                    modifiers: KeyModifiers::CONTROL,
-                    ..
-                } | KeyEvent {
-                    code: KeyCode::Char('q'),
-                    modifiers: KeyModifiers::NONE,
-                    ..
-                }
-            )
+            Self::Key(KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            })
         )
     }
 
