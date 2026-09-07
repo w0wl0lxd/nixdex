@@ -1,9 +1,3 @@
-- Rewrite the TUI help overlay so every key it lists has a live handler. It
-  advertised `s`, `f`, `r`, `c`, `e`, `n`, `j` and `q` as commands; none of
-  those were ever bound, and plain characters are search input.
-- Move the detail-pane pin from Space to Ctrl+D. Space types a space into the
-  query, so the pin had no reachable key. Ctrl+D with nothing selected now
-  says so instead of reporting a pin state the user cannot see.
-- Share one `default_db_dir()` from `nixdex-cli`'s library root. The same
-  helper was copied into `locate.rs`, `tui.rs` and `bin/nixdex.rs`, so the
-  default could drift between `--db` arguments.
+- Rewrite the TUI help overlay so every key it lists has a live handler. It advertised `s`, `f`, `r`, `c`, `e`, `n`, `j` and `q` as commands; none of those were ever bound, and plain characters are search input.
+- Move the detail-pane pin from Space to Ctrl+D. Space types a space into the query, so the pin had no reachable key. Ctrl+D with nothing selected now says so instead of reporting a pin state the user cannot see.
+- Share one `default_db_dir()` from `nixdex-cli`'s library root. The same helper was copied into `locate.rs`, `tui.rs` and `bin/nixdex.rs`, so the default could drift between `--db` arguments.

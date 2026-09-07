@@ -97,6 +97,9 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
 
     let mut debounce_deadline: Option<Instant> = None;
     let mut pending_query: Option<String> = None;
+    // `app.input` now advances on every keystroke, so it can no longer say
+    // whether a query was already searched for. Track that separately.
+    let mut dispatched_query: Option<String> = None;
 
     loop {
         terminal.draw(|frame| ui::render(frame, &app))?;
@@ -105,7 +108,7 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
             maybe_event = rx.recv() => {
                 match maybe_event {
                     Some(app_event) => {
-                        handle_input_event(&app, &app_event, &mut pending_query, &mut debounce_deadline);
+                        handle_input_event(&mut app, &app_event, &mut pending_query, &mut debounce_deadline);
                         handle_event(&mut app, app_event);
                         dispatch_reload(&mut app, &search_tx);
                     }
@@ -117,7 +120,6 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
             }
             maybe_outcome = outcome_rx.recv() => {
                 if let Some(outcome) = maybe_outcome {
-                    app.is_searching = false;
                     apply_search_outcome(&mut app, outcome);
                 }
             }
@@ -134,9 +136,10 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
             } => {
                 if let Some(query) = pending_query.take() {
                     debounce_deadline = None;
-                    if query != app.input {
+                    if dispatched_query.as_ref() != Some(&query) {
                         app.set_input(query.clone());
                         dispatch_search(&mut app, &query, &search_tx);
+                        dispatched_query = Some(query);
                     }
                 }
             }
@@ -203,7 +206,7 @@ fn send_search(
 }
 
 fn handle_input_event(
-    app: &App,
+    app: &mut App,
     event: &AppEvent,
     pending_query: &mut Option<String>,
     debounce_deadline: &mut Option<Instant>,
@@ -229,6 +232,10 @@ fn handle_input_event(
                 return;
             }
             new_input.push(*c);
+            // Show the character now. The debounce only delays the search; the
+            // query line has to track every keystroke or the box looks frozen
+            // until the user pauses.
+            app.set_input(new_input.clone());
             *pending_query = Some(new_input);
             *debounce_deadline = Some(Instant::now() + DEBOUNCE_DELAY);
         }
@@ -239,6 +246,7 @@ fn handle_input_event(
         }) => {
             let mut new_input = pending_query.take().unwrap_or_else(|| app.input.clone());
             new_input.pop();
+            app.set_input(new_input.clone());
             *pending_query = Some(new_input);
             *debounce_deadline = Some(Instant::now() + DEBOUNCE_DELAY);
         }
@@ -572,8 +580,12 @@ fn apply_search_outcome(app: &mut App, outcome: SearchOutcome) {
     let stale_query = outcome.query != app.input;
     let stale_mode = outcome.mode != app.mode;
     if stale_query || stale_mode {
+        // Leave `is_searching` alone. Clearing it here would hide the loading
+        // indicator while the search the user is actually waiting for still
+        // runs.
         return;
     }
+    app.is_searching = false;
     if let Some(results) = outcome.results {
         app.cache_results(outcome.query, results.clone());
         app.set_results(results);
@@ -878,7 +890,7 @@ mod tests {
 
     /// Feeds a string through the input handler one character at a time,
     /// returning the query that would be searched once the debounce fires.
-    fn type_text(app: &App, text: &str) -> Option<String> {
+    fn type_text(app: &mut App, text: &str) -> Option<String> {
         let mut pending = None;
         let mut deadline: Option<Instant> = None;
         for c in text.chars() {
@@ -903,33 +915,38 @@ mod tests {
     fn punctuation_is_query_text_not_a_shortcut() {
         // `/`, `:` and `?` were treated as commands, so they were stripped from
         // every query. Commands carry a modifier now and these are just text.
-        assert_eq!(type_text(&app(), "a/b:c?d").as_deref(), Some("a/b:c?d"));
+        assert_eq!(type_text(&mut app(), "a/b:c?d").as_deref(), Some("a/b:c?d"));
     }
 
     #[test]
     fn a_space_inside_the_pending_query_survives() {
         // The guard used to read `app.input`, which is still empty while the
         // debounce runs, so a fast "ab c" collapsed to "abc".
-        assert_eq!(type_text(&app(), "ab c").as_deref(), Some("ab c"));
+        assert_eq!(type_text(&mut app(), "ab c").as_deref(), Some("ab c"));
     }
 
     #[test]
     fn a_leading_space_is_still_dropped() {
-        assert_eq!(type_text(&app(), " ab").as_deref(), Some("ab"));
+        assert_eq!(type_text(&mut app(), " ab").as_deref(), Some("ab"));
     }
 
     #[test]
     fn tab_discards_the_queued_query() {
         // Tab switches mode and clears the visible input. A query left queued
         // then ran against the newly selected mode.
-        let app = app();
+        let mut app = app();
         let mut pending = None;
         let mut deadline: Option<Instant> = None;
         for c in "firefox".chars() {
-            handle_input_event(&app, &key(KeyCode::Char(c)), &mut pending, &mut deadline);
+            handle_input_event(
+                &mut app,
+                &key(KeyCode::Char(c)),
+                &mut pending,
+                &mut deadline,
+            );
         }
         assert_eq!(pending.as_deref(), Some("firefox"));
-        handle_input_event(&app, &key(KeyCode::Tab), &mut pending, &mut deadline);
+        handle_input_event(&mut app, &key(KeyCode::Tab), &mut pending, &mut deadline);
         assert_eq!(pending, None);
         assert_eq!(deadline, None);
     }
@@ -1055,16 +1072,73 @@ mod tests {
         assert_eq!(app.status_message, "done");
     }
 
+    /// The query line must track every keystroke.
+    ///
+    /// `app.input` was only updated when the debounce fired, so the search box
+    /// showed stale text for the whole debounce window and looked frozen.
+    #[test]
+    fn the_query_line_updates_on_every_keystroke() {
+        let mut app = app();
+        let mut pending = None;
+        let mut deadline: Option<Instant> = None;
+
+        handle_input_event(
+            &mut app,
+            &key(KeyCode::Char('f')),
+            &mut pending,
+            &mut deadline,
+        );
+        assert_eq!(app.input, "f");
+        handle_input_event(
+            &mut app,
+            &key(KeyCode::Char('o')),
+            &mut pending,
+            &mut deadline,
+        );
+        assert_eq!(app.input, "fo");
+        handle_input_event(
+            &mut app,
+            &key(KeyCode::Backspace),
+            &mut pending,
+            &mut deadline,
+        );
+        assert_eq!(app.input, "f");
+    }
+
+    /// A stale outcome must not clear the loading indicator.
+    ///
+    /// `is_searching` was cleared before the staleness check, so a result for a
+    /// query the user had moved on from hid the spinner while the current
+    /// search was still running.
+    #[test]
+    fn a_stale_outcome_leaves_the_loading_indicator_alone() {
+        let mut app = app();
+        app.set_input(String::from("current"));
+        app.is_searching = true;
+
+        super::apply_search_outcome(&mut app, outcome("previous", Some(Vec::new())));
+        assert!(
+            app.is_searching,
+            "a stale outcome must not stop the spinner"
+        );
+
+        super::apply_search_outcome(&mut app, outcome("current", Some(Vec::new())));
+        assert!(!app.is_searching, "the awaited outcome stops the spinner");
+    }
+
     /// A path typed in Locate mode must keep its separators.
     ///
     /// `/`, `:` and `?` were treated as shortcuts and dropped from the query in
     /// every mode, so `bin/ls` searched for `binls`.
     #[test]
     fn punctuation_stays_in_the_query() {
-        let mut app = app();
-        app.set_mode(SearchMode::Locate);
-        assert_eq!(type_text(&app, "bin/ls"), Some(String::from("bin/ls")));
-        assert_eq!(type_text(&app, "a:b?c"), Some(String::from("a:b?c")));
+        // A fresh app per case: `app.input` now tracks every keystroke, so a
+        // second query typed into the same app would append to the first.
+        for text in ["bin/ls", "a:b?c"] {
+            let mut app = app();
+            app.set_mode(SearchMode::Locate);
+            assert_eq!(type_text(&mut app, text), Some(String::from(text)));
+        }
     }
 
     /// Help moved to Ctrl+H because `?` is query text now.

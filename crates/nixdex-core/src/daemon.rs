@@ -538,8 +538,11 @@ async fn download_and_update(config: &PrebuiltConfig, cache_dir: &std::path::Pat
 /// If `admin_token` is configured, the caller must present it as an
 /// `Authorization: Bearer <token>` header (compared in constant time).
 /// If no token is configured, the endpoint is restricted to loopback addresses.
+///
+/// This guards every route that returns indexed data or operational detail,
+/// not just `/reload`.
 #[cfg(feature = "daemon")]
-async fn admin_auth_middleware(
+async fn auth_middleware(
     State(index_state): State<Arc<IndexState>>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
     request: axum::extract::Request,
@@ -603,18 +606,14 @@ fn constant_time_bearer_eq(presented: &str, expected: &str) -> bool {
 /// Run the HTTP server for basename lookups.
 #[cfg(feature = "daemon")]
 async fn run_http_server(addr: &str, index_state: Arc<IndexState>) -> Result<()> {
-    let app = Router::new()
-        .route("/health", get(health_handler))
-        .route("/ready", get(ready_handler))
-        .route("/version", get(version_handler))
-        .route("/metrics", get(metrics_handler))
-        .route(
-            "/reload",
-            post(reload_handler).route_layer(axum::middleware::from_fn_with_state(
-                Arc::clone(&index_state),
-                admin_auth_middleware,
-            )),
-        )
+    // Every route that returns indexed data or operational detail sits behind
+    // `auth_middleware`: with a token configured it must be presented, and
+    // without one the route is loopback-only. A daemon bound to a non-loopback
+    // address therefore cannot serve the index to an unauthenticated client.
+    // `/health`, `/ready`, `/version` and `/metrics` stay open, because probes
+    // and scrapers expect them to be and they expose no index content.
+    let data_routes = Router::new()
+        .route("/reload", post(reload_handler))
         .route("/locate", get(locate_handler))
         .route("/nix-locate", get(nix_locate_handler))
         .route("/search", get(search_handler))
@@ -623,6 +622,17 @@ async fn run_http_server(addr: &str, index_state: Arc<IndexState>) -> Result<()>
         .route("/options", get(options_handler))
         .route("/stats", get(stats_handler))
         .route("/command", get(command_handler))
+        .route_layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&index_state),
+            auth_middleware,
+        ));
+
+    let app = Router::new()
+        .route("/health", get(health_handler))
+        .route("/ready", get(ready_handler))
+        .route("/version", get(version_handler))
+        .route("/metrics", get(metrics_handler))
+        .merge(data_routes)
         .with_state(index_state);
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -1759,11 +1769,61 @@ mod tests {
                 "/reload",
                 post(reload_handler).route_layer(axum::middleware::from_fn_with_state(
                     Arc::clone(&state),
-                    admin_auth_middleware,
+                    auth_middleware,
                 )),
             )
             .layer(axum::extract::connect_info::MockConnectInfo(addr))
             .with_state(state)
+    }
+
+    /// Every data route must sit behind the same guard `/reload` has.
+    ///
+    /// `/locate`, `/nix-locate`, `/search`, `/info`, `/history`, `/options`,
+    /// `/stats` and `/command` were plain routes, so a daemon bound to a
+    /// non-loopback address served the whole index to any client that could
+    /// reach it.
+    fn guarded_app(state: Arc<IndexState>, addr: SocketAddr) -> Router {
+        Router::new()
+            .route("/stats", get(stats_handler))
+            .route("/info", get(info_handler))
+            .route_layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                auth_middleware,
+            ))
+            .layer(axum::extract::connect_info::MockConnectInfo(addr))
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn data_routes_reject_a_non_loopback_client_without_a_token() {
+        for path in ["/stats", "/info"] {
+            let mut app = guarded_app(empty_state(), SocketAddr::from(([203, 0, 113, 5], 1234)));
+            let request = axum::http::Request::builder()
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = tower::ServiceExt::<axum::extract::Request>::oneshot(&mut app, request)
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::UNAUTHORIZED,
+                "{path} must not answer an unauthenticated non-loopback client"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn data_routes_still_answer_a_loopback_client_without_a_token() {
+        let mut app = guarded_app(empty_state(), SocketAddr::from(([127, 0, 0, 1], 1234)));
+        let request = axum::http::Request::builder()
+            .uri("/stats")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::<axum::extract::Request>::oneshot(&mut app, request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
     }
 
     #[tokio::test]

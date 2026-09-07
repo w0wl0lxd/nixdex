@@ -3703,11 +3703,21 @@ fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
                 ATTRS_FILE,
             ];
             if include_heavy {
+                // Every file the heavy readers map on `open`, not just the
+                // headline two per index. `EntryIndex::open` also reads the
+                // store-path table, and `PathEntryIndex::open` also maps the
+                // string table, the offset table and its own store-path table;
+                // deleting one of those left the index unopenable while this
+                // check still reported the database up to date.
                 required_sidecars.extend_from_slice(&[
                     crate::entry_index::FST_FILE,
                     crate::entry_index::POSTINGS_FILE,
+                    crate::entry_index::STORE_PATHS_FILE,
                     crate::path_entry_index::FST_FILE,
                     crate::path_entry_index::ENTRIES_FILE,
+                    crate::path_entry_index::STRINGS_FILE,
+                    crate::path_entry_index::OFFSETS_FILE,
+                    crate::path_entry_index::STORE_PATHS_FILE,
                     crate::path_trigram_index::FST_FILE,
                     crate::path_trigram_index::POSTINGS_FILE,
                     crate::ngram_index::FST_FILE,
