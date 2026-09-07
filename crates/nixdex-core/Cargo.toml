@@ -104,7 +104,7 @@ name = "ngram_index"
 harness = false
 
 [[bench]]
-name = "parallel_search"
+name = "package_search"
 harness = false
 
 [lints]

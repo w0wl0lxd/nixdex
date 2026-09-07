@@ -1514,7 +1514,9 @@ async fn history_handler(
     let Some(history_db) = history_db else {
         return Err(json_error(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "no history database loaded",
+            "no history sidecar loaded: the daemon expects files.history in its \
+             index directory and does not download it -- run `nixdex update` \
+             against the same --db to fetch it",
         ));
     };
 
@@ -1581,7 +1583,9 @@ async fn options_handler(
     let Some(options_db) = options_db else {
         return Err(json_error(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "no options database loaded",
+            "no options sidecar loaded: the daemon expects files.options in its \
+             index directory and does not download it -- run `nixdex update` \
+             against the same --db to fetch it",
         ));
     };
 
