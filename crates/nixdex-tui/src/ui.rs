@@ -115,7 +115,7 @@ struct ThemeColors {
 }
 
 pub fn render(frame: &mut Frame<'_>, app: &App) {
-    let size = frame.size();
+    let size = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -353,8 +353,8 @@ fn render_toasts(frame: &mut Frame<'_>, app: &App, tc: &ThemeColors) {
     }
 
     let toast_area = ratatui::layout::Rect::new(
-        frame.size().width.saturating_sub(40),
-        frame.size().height.saturating_sub(3),
+        frame.area().width.saturating_sub(40),
+        frame.area().height.saturating_sub(3),
         40,
         1,
     );
@@ -404,23 +404,30 @@ fn centered_rect(
 }
 
 fn render_help_overlay(frame: &mut Frame<'_>, area: ratatui::layout::Rect, tc: &ThemeColors) {
+    // Every entry here must have a live handler in `tui.rs`. Plain printable
+    // characters are search input, so each command key carries a modifier.
     let help_text = [
         " nixdex TUI Help ",
         "",
-        "  /            Focus search input",
+        "  type         Search -- every plain character goes to the query",
+        "  /            Focus the search input",
         "  Tab          Switch search mode (Search/Locate/Which)",
-        "  Enter        Submit search",
-        "  Esc          Clear input / exit help",
-        "  Up/Down      Navigate results",
-        "  s            Cycle sort order",
-        "  f            Toggle fuzzy search",
-        "  r            Toggle regex search",
-        "  c            Toggle case sensitivity",
-        "  e            Toggle exact match",
-        "  n            Toggle name-only display",
-        "  j            Toggle JSON output",
+        "  Enter        Submit the search now",
+        "  Esc          Clear the input",
+        "  Up/Down      Move the selection",
+        "  PgUp/PgDn    Move the selection by a page",
+        "  Home/End     Jump to the first or last result",
+        "  Ctrl+D       Pin or unpin the detail pane",
+        "  Ctrl+A       Expand or collapse every result",
+        "  Ctrl+Y       Copy the selected attribute",
+        "  Ctrl+E       Copy a nix-env install command",
+        "  Ctrl+P       Copy a nix profile install command",
+        "  Ctrl+J       Toggle JSON output",
+        "  Ctrl+N       Toggle quiet mode",
+        "  Ctrl+R       Refresh",
+        "  Ctrl+T       Cycle the theme",
         "  ?            Toggle this help",
-        "  q            Quit",
+        "  Ctrl+C       Quit",
         "",
         " Press any key or Esc to continue.",
     ];

@@ -96,8 +96,8 @@ criterion = "0.5"
 divan = "0.1"
 
 # TUI
-ratatui = "0.25"
-crossterm = { version = "0.27", features = ["event-stream"] }
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
 nixdex-tui = { path = "crates/nixdex-tui", version = "0.1.0" }
 nixdex-history = { path = "crates/nixdex-history", version = "0.1.0" }
 nixdex-options = { path = "crates/nixdex-options", version = "0.1.0" }

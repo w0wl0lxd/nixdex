@@ -152,12 +152,17 @@ impl AppEvent {
         )
     }
 
-    pub fn is_space(&self) -> bool {
+    /// Ctrl+D pins or unpins the detail pane.
+    ///
+    /// This used to be plain Space. Every unmodified printable character is
+    /// search input now, so Space types a space into the query and can no
+    /// longer double as a command key.
+    pub fn is_ctrl_d(&self) -> bool {
         matches!(
             self,
             Self::Key(KeyEvent {
-                code: KeyCode::Char(' '),
-                modifiers: KeyModifiers::NONE,
+                code: KeyCode::Char('d'),
+                modifiers: KeyModifiers::CONTROL,
                 ..
             })
         )

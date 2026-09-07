@@ -1,9 +1,9 @@
 //! Logic for the `nix-locate` / `nixdex locate` command.
 
+use crate::default_db_dir;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::OnceLock;
 
 use clap::Parser;
 use color_eyre::eyre::WrapErr;
@@ -11,19 +11,6 @@ use tracing_subscriber::EnvFilter;
 
 use nixdex_core::database::{SearchMode, SearchOptions, SearchSort};
 use nixdex_core::{ALL_FILE_TYPES, FileType};
-
-/// Resolve the default nixdex database directory.
-fn default_db_dir() -> &'static str {
-    static CACHE: OnceLock<String> = OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            nixdex_core::nixdex_dir()
-                .into_os_string()
-                .into_string()
-                .unwrap_or_else(|_| String::from("/tmp/nixdex"))
-        })
-        .as_str()
-}
 
 /// Color policy for terminal output.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
