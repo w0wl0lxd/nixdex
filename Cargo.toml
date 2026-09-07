@@ -32,8 +32,12 @@ reqwest = { version = "0.13", default-features = false, features = [
   "zstd",
   "query",
   "json",
+  # `Response::stream` lives behind this feature; the sidecar download reads
+  # the body in chunks to enforce a size cap before buffering it.
+  "stream",
 ] }
 rayon = "1.10"
+futures-util = { version = "0.3", default-features = false }
 
 # Serialization and compression
 sonic-rs = "0.5"

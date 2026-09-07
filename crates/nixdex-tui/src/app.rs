@@ -35,8 +35,7 @@ impl SearchDbCache {
     }
 
     pub fn get_or_open(&mut self, sidecar: &Path) -> Result<&SearchDb, String> {
-        let needs_open = self.db.is_none()
-            || self.path.as_deref() != Some(sidecar);
+        let needs_open = self.db.is_none() || self.path.as_deref() != Some(sidecar);
 
         if needs_open {
             match SearchDb::open(sidecar) {

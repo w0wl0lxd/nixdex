@@ -19,6 +19,7 @@ sonic-rs = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 reqwest = { workspace = true }
+futures-util = { workspace = true }
 nixdex-core = { workspace = true, features = ["cli", "daemon"] }
 nixdex-history = { workspace = true }
 nixdex-options = { workspace = true }

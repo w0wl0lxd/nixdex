@@ -523,7 +523,13 @@ fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
     let pattern = opts.pattern.join(" ");
 
     let matches = if opts.fuzzy {
-        db.search_fuzzy(&pattern, opts.field, opts.case_sensitive, opts.sort, opts.limit)
+        db.search_fuzzy(
+            &pattern,
+            opts.field,
+            opts.case_sensitive,
+            opts.sort,
+            opts.limit,
+        )
     } else {
         db.search(
             &pattern,
@@ -951,8 +957,14 @@ async fn download_history_sidecar(
     let url = format!("{}/{}", config.release_url, filename);
     let dest = dest_dir.join(nixdex_history::HISTORY_FILE);
     let max_bytes = 512 * 1024 * 1024; // MAX_HISTORY_BYTES
-    download_sidecar_with_retry(&url, &dest, nixdex_history::HISTORY_MAGIC, max_bytes, "history")
-        .await
+    download_sidecar_with_retry(
+        &url,
+        &dest,
+        nixdex_history::HISTORY_MAGIC,
+        max_bytes,
+        "history",
+    )
+    .await
 }
 
 async fn download_options_sidecar(
@@ -967,8 +979,14 @@ async fn download_options_sidecar(
     let url = format!("{}/{}", config.release_url, filename);
     let dest = dest_dir.join(nixdex_options::OPTIONS_FILE);
     let max_bytes = 1024 * 1024 * 1024; // MAX_OPTIONS_BYTES
-    download_sidecar_with_retry(&url, &dest, nixdex_options::OPTIONS_MAGIC, max_bytes, "options")
-        .await
+    download_sidecar_with_retry(
+        &url,
+        &dest,
+        nixdex_options::OPTIONS_MAGIC,
+        max_bytes,
+        "options",
+    )
+    .await
 }
 
 async fn download_sidecar_with_retry(
@@ -989,7 +1007,16 @@ async fn download_sidecar_with_retry(
     }
 
     let temp_path = sidecar_temp_path(dest);
-    retry_sidecar_download(&client, url, &temp_path, dest, expected_magic, max_bytes, name).await
+    retry_sidecar_download(
+        &client,
+        url,
+        &temp_path,
+        dest,
+        expected_magic,
+        max_bytes,
+        name,
+    )
+    .await
 }
 
 fn sidecar_temp_path(dest: &std::path::Path) -> std::path::PathBuf {
@@ -1010,8 +1037,7 @@ async fn retry_sidecar_download(
 ) -> color_eyre::Result<()> {
     let mut last_err = None;
     for attempt in 1..=MAX_SIDECAR_RETRIES {
-        match download_sidecar_once(client, url, temp_path, expected_magic, max_bytes, name).await
-        {
+        match download_sidecar_once(client, url, temp_path, expected_magic, max_bytes, name).await {
             Ok(()) => match finalize_sidecar_download(temp_path, dest, name).await {
                 Ok(()) => return Ok(()),
                 Err(err) => last_err = Some(err),
@@ -1070,16 +1096,21 @@ async fn download_sidecar_once(
         ));
     }
 
-    // Check Content-Length header if present and reject if too large
-    if let Some(content_length) = response.content_length() {
-        if content_length > max_bytes as u64 {
-            return Err(color_eyre::eyre::eyre!(
-                "{} sidecar too large: Content-Length {} bytes exceeds limit of {} bytes",
-                name,
-                content_length,
-                max_bytes
-            ));
-        }
+    // Check Content-Length header if present and reject if too large.
+    // `content_length` is a u64 and the cap a usize, so the header is
+    // narrowed rather than cast: a length that does not fit in a `usize`
+    // cannot fit under the cap either, so it counts as too large.
+    if let Some(content_length) = response.content_length()
+        && usize::try_from(content_length)
+            .ok()
+            .is_none_or(|length| length > max_bytes)
+    {
+        return Err(color_eyre::eyre::eyre!(
+            "{} sidecar too large: Content-Length {} bytes exceeds limit of {} bytes",
+            name,
+            content_length,
+            max_bytes
+        ));
     }
 
     // Stream the response body with chunked reads to enforce size limit
