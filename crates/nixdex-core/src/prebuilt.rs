@@ -902,6 +902,8 @@ mod tests {
         addr
     }
 
+    // Miri cannot run this test: it drives a real tokio TCP listener.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn parallel_range_download_reconstructs() {
         let data = Arc::new(make_fake_db(2 * (1 << 20) + 1234));
@@ -931,6 +933,8 @@ mod tests {
         assert_eq!(got, *data);
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn range_ignoring_server_falls_back_to_serial() {
         let data = Arc::new(make_fake_db(2 * (1 << 20) + 1234));
@@ -960,6 +964,8 @@ mod tests {
         assert_eq!(got, *data);
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn segmented_download_resumes_after_transient_failure() {
         let data = Arc::new(make_fake_db(2 * (1 << 20) + 1234));

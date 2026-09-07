@@ -564,6 +564,8 @@ mod tests {
         assert!(!is_command_candidate(b"ls")); // not absolute
     }
 
+    // Miri has no `mmap`, and opening the index memory-maps the sidecars.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn build_and_query_command() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -629,6 +631,8 @@ mod tests {
         assert!(missing.is_empty());
     }
 
+    // Miri has no `mmap`, and opening the index memory-maps the sidecars.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn dedup_providers_and_commands() {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -392,6 +392,8 @@ mod tests {
         )
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn build_and_lookup_returns_store_paths() {
         let dir = tempfile::tempdir().expect("tempdir");

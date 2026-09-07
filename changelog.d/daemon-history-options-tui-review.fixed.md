@@ -13,3 +13,4 @@
 - `/history` and `/options` say which sidecar is absent and that `nixdex update` fetches it, instead of a bare "no history database loaded". The daemon still does not download sidecars itself.
 - The `parallel_search` benchmark is renamed to `package_search`, which is what it measures; the parallel trigram path and the n-gram cache are not exercised by it.
 - `advise_huge_pages` now asks for `MADV_HUGEPAGE` only on Linux, so the `huge_pages` feature builds on macOS again; the portable `MADV_WILLNEED` read-ahead hint still applies everywhere.
+- The `miri` job runs again: every test that memory-maps a sidecar, opens a real database, calls into `zstd` or drives a tokio TCP listener carries `#[cfg_attr(miri, ignore)]`, matching the idiom already used in `hydra.rs` and `basename_index.rs`. Miri supports neither `mmap` nor foreign function calls, so those tests aborted the whole run before reaching the logic Miri can actually check.

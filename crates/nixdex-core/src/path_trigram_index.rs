@@ -306,6 +306,8 @@ fn read_ids_at(postings: &[u8], cookie: u64) -> Result<Vec<u32>> {
 mod tests {
     use super::*;
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn build_and_intersect() {
         let dir = tempfile::tempdir().expect("tempdir");
