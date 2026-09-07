@@ -4223,6 +4223,8 @@ mod tests {
         )])
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn writer_reader_roundtrip_and_search() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4283,6 +4285,8 @@ mod tests {
         search(&options).expect("search ok");
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn ngram_narrows_search_results() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4334,6 +4338,8 @@ mod tests {
     // substring. The ngram sidecar narrows by *package* ordinal, so this exercises
     // that package ordinals in the sidecar indexes align with the decoder's
     // per-frame `current_ordinal` (incl. multi-frame `frame_starts` threading).
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn sidecar_search_matches_full_scan() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4534,6 +4540,8 @@ mod tests {
         }
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn entry_index_exact_basename_matches_full_scan() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4609,6 +4617,8 @@ mod tests {
         );
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn normalized_path_fast_path_matches_full_scan() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4704,6 +4714,8 @@ mod tests {
         }
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn fast_path_fallbacks_for_regex_and_short_literals() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4808,6 +4820,8 @@ mod tests {
         );
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn missing_path_trigram_sidecars_fall_back_to_frcode() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4872,6 +4886,8 @@ mod tests {
         );
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn filter_prefix_skips_non_matching() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4915,6 +4931,8 @@ mod tests {
         assert!(re.is_match(b"/bin/hello"));
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn writer_builds_fst_sidecar_queryable_by_basename() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4966,6 +4984,8 @@ mod tests {
         assert!(none.is_empty());
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn writer_builds_path_index_queryable_by_full_path() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5029,6 +5049,8 @@ mod tests {
         assert!(missing.is_empty());
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn v2_writer_reader_roundtrip_and_search() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5062,6 +5084,8 @@ mod tests {
         assert!(dir.path().join("files.basename.fst").is_file());
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn v2_multiple_packages_yield_per_cpu_frames() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5129,6 +5153,8 @@ mod tests {
         assert!(frame_count >= 1 && frame_count <= num_cpus.max(2));
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn v2_selective_search_by_ordinals() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5183,6 +5209,8 @@ mod tests {
         assert!(hits.iter().any(|(_, e)| e.path == b"/bin/cat"));
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn v2_corrupt_seek_table_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5209,6 +5237,8 @@ mod tests {
         assert!(matches!(err, Error::Corrupt(_)));
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn v2_seek_table_smaller_than_header_plus_trailer_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5229,6 +5259,8 @@ mod tests {
         assert!(matches!(err, Error::Corrupt(_)));
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn add_skips_entries_with_forbidden_bytes() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5332,6 +5364,8 @@ mod tests {
         assert_eq!(extract_regex_literal_suffix(".*"), None);
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn regex_with_literal_prefix_uses_ngram_candidates() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5418,6 +5452,8 @@ mod tests {
         );
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn regex_with_prefix_and_suffix_uses_trigram_intersection() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5518,6 +5554,8 @@ mod tests {
     /// `search_short_literal`, which stopped collecting at `options.limit`.
     /// `search_results` sorts *after* that, so the limit picked whichever entry
     /// the index reached first rather than the smallest one.
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn a_short_literal_with_a_sort_and_a_limit_returns_the_smallest_match() {
         let dir = tempfile::tempdir().expect("tempdir");

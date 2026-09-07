@@ -395,6 +395,8 @@ fn read_ordinals_at(postings: &[u8], cookie: u64) -> Result<Vec<u32>> {
 mod tests {
     use super::*;
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn build_and_query_shared_trigram() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -431,6 +433,8 @@ mod tests {
         assert_eq!(ordinals, vec![0, 1]);
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn no_shared_package_is_empty_bitmap() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -449,6 +453,8 @@ mod tests {
         assert!(candidates.is_empty());
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn pattern_shorter_than_three_returns_none() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -467,6 +473,8 @@ mod tests {
         );
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn nonmatching_special_chars_produce_empty_candidates() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -503,6 +511,8 @@ mod tests {
         );
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn short_paths_are_skipped() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -522,6 +532,8 @@ mod tests {
         assert_eq!(ordinals, vec![0]);
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn intersecting_trigrams_narrows_candidates() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -565,6 +577,8 @@ mod tests {
         assert_eq!(ordinals, vec![0]);
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn slash_in_pattern_and_path() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -623,6 +637,8 @@ mod tests {
         );
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn intersecting_lazy_short_circuits_on_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
