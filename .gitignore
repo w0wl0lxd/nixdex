@@ -110,3 +110,9 @@ target-nextest/
 
 # Private local planning (never commit)
 .plan/
+
+# Scratch build and test logs.
+*.log
+
+# Stray build artifacts from ad-hoc compiles.
+test_simd
