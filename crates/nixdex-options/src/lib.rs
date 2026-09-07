@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Maximum total size of the options sidecar (defensive cap).
-const MAX_OPTIONS_BYTES: usize = 1024 * 1024 * 1024;
+///
+/// Public so the downloader can reject an oversized body before buffering it,
+/// instead of repeating the number and drifting from the value enforced here.
+pub const MAX_OPTIONS_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Maximum number of option records.
 const MAX_OPTION_COUNT: usize = 100_000;
@@ -64,6 +67,22 @@ pub enum Error {
 
 /// Convenience alias.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Strips the `| ` prefix that nixpkgs option descriptions carry over from
+/// their Markdown table source.
+///
+/// Normalising here keeps every consumer consistent. The CLI used to strip the
+/// prefix only when printing a human-readable record, so `--json`, the daemon's
+/// `/options` response and [`OptionsDb::search`] all saw -- and matched
+/// against -- the prefixed text. Both the build path and the sidecar decode
+/// path go through this, because a downloaded sidecar never passes through
+/// [`OptionsBuilder::record_option`].
+fn normalize_description(description: String) -> String {
+    match description.strip_prefix("| ") {
+        Some(rest) => rest.to_string(),
+        None => description,
+    }
+}
 
 /// A single NixOS module option record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,8 +163,9 @@ impl OptionsDb {
             if line.is_empty() {
                 continue;
             }
-            let record: OptionRecord =
+            let mut record: OptionRecord =
                 sonic_rs::from_slice(line).map_err(|err| Error::Json(err.to_string()))?;
+            record.description = normalize_description(std::mem::take(&mut record.description));
             if record.attr.len() > MAX_OPTION_ATTR_BYTES {
                 return Err(Error::Corrupt(format!(
                     "option attr too long: {} (max {MAX_OPTION_ATTR_BYTES})",
@@ -251,7 +271,7 @@ impl OptionsBuilder {
         let record = OptionRecord {
             attr,
             r#type,
-            description,
+            description: normalize_description(description),
             default,
             example,
         };
@@ -306,5 +326,33 @@ impl OptionsBuilder {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_description;
+
+    #[test]
+    fn a_markdown_table_prefix_is_stripped() {
+        assert_eq!(
+            normalize_description("| Whether to enable the service.".to_string()),
+            "Whether to enable the service."
+        );
+    }
+
+    #[test]
+    fn a_description_without_the_prefix_is_untouched() {
+        assert_eq!(
+            normalize_description("Whether to enable the service.".to_string()),
+            "Whether to enable the service."
+        );
+    }
+
+    #[test]
+    fn a_bare_pipe_is_not_a_prefix() {
+        // Only the `| ` pair is the table artefact. A pipe that starts real
+        // prose, or one with no following space, must survive.
+        assert_eq!(normalize_description("|pipe".to_string()), "|pipe");
     }
 }

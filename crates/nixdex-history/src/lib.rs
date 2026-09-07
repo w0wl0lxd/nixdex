@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Maximum total size of the history sidecar (defensive cap).
-const MAX_HISTORY_BYTES: usize = 512 * 1024 * 1024;
+///
+/// Public so the downloader can reject an oversized body before buffering it,
+/// instead of repeating the number and drifting from the value enforced here.
+pub const MAX_HISTORY_BYTES: usize = 512 * 1024 * 1024;
 
 /// Maximum number of version entries per attribute.
 const MAX_VERSIONS_PER_ATTR: usize = 1_000;
