@@ -4,11 +4,15 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::app::App;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::cursor::Show;
+use crossterm::event::{
+    EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use futures_util::StreamExt;
 use nixdex_core::database::{SearchOptions, SearchSort};
 use nixdex_core::package_search::SearchSort as PkgSearchSort;
 use ratatui::Terminal;
@@ -23,10 +27,30 @@ use crate::ui;
 const DEBOUNCE_DELAY: Duration = Duration::from_millis(300);
 const CACHE_TTL: Duration = Duration::from_secs(30);
 
+/// Restores the terminal when the TUI exits, however it exits.
+///
+/// Raw mode and the alternate screen are entered before the event loop, and the
+/// loop propagates I/O errors with `?` -- `terminal.draw` runs every frame.
+/// Restoring only after a normal `break` therefore left the terminal in raw
+/// mode, on the alternate screen and with no cursor on every error path, which
+/// the user could escape only with a manual `reset`.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        // A failure here cannot be reported usefully: the process is on its way
+        // out and the message would be drawn onto the alternate screen that is
+        // being torn down. Restoring as much as possible beats aborting.
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+    }
+}
+
 pub async fn run_tui(database: PathBuf) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    let _terminal_guard = TerminalGuard;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -36,14 +60,19 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
 
+    // `crossterm::event::read()` blocks the calling thread until a key arrives,
+    // which ties up a runtime worker for the whole session. `EventStream` is
+    // the async reader for the same source and the `event-stream` feature is
+    // already enabled.
     let event_handle = tokio::spawn(async move {
-        while let Ok(event) = crossterm::event::read() {
+        let mut events = EventStream::new();
+        while let Some(Ok(event)) = events.next().await {
             let app_event = AppEvent::from(event);
-            if app_event.is_quit() {
-                let _ = tx.send(app_event);
+            let quit = app_event.is_quit();
+            let _ = tx.send(app_event);
+            if quit {
                 break;
             }
-            let _ = tx.send(app_event);
         }
     });
 
@@ -81,7 +110,15 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
                     debounce_deadline = None;
                     if query != app.input {
                         app.set_input(query.clone());
+                        // Draw once with the flag set. The search is
+                        // synchronous, so setting and clearing the flag around
+                        // it inside one `select!` branch meant no frame was
+                        // ever rendered while it was true and the loading
+                        // indicator was unreachable.
+                        app.is_searching = true;
+                        terminal.draw(|frame| ui::render(frame, &app))?;
                         perform_search(&mut app, &query);
+                        app.is_searching = false;
                     }
                 }
             }
@@ -89,10 +126,9 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
     }
 
     event_handle.abort();
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
 
+    // `_terminal_guard` restores raw mode, the alternate screen and the cursor
+    // as it drops, on this path and on every `?` above.
     Ok(())
 }
 
@@ -108,12 +144,24 @@ fn handle_input_event(
             modifiers: KeyModifiers::NONE,
             ..
         }) => {
-            if !app.input.is_empty() || *c != ' ' {
-                let mut new_input = pending_query.take().unwrap_or_else(|| app.input.clone());
-                new_input.push(*c);
-                *pending_query = Some(new_input);
-                *debounce_deadline = Some(Instant::now() + DEBOUNCE_DELAY);
+            // `/`, `:` and `?` are documented shortcuts, so they are commands
+            // rather than query text. Letting them through here both typed
+            // them into the search box and left the shortcuts unreachable.
+            if matches!(c, '/' | ':' | '?') {
+                return;
             }
+            let mut new_input = pending_query.take().unwrap_or_else(|| app.input.clone());
+            // Drop a leading space. The guard has to read the pending buffer,
+            // not `app.input`: while the debounce is still running `app.input`
+            // is empty even though characters are already queued, so typing
+            // "ab c" quickly used to lose the space and produce "abc".
+            if new_input.is_empty() && *c == ' ' {
+                *pending_query = Some(new_input);
+                return;
+            }
+            new_input.push(*c);
+            *pending_query = Some(new_input);
+            *debounce_deadline = Some(Instant::now() + DEBOUNCE_DELAY);
         }
         AppEvent::Key(KeyEvent {
             code: KeyCode::Backspace,
@@ -125,8 +173,12 @@ fn handle_input_event(
             *pending_query = Some(new_input);
             *debounce_deadline = Some(Instant::now() + DEBOUNCE_DELAY);
         }
+        // Esc clears the query. Tab switches mode, which clears the visible
+        // input, so the queued query has to go with it: leaving it in place ran
+        // the previous mode's text against the newly selected mode once the
+        // debounce fired.
         AppEvent::Key(KeyEvent {
-            code: KeyCode::Esc,
+            code: KeyCode::Esc | KeyCode::Tab,
             modifiers: KeyModifiers::NONE,
             ..
         }) => {
@@ -179,15 +231,6 @@ fn handle_key_event(app: &mut App, event: AppEvent) {
         app.set_status(String::from("Quitting..."));
         return;
     }
-    // Plain printable characters are search input, not commands. They are
-    // already accumulated into the query by `handle_input_event`, so we must
-    // not also treat them as command keys here (otherwise typing a word
-    // containing e.g. `q`, `a`, `y`, `j`, or `k` would quit the app or fire
-    // unrelated actions). Command shortcuts therefore use modifiers or
-    // non-character keys. `Esc`/`Space` are handled as input/detail keys below.
-    if event.as_char().is_some() {
-        return;
-    }
     if event.is_slash() {
         app.set_status(String::from(
             "Focus: search input — type to search, Esc to clear",
@@ -205,6 +248,15 @@ fn handle_key_event(app: &mut App, event: AppEvent) {
         } else {
             app.set_status(String::from("Help overlay closed"));
         }
+        return;
+    }
+    // Every remaining plain printable character is search input, not a
+    // command. `handle_input_event` has already appended it to the query, so
+    // treating it as a command key here would also fire an unrelated action --
+    // typing a word containing `a`, `y`, `j` or `k` moved the selection or
+    // copied a row. The shortcuts above are checked first because they are
+    // characters too, and are excluded from the query for that reason.
+    if event.as_char().is_some() {
         return;
     }
     if event.is_ctrl_t() {
@@ -358,10 +410,15 @@ fn handle_mouse_event(app: &mut App, event: AppEvent) {
         }) => {
             let result_count = app.result_count();
             if result_count > 0 {
+                // The list is scrolled, so a screen row maps to
+                // `app.scroll + offset`, not to the offset alone. Without the
+                // scroll term a click after scrolling selected a different
+                // entry than the one under the pointer.
                 let first_result_row = 2u16;
                 let row_offset = usize::from(row.saturating_sub(first_result_row));
-                if row_offset < result_count {
-                    app.selected = row_offset.min(result_count - 1);
+                let index = usize::from(app.scroll).saturating_add(row_offset);
+                if index < result_count {
+                    app.selected = index;
                     app.ensure_visible();
                 }
             }
@@ -436,8 +493,6 @@ fn perform_search(app: &mut App, query: &str) {
         return;
     }
 
-    app.is_searching = true;
-
     match app.mode {
         SearchMode::Search => {
             perform_package_search(app, query);
@@ -449,8 +504,6 @@ fn perform_search(app: &mut App, query: &str) {
             perform_which_search(app, query);
         }
     }
-
-    app.is_searching = false;
 }
 
 fn perform_package_search(app: &mut App, query: &str) {
@@ -696,5 +749,77 @@ fn copy_to_clipboard(text: &str) -> bool {
     {
         let _ = text;
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{App, AppEvent, Instant, KeyCode, KeyEvent, KeyModifiers, handle_input_event};
+    use std::path::PathBuf;
+
+    fn app() -> App {
+        App::new(PathBuf::from("/nonexistent"))
+    }
+
+    fn key(code: KeyCode) -> AppEvent {
+        AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// Feeds a string through the input handler one character at a time,
+    /// returning the query that would be searched once the debounce fires.
+    fn type_text(app: &App, text: &str) -> Option<String> {
+        let mut pending = None;
+        let mut deadline: Option<Instant> = None;
+        for c in text.chars() {
+            handle_input_event(app, &key(KeyCode::Char(c)), &mut pending, &mut deadline);
+        }
+        pending
+    }
+
+    #[test]
+    fn a_typed_q_is_not_a_quit() {
+        // The search box always has focus, so `q` is a character. Treating it
+        // as quit closed the application mid-word.
+        assert!(!key(KeyCode::Char('q')).is_quit());
+    }
+
+    #[test]
+    fn ctrl_c_is_still_a_quit() {
+        assert!(AppEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)).is_quit());
+    }
+
+    #[test]
+    fn shortcut_characters_stay_out_of_the_query() {
+        // `/`, `:` and `?` are documented shortcuts. Appending them here both
+        // typed them into the box and left the shortcuts unreachable.
+        assert_eq!(type_text(&app(), "a/b:c?d").as_deref(), Some("abcd"));
+    }
+
+    #[test]
+    fn a_space_inside_the_pending_query_survives() {
+        // The guard used to read `app.input`, which is still empty while the
+        // debounce runs, so a fast "ab c" collapsed to "abc".
+        assert_eq!(type_text(&app(), "ab c").as_deref(), Some("ab c"));
+    }
+
+    #[test]
+    fn a_leading_space_is_still_dropped() {
+        assert_eq!(type_text(&app(), " ab").as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn tab_discards_the_queued_query() {
+        // Tab switches mode and clears the visible input. A query left queued
+        // then ran against the newly selected mode.
+        let app = app();
+        let mut pending = None;
+        let mut deadline: Option<Instant> = None;
+        for c in "firefox".chars() {
+            handle_input_event(&app, &key(KeyCode::Char(c)), &mut pending, &mut deadline);
+        }
+        assert_eq!(pending.as_deref(), Some("firefox"));
+        handle_input_event(&app, &key(KeyCode::Tab), &mut pending, &mut deadline);
+        assert_eq!(pending, None);
+        assert_eq!(deadline, None);
     }
 }

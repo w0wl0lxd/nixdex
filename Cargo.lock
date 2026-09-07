@@ -1878,6 +1878,7 @@ version = "0.1.0"
 dependencies = [
  "color-eyre",
  "crossterm",
+ "futures-util",
  "nixdex-core",
  "ratatui",
  "tokio",
