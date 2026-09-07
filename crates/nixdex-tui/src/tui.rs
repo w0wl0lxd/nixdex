@@ -269,7 +269,7 @@ fn handle_key_event(app: &mut App, event: AppEvent) {
     handle_search_toggle_key(app, &event);
     handle_clipboard_key(app, &event);
     handle_enter_key(app, &event);
-    handle_space_key(app, &event);
+    handle_detail_pin_key(app, &event);
 }
 
 fn handle_navigation_key(app: &mut App, event: &AppEvent) {
@@ -386,8 +386,16 @@ fn handle_enter_key(app: &mut App, event: &AppEvent) {
     app.set_detail(detail);
 }
 
-fn handle_space_key(app: &mut App, event: &AppEvent) {
-    if !event.is_space() {
+fn handle_detail_pin_key(app: &mut App, event: &AppEvent) {
+    if !event.is_ctrl_d() {
+        return;
+    }
+    // `toggle_detail_pin` does nothing when no detail pane is open, so report
+    // that instead of claiming a pin state the user cannot see.
+    if app.detail.is_none() {
+        app.set_status(String::from(
+            "No detail pane to pin -- select a result first",
+        ));
         return;
     }
     app.toggle_detail_pin();
@@ -755,6 +763,7 @@ fn copy_to_clipboard(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{App, AppEvent, Instant, KeyCode, KeyEvent, KeyModifiers, handle_input_event};
+    use crate::app::DetailView;
     use std::path::PathBuf;
 
     fn app() -> App {
@@ -763,6 +772,10 @@ mod tests {
 
     fn key(code: KeyCode) -> AppEvent {
         AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn ctrl(code: KeyCode) -> AppEvent {
+        AppEvent::Key(KeyEvent::new(code, KeyModifiers::CONTROL))
     }
 
     /// Feeds a string through the input handler one character at a time,
@@ -821,5 +834,53 @@ mod tests {
         handle_input_event(&app, &key(KeyCode::Tab), &mut pending, &mut deadline);
         assert_eq!(pending, None);
         assert_eq!(deadline, None);
+    }
+
+    /// Ctrl+D pins the detail pane; a plain Space does not.
+    ///
+    /// Space used to be the pin key. Every unmodified printable character is
+    /// search input now, so Space no longer reached the command handler and
+    /// pinning had no key at all.
+    #[test]
+    fn ctrl_d_pins_the_detail_pane_and_space_does_not() {
+        let mut app = app();
+        app.set_detail(DetailView {
+            attr: String::from("hello"),
+            name: String::from("hello"),
+            description: String::new(),
+            path: None,
+            size: None,
+            license: None,
+            homepage: None,
+            maintainers: Vec::new(),
+            main_program: None,
+            pinned: false,
+        });
+        assert!(!app.detail_pinned);
+
+        super::handle_key_event(&mut app, key(KeyCode::Char(' ')));
+        assert!(
+            !app.detail_pinned,
+            "a plain Space is search input, not a command"
+        );
+
+        super::handle_key_event(&mut app, ctrl(KeyCode::Char('d')));
+        assert!(app.detail_pinned, "Ctrl+D must pin the detail pane");
+
+        super::handle_key_event(&mut app, ctrl(KeyCode::Char('d')));
+        assert!(!app.detail_pinned, "Ctrl+D must unpin it again");
+    }
+
+    /// Ctrl+D with nothing selected says so rather than reporting a pin state.
+    #[test]
+    fn ctrl_d_without_a_detail_pane_reports_that_nothing_is_selected() {
+        let mut app = app();
+        super::handle_key_event(&mut app, ctrl(KeyCode::Char('d')));
+        assert!(
+            app.status_message.contains("select a result"),
+            "unexpected status: {}",
+            app.status_message
+        );
+        assert!(!app.detail_pinned);
     }
 }

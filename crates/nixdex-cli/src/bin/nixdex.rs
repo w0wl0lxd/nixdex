@@ -1,10 +1,10 @@
 //! Multi-purpose `nixdex` tool — currently provides package search by attribute
 //! and description from the `packages.json` sidecar.
 
+use nixdex_cli::default_db_dir;
 use std::io::IsTerminal;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate, generate_to};
@@ -46,19 +46,6 @@ fn comma_available() -> Option<&'static str> {
 #[cfg(not(unix))]
 fn comma_available() -> Option<&'static str> {
     None
-}
-
-/// Resolve the default nixdex database directory.
-fn default_db_dir() -> &'static str {
-    static CACHE: OnceLock<String> = OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            nixdex_core::nixdex_dir()
-                .into_os_string()
-                .into_string()
-                .unwrap_or_else(|_| String::from("/tmp/nixdex"))
-        })
-        .as_str()
 }
 
 /// Color policy for terminal output.
