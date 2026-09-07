@@ -168,6 +168,21 @@ impl AppEvent {
         )
     }
 
+    /// Ctrl+H toggles the help overlay.
+    ///
+    /// It used to be `?`. Every unmodified printable character is search input,
+    /// and `?` is meaningful in a regex query, so the shortcut needs a modifier.
+    pub fn is_ctrl_h(&self) -> bool {
+        matches!(
+            self,
+            Self::Key(KeyEvent {
+                code: KeyCode::Char('h'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            })
+        )
+    }
+
     pub fn is_ctrl_r(&self) -> bool {
         matches!(
             self,
