@@ -22,7 +22,7 @@ reqwest = { workspace = true }
 rayon = { workspace = true }
 sonic-rs = { workspace = true }
 serde = { workspace = true }
-serde_yaml = { workspace = true }
+serde_norway = { workspace = true }
 fst = { workspace = true }
 roaring = { workspace = true }
 zstd = { workspace = true }

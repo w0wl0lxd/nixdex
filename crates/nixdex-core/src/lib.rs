@@ -1,7 +1,5 @@
 //! nixdex-core — library for building and searching a Nix package file index.
 
-#![allow(unsafe_code)]
-
 use std::io::{self, Read};
 
 pub mod basename_index;
