@@ -1309,20 +1309,22 @@ impl Reader {
 
         let needle = pattern.as_bytes();
 
-        // For basename-only queries, check the basename FST first so
-        // non-existent commands return near-instantly.
-        if !needle.contains(&b'/')
-            && let Some(basename_index) = self.basename()
-            && let Ok(ords) = basename_index.lookup_basename_ordinals(needle)
-            && !ords.is_empty()
-        {}
+        // A basename-FST probe used to run here with an empty body: it did the
+        // lookup and threw the answer away, so it was pure cost. It cannot
+        // become an early return either -- this is a substring search over full
+        // paths, so a basename miss does not mean there are no matches.
 
         let mut results = Vec::new();
         let path_count = entry.path_count();
 
-        let limit = match options.limit {
-            Some(v) => v,
-            None => usize::MAX,
+        // Stopping early is only safe when nothing re-orders the results
+        // afterwards. `search_results` sorts and then truncates, so under a
+        // sort this would hand back the first N found rather than the first N
+        // in the requested order: `--sort size --limit 1` returned whichever
+        // entry the index happened to reach first, not the smallest.
+        let limit = match (options.sort, options.limit) {
+            (SearchSort::None, Some(v)) => v,
+            _ => usize::MAX,
         };
         for path_id in 0..path_count {
             if results.len() >= limit {
@@ -3649,6 +3651,33 @@ pub(crate) fn generate_sidecars_mode(db_path: &Path, include_heavy: bool) -> Res
     generate_sidecars_impl(db_path, include_heavy)
 }
 
+/// Warn when the command index is absent from a database whose sidecars are
+/// otherwise complete.
+///
+/// `generate_sidecars` cannot build it -- it comes from indexing -- so the only
+/// useful thing to do is say so. Without this, a database missing the command
+/// index reported "sidecars are up to date" and then failed a daemon reload,
+/// which kept serving the older snapshot with nothing explaining why.
+fn warn_on_missing_command_index(db_dir: &Path, db_path: &Path) {
+    let missing: Vec<&str> = [
+        crate::command_index::FST_FILE,
+        crate::command_index::POSTINGS_FILE,
+        crate::command_index::PROVIDERS_FILE,
+    ]
+    .into_iter()
+    .filter(|name| !db_dir.join(name).exists())
+    .collect();
+    if missing.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        db_path = %db_path.display(),
+        missing = ?missing,
+        "command index files are absent; re-run indexing to build them -- \
+         generate-sidecars cannot produce them"
+    );
+}
+
 #[allow(clippy::cognitive_complexity)]
 #[allow(clippy::too_many_lines)]
 fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
@@ -3691,6 +3720,13 @@ fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
                 .copied()
                 .collect();
             if missing.is_empty() {
+                // The command index is written by `Writer::do_finish` during
+                // indexing, not here, so it cannot go in `required_sidecars`:
+                // listing it would make this function rebuild forever without
+                // ever producing it. Warn instead, so a database that is
+                // missing it is not silently reported as up to date and then
+                // rejected later when the daemon reloads.
+                warn_on_missing_command_index(db_dir, db_path);
                 tracing::info!(
                     db_path = %db_path.display(),
                     "sidecars are up to date; skipping regeneration"
@@ -5458,6 +5494,69 @@ mod tests {
             normalize(regex_pruned),
             normalize(baseline),
             "regex with prefix and suffix must match full scan"
+        );
+    }
+
+    /// `--sort size --limit 1` must return the globally smallest match.
+    ///
+    /// A pattern shorter than three characters routes to
+    /// `search_short_literal`, which stopped collecting at `options.limit`.
+    /// `search_results` sorts *after* that, so the limit picked whichever entry
+    /// the index reached first rather than the smallest one.
+    #[test]
+    fn a_short_literal_with_a_sort_and_a_limit_returns_the_smallest_match() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+        let path = sample_store_path();
+        // Three files whose names all contain "z", written largest first so a
+        // premature truncation cannot accidentally pick the smallest.
+        let tree = FileTree::directory(vec![(
+            Bytes::from_static(b"bin"),
+            FileTree::directory(vec![
+                (Bytes::from_static(b"za"), FileTree::regular(9000, true)),
+                (Bytes::from_static(b"zb"), FileTree::regular(500, true)),
+                (Bytes::from_static(b"zc"), FileTree::regular(3000, true)),
+            ]),
+        )]);
+
+        {
+            let mut writer = Writer::create(&db_path, 3).expect("create");
+            writer.add(&path, &tree, b"").expect("add");
+            writer.finish().expect("finish");
+        }
+        generate_sidecars(&db_path).expect("sidecars");
+
+        let options = SearchOptions {
+            database: dir.path().to_path_buf(),
+            pattern: "z".into(),
+            hash: None,
+            package_pattern: None,
+            exact_basename: None,
+            exact_path: None,
+            path_prefix: None,
+            literal_pattern: Some("z".into()),
+            file_type: &[],
+            mode: SearchMode::Minimal,
+            json: false,
+            yaml: false,
+            limit: Some(1),
+            count: false,
+            sort: SearchSort::SizeAsc,
+            min_size: None,
+            max_size: None,
+            exclude_fhs: false,
+            null_output: false,
+            quiet: false,
+            details: false,
+        };
+
+        let results = search_results(&options, None).expect("search");
+        assert_eq!(results.len(), 1, "the limit must still be honoured");
+        let (_, entry) = &results[0];
+        assert_eq!(
+            entry.node.size(),
+            500,
+            "the limit must be applied after the sort, not during the scan"
         );
     }
 }
