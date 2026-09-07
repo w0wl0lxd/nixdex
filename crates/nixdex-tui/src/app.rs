@@ -26,8 +26,15 @@ impl std::fmt::Debug for SearchDbCache {
     }
 }
 
+impl Default for SearchDbCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SearchDbCache {
-    fn new() -> Self {
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             db: None,
             path: None,
@@ -123,7 +130,6 @@ pub struct App {
     pub toasts: Vec<Toast>,
     pub is_searching: bool,
     pub show_help: bool,
-    pub search_db_cache: SearchDbCache,
 }
 
 #[derive(Debug, Clone)]
@@ -182,7 +188,6 @@ impl App {
             toasts: Vec::new(),
             is_searching: false,
             show_help: false,
-            search_db_cache: SearchDbCache::new(),
         }
     }
 
@@ -312,6 +317,25 @@ impl App {
         self.results.len()
     }
 
+    /// Snapshot the settings one search needs, for the blocking worker.
+    pub fn search_request(&self, query: &str) -> SearchRequest {
+        SearchRequest {
+            query: query.to_string(),
+            mode: self.mode,
+            database: self.database.clone(),
+            limit: self.search_limit,
+            sort: self.search_sort,
+            field: self.search_field,
+            case_sensitive: self.search_case_sensitive,
+            tiered_fuzzy: self.search_tiered_fuzzy,
+            fuzzy: self.search_fuzzy,
+            regex: self.search_regex,
+            exact: self.search_exact,
+            quiet: self.search_quiet,
+            details: self.search_details,
+        }
+    }
+
     pub fn cache_key(&self, query: &str) -> String {
         format!(
             "{:?}|{}|{:?}|{}|{}|{}|{}|{}|{:?}|{}|{}",
@@ -433,4 +457,39 @@ fn is_word_boundary(chars: &[char], from: usize, to: usize) -> bool {
         || prev == '/'
         || prev == ':'
         || curr.is_ascii_uppercase() && prev.is_ascii_lowercase()
+}
+
+/// Everything one search needs, snapshotted off `App`.
+///
+/// The search runs on a blocking worker task so the event loop can keep
+/// drawing and reading keys while a database read is in flight. The worker
+/// cannot borrow `App`, so it gets this copy of the settings instead.
+#[derive(Debug, Clone)]
+pub struct SearchRequest {
+    pub query: String,
+    pub mode: SearchMode,
+    pub database: PathBuf,
+    pub limit: Option<usize>,
+    pub sort: SearchSort,
+    pub field: SearchField,
+    pub case_sensitive: bool,
+    pub tiered_fuzzy: bool,
+    pub fuzzy: bool,
+    pub regex: bool,
+    pub exact: bool,
+    pub quiet: bool,
+    pub details: bool,
+}
+
+/// What one search produced, sent back to the event loop.
+///
+/// `results` is `None` when the search failed or found no usable database. The
+/// loop then keeps the results it already has and shows `status` instead, so a
+/// transient error does not wipe the list under the user.
+#[derive(Debug)]
+pub struct SearchOutcome {
+    pub query: String,
+    pub mode: SearchMode,
+    pub results: Option<Vec<SearchResult>>,
+    pub status: Option<String>,
 }
