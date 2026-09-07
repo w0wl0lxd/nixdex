@@ -500,13 +500,16 @@ fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
 
     let pattern = opts.pattern.join(" ");
 
-    // Exclusions run after the search, so applying `--limit` inside it would
-    // spend the budget on rows that are about to be dropped: a limit of 10 with
-    // 3 excluded rows returned 7 results and undercounted `--count`. The search
-    // is therefore left unbounded whenever an exclusion is set, and the limit is
-    // applied to the surviving rows below.
+    // Exclusion and `--reverse` both run after the search, so letting the search
+    // apply `--limit` would spend the budget on the wrong rows. Exclusion drops
+    // rows the limit already paid for: a limit of 10 with 3 excluded rows
+    // returned 7 results and undercounted `--count`. `--reverse` is worse -- the
+    // search truncates to the first N of the sort, so `--sort attr --reverse
+    // --limit 2` returned the two lowest attrs, not the two highest. When either
+    // is set the search runs unbounded and the limit is applied below instead.
     let excluding = opts.exclude.is_some() || opts.exclude_regex.is_some();
-    let search_limit = if excluding { None } else { opts.limit };
+    let limit_after_search = excluding || opts.reverse;
+    let search_limit = if limit_after_search { None } else { opts.limit };
 
     let matches = if opts.fuzzy {
         db.search_fuzzy(
@@ -565,7 +568,7 @@ fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
 
     // Apply the limit the search was not allowed to apply. Truncating after the
     // reverse keeps `--limit` meaning "the first N of what you asked to see".
-    if excluding && let Some(limit) = opts.limit {
+    if limit_after_search && let Some(limit) = opts.limit {
         matches.truncate(limit);
     }
 
@@ -639,9 +642,8 @@ fn output_search_results(
         }
         OutputFormat::Yaml => {
             for record in matches {
-                let yaml = serde_norway::to_string(record)
-                    .wrap_err("failed to serialize search result as YAML")?;
-                writeln!(out, "{yaml}").wrap_err("failed to write search result")?;
+                let doc = yaml_document(record)?;
+                write!(out, "{doc}").wrap_err("failed to write search result")?;
                 flush_if_streaming(&mut out, opts.stream)?;
             }
         }
@@ -667,6 +669,18 @@ fn output_search_results(
         }
     }
     Ok(())
+}
+
+/// Render one search result as a YAML document, with its `---` head marker.
+///
+/// Results were serialized one after another with no separator, so more than
+/// one produced a single document with every key repeated -- not a valid YAML
+/// stream. Each record is its own document now, which is what a reader
+/// consuming `--format yaml` expects.
+fn yaml_document<T: serde::Serialize>(record: &T) -> color_eyre::Result<String> {
+    let body =
+        serde_norway::to_string(record).wrap_err("failed to serialize search result as YAML")?;
+    Ok(format!("---\n{body}"))
 }
 
 fn run_info(opts: InfoOpts) -> color_eyre::Result<()> {
@@ -918,11 +932,12 @@ fn csv_escape(s: &str) -> String {
 
 /// Rejects a release URL that would fetch index data over plaintext HTTP.
 ///
-/// A downloaded sidecar is installed into the database directory after only a
-/// four-byte magic check, and there is no signature or checksum to fall back
-/// on, so transport security is the only integrity guarantee available: anyone
-/// able to rewrite the response controls the file. Loopback stays allowed so a
-/// local mirror or a test server still works.
+/// A downloaded sidecar is checked against a published SHA-256 before it is
+/// installed, but that digest is fetched from the same server as the artifact,
+/// so it only catches a mirror or a corrupted transfer. Anyone able to rewrite
+/// the response can rewrite the digest with it, which makes transport security
+/// the part that stops a MITM. Loopback stays allowed so a local mirror or a
+/// test server still works.
 fn validate_release_url(url: &str) -> color_eyre::Result<()> {
     let rest = match url.split_once("://") {
         Some(("https", _)) => return Ok(()),
@@ -1178,6 +1193,92 @@ async fn finalize_sidecar_download(
     Ok(())
 }
 
+/// Longest `.sha256` body accepted. A sha256sum line is 64 hex digits plus a
+/// separator and a file name; anything much larger is not a checksum file.
+const MAX_CHECKSUM_BYTES: usize = 4096;
+
+/// Parse the digest out of a `.sha256` file.
+///
+/// Accepts both the bare 64-hex-digit form and GNU `sha256sum` output
+/// (`<hex>  <name>`), which is what release tooling usually publishes.
+fn parse_sha256_hex(text: &str) -> color_eyre::Result<[u8; 32]> {
+    let field = text
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| color_eyre::eyre::eyre!("checksum file is empty"))?;
+    if field.len() != 64 {
+        return Err(color_eyre::eyre::eyre!(
+            "checksum must be 64 hex digits, got {} characters",
+            field.len()
+        ));
+    }
+    let mut digest = [0u8; 32];
+    for (i, byte) in digest.iter_mut().enumerate() {
+        let pair = field
+            .get(i * 2..i * 2 + 2)
+            .ok_or_else(|| color_eyre::eyre::eyre!("checksum is not valid hex"))?;
+        *byte = u8::from_str_radix(pair, 16)
+            .map_err(|_| color_eyre::eyre::eyre!("checksum is not valid hex"))?;
+    }
+    Ok(digest)
+}
+
+/// Fetch the published SHA-256 for a sidecar.
+///
+/// The digest lives next to the artifact as `<url>.sha256`. A missing or
+/// malformed checksum is an error, not a reason to skip the check: accepting
+/// the bytes anyway would make the whole verification optional for whoever
+/// controls the server.
+async fn fetch_expected_digest(
+    client: &reqwest::Client,
+    url: &str,
+    name: &str,
+) -> color_eyre::Result<[u8; 32]> {
+    let checksum_url = format!("{url}.sha256");
+    let response = client.get(&checksum_url).send().await.map_err(|err| {
+        color_eyre::eyre::eyre!("failed to download {name} sidecar checksum: {err}")
+    })?;
+    if !response.status().is_success() {
+        return Err(color_eyre::eyre::eyre!(
+            "failed to download {} sidecar checksum: HTTP {}",
+            name,
+            response.status()
+        ));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|err| color_eyre::eyre::eyre!("failed to read {name} sidecar checksum: {err}"))?;
+    if bytes.len() > MAX_CHECKSUM_BYTES {
+        return Err(color_eyre::eyre::eyre!(
+            "{name} sidecar checksum file is too large"
+        ));
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| color_eyre::eyre::eyre!("{name} sidecar checksum is not text"))?;
+    parse_sha256_hex(text).wrap_err_with(|| format!("invalid checksum for the {name} sidecar"))
+}
+
+/// Compare a sidecar body against its published digest.
+///
+/// This catches a mirror or CDN serving different bytes than the release, and
+/// a truncated or corrupted transfer. It is not a signature: it does not help
+/// if the release host itself is compromised, because the digest comes from
+/// that same host. Signing the digest is the fix for that, and needs a key
+/// distribution story this CLI does not have yet.
+fn verify_sha256(bytes: &[u8], expected: &[u8; 32], name: &str) -> color_eyre::Result<()> {
+    use sha2::Digest;
+    use subtle::ConstantTimeEq;
+
+    let actual = sha2::Sha256::digest(bytes);
+    if actual.ct_eq(expected).into() {
+        return Ok(());
+    }
+    Err(color_eyre::eyre::eyre!(
+        "{name} sidecar checksum mismatch: refusing to install the download"
+    ))
+}
+
 async fn download_sidecar_once(
     client: &reqwest::Client,
     url: &str,
@@ -1246,6 +1347,11 @@ async fn download_sidecar_once(
             magic_slice
         ));
     }
+
+    // Verify the published digest before anything touches the disk, so a
+    // mismatched download never becomes a file another process could pick up.
+    let expected = fetch_expected_digest(client, url, name).await?;
+    verify_sha256(&bytes, &expected, name)?;
 
     tokio::fs::write(temp_path, &bytes).await.map_err(|err| {
         color_eyre::eyre::eyre!("failed to write {} sidecar to temp file: {err}", name)
@@ -1869,5 +1975,73 @@ mod tests {
     #[test]
     fn a_url_without_a_scheme_is_refused() {
         assert!(validate_release_url("example.com/releases").is_err());
+    }
+
+    /// A multi-result YAML stream needs a `---` head marker per document.
+    ///
+    /// Without one the documents concatenate into a single document with every
+    /// key repeated, which no YAML reader accepts.
+    #[test]
+    fn each_yaml_result_is_its_own_document() {
+        #[derive(serde::Serialize)]
+        struct Row {
+            attr: String,
+        }
+        let rows = [
+            Row {
+                attr: String::from("a"),
+            },
+            Row {
+                attr: String::from("b"),
+            },
+        ];
+        let stream: String = rows
+            .iter()
+            .map(|r| super::yaml_document(r).expect("serialize"))
+            .collect();
+        assert_eq!(stream, "---\nattr: a\n---\nattr: b\n");
+
+        let docs: Vec<serde_norway::Value> = serde_norway::Deserializer::from_str(&stream)
+            .map(|d| serde::Deserialize::deserialize(d).expect("document"))
+            .collect();
+        assert_eq!(docs.len(), 2, "the stream must parse as two documents");
+    }
+
+    /// The digest of the empty string, as published by `sha256sum`.
+    const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    #[test]
+    fn a_bare_hex_digest_parses() {
+        let digest = super::parse_sha256_hex(EMPTY_SHA256).expect("parse");
+        super::verify_sha256(b"", &digest, "test").expect("empty input must match");
+    }
+
+    #[test]
+    fn a_sha256sum_line_parses() {
+        let line = format!("{EMPTY_SHA256}  files.history\n");
+        let digest = super::parse_sha256_hex(&line).expect("parse");
+        super::verify_sha256(b"", &digest, "test").expect("empty input must match");
+    }
+
+    #[test]
+    fn a_malformed_checksum_is_rejected() {
+        for bad in ["", "not-hex", "abc", &"z".repeat(64)] {
+            assert!(
+                super::parse_sha256_hex(bad).is_err(),
+                "{bad:?} must not parse as a digest"
+            );
+        }
+    }
+
+    /// A body that does not match its published digest must never be installed.
+    #[test]
+    fn a_body_that_does_not_match_its_digest_is_refused() {
+        let digest = super::parse_sha256_hex(EMPTY_SHA256).expect("parse");
+        let err = super::verify_sha256(b"tampered", &digest, "history")
+            .expect_err("a mismatched body must be refused");
+        assert!(
+            err.to_string().contains("checksum mismatch"),
+            "unexpected error: {err}"
+        );
     }
 }
