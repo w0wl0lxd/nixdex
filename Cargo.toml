@@ -18,7 +18,7 @@ license = "AGPL-3.0-only"
 repository = "https://github.com/w0wl0lxd/nixdex"
 description = "Modern rewrite of nix-index / nix-locate"
 categories = ["development-tools", "command-line-utilities"]
-rust-version = "1.99.0"
+rust-version = "1.90.0"
 
 [workspace.dependencies]
 # Core async runtime and networking
@@ -42,7 +42,7 @@ futures-util = { version = "0.3", default-features = false }
 # Serialization and compression
 sonic-rs = "0.5"
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+serde_norway = "0.9"
 zstd = "0.13"
 bytes = { version = "1", features = ["serde"] }
 byteorder = "1"
@@ -103,7 +103,10 @@ nixdex-history = { path = "crates/nixdex-history", version = "0.1.0" }
 nixdex-options = { path = "crates/nixdex-options", version = "0.1.0" }
 
 [workspace.lints.rust]
-unsafe_code = "warn"
+# `deny`, not `forbid`: the only unsafe in the workspace is the `huge_pages`
+# module in nixdex-core, which opts out with a scoped `#![allow(unsafe_code)]`.
+# `forbid` cannot be overridden, and every other crate stays covered.
+unsafe_code = "deny"
 unused_must_use = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
 

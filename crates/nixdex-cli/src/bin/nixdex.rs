@@ -652,7 +652,7 @@ fn output_search_results(
         }
         OutputFormat::Yaml => {
             for record in matches {
-                let yaml = serde_yaml::to_string(record)
+                let yaml = serde_norway::to_string(record)
                     .wrap_err("failed to serialize search result as YAML")?;
                 writeln!(out, "{yaml}").wrap_err("failed to write search result")?;
                 flush_if_streaming(&mut out, opts.stream)?;

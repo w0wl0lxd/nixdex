@@ -255,81 +255,81 @@ fn render_daemon_yaml(matches: &[NixLocateMatch], opts: &RenderOpts, delim: &str
         .iter()
         .map(|m| {
             let (kind, size) = node_kind_size(m.node.as_ref());
-            let mut obj = serde_yaml::Mapping::new();
+            let mut obj = serde_norway::Mapping::new();
             obj.insert(
-                serde_yaml::Value::String("attr".into()),
-                serde_yaml::Value::String(m.attr.clone()),
+                serde_norway::Value::String("attr".into()),
+                serde_norway::Value::String(m.attr.clone()),
             );
             obj.insert(
-                serde_yaml::Value::String("size".into()),
-                serde_yaml::Value::Number(size.into()),
+                serde_norway::Value::String("size".into()),
+                serde_norway::Value::Number(size.into()),
             );
             obj.insert(
-                serde_yaml::Value::String("kind".into()),
-                serde_yaml::Value::String(kind.to_string()),
+                serde_norway::Value::String("kind".into()),
+                serde_norway::Value::String(kind.to_string()),
             );
             obj.insert(
-                serde_yaml::Value::String("path".into()),
-                serde_yaml::Value::String(m.path.clone().unwrap_or_else(String::new)),
+                serde_norway::Value::String("path".into()),
+                serde_norway::Value::String(m.path.clone().unwrap_or_else(String::new)),
             );
             obj.insert(
-                serde_yaml::Value::String("store_path".into()),
-                serde_yaml::Value::String(store_path_string(m)),
+                serde_norway::Value::String("store_path".into()),
+                serde_norway::Value::String(store_path_string(m)),
             );
             if opts.details {
                 append_daemon_yaml_details(&mut obj, m);
             }
-            let yaml = serde_yaml::to_string(&obj).unwrap_or_else(|_| String::new());
+            let yaml = serde_norway::to_string(&obj).unwrap_or_else(|_| String::new());
             format!("{yaml}{delim}")
         })
         .collect()
 }
 
-fn append_daemon_yaml_details(obj: &mut serde_yaml::Mapping, m: &NixLocateMatch) {
+fn append_daemon_yaml_details(obj: &mut serde_norway::Mapping, m: &NixLocateMatch) {
     if let Some(ref desc) = m.description {
         obj.insert(
-            serde_yaml::Value::String("description".into()),
-            serde_yaml::Value::String(desc.clone()),
+            serde_norway::Value::String("description".into()),
+            serde_norway::Value::String(desc.clone()),
         );
     }
     if let Some(ref lic) = m.license {
         obj.insert(
-            serde_yaml::Value::String("license".into()),
-            serde_yaml::Value::String(lic.clone()),
+            serde_norway::Value::String("license".into()),
+            serde_norway::Value::String(lic.clone()),
         );
     }
     if let Some(ref hp) = m.homepage {
         obj.insert(
-            serde_yaml::Value::String("homepage".into()),
-            serde_yaml::Value::String(hp.clone()),
+            serde_norway::Value::String("homepage".into()),
+            serde_norway::Value::String(hp.clone()),
         );
     }
     if let Some(ref maint) = m.maintainers {
-        let vals: Vec<serde_yaml::Value> = maint
+        let vals: Vec<serde_norway::Value> = maint
             .iter()
             .cloned()
-            .map(serde_yaml::Value::String)
+            .map(serde_norway::Value::String)
             .collect();
         obj.insert(
-            serde_yaml::Value::String("maintainers".into()),
-            serde_yaml::Value::Sequence(vals),
+            serde_norway::Value::String("maintainers".into()),
+            serde_norway::Value::Sequence(vals),
         );
     }
     if let Some(ref plats) = m.platforms {
-        let vals: Vec<serde_yaml::Value> = plats
+        let vals: Vec<serde_norway::Value> = plats
             .iter()
             .cloned()
-            .map(serde_yaml::Value::String)
+            .map(serde_norway::Value::String)
             .collect();
         obj.insert(
-            serde_yaml::Value::String("platforms".into()),
-            serde_yaml::Value::Sequence(vals),
+            serde_norway::Value::String("platforms".into()),
+            serde_norway::Value::Sequence(vals),
         );
     }
     if let Some(ref mp) = m.main_program {
         obj.insert(
-            serde_yaml::Value::String("main_program".into()),
-            serde_yaml::Value::String(mp.clone()),
+            serde_norway::Value::String("main_program".into()),
+            serde_norway::Value::String(mp.clone()),
         );
     }
 }

@@ -2979,12 +2979,12 @@ fn print_match_yaml(
     match options.mode {
         SearchMode::Minimal => {
             if printed_attrs.insert(attr.into()) {
-                let mut obj = serde_yaml::Mapping::new();
+                let mut obj = serde_norway::Mapping::new();
                 obj.insert(
-                    serde_yaml::Value::String("attr".into()),
-                    serde_yaml::Value::String(attr.to_string()),
+                    serde_norway::Value::String("attr".into()),
+                    serde_norway::Value::String(attr.to_string()),
                 );
-                if let Ok(yaml) = serde_yaml::to_string(&obj) {
+                if let Ok(yaml) = serde_norway::to_string(&obj) {
                     print!("{yaml}{delim}");
                     return true;
                 }
@@ -3000,76 +3000,76 @@ fn print_match_yaml(
                 FileNode::Symlink { .. } => ("s", 0),
             };
             let meta = package_db.and_then(|db| db.lookup_attr(store_path.origin().attr.as_str()));
-            let mut obj = serde_yaml::Mapping::new();
+            let mut obj = serde_norway::Mapping::new();
             obj.insert(
-                serde_yaml::Value::String("attr".into()),
-                serde_yaml::Value::String(attr.to_string()),
+                serde_norway::Value::String("attr".into()),
+                serde_norway::Value::String(attr.to_string()),
             );
             obj.insert(
-                serde_yaml::Value::String("size".into()),
-                serde_yaml::Value::Number(size.into()),
+                serde_norway::Value::String("size".into()),
+                serde_norway::Value::Number(size.into()),
             );
             obj.insert(
-                serde_yaml::Value::String("kind".into()),
-                serde_yaml::Value::String(kind.to_string()),
+                serde_norway::Value::String("kind".into()),
+                serde_norway::Value::String(kind.to_string()),
             );
             obj.insert(
-                serde_yaml::Value::String("path".into()),
-                serde_yaml::Value::String(String::from_utf8_lossy(&entry.path).into_owned()),
+                serde_norway::Value::String("path".into()),
+                serde_norway::Value::String(String::from_utf8_lossy(&entry.path).into_owned()),
             );
             obj.insert(
-                serde_yaml::Value::String("store_path".into()),
-                serde_yaml::Value::String(store_path.as_str()),
+                serde_norway::Value::String("store_path".into()),
+                serde_norway::Value::String(store_path.as_str()),
             );
             if options.details {
                 if let Some(ref desc) = meta.and_then(|m| m.description.clone()) {
                     obj.insert(
-                        serde_yaml::Value::String("description".into()),
-                        serde_yaml::Value::String(desc.clone()),
+                        serde_norway::Value::String("description".into()),
+                        serde_norway::Value::String(desc.clone()),
                     );
                 }
                 if let Some(ref lic) = meta.and_then(|m| m.license.clone()) {
                     obj.insert(
-                        serde_yaml::Value::String("license".into()),
-                        serde_yaml::Value::String(lic.clone()),
+                        serde_norway::Value::String("license".into()),
+                        serde_norway::Value::String(lic.clone()),
                     );
                 }
                 if let Some(ref hp) = meta.and_then(|m| m.homepage.clone()) {
                     obj.insert(
-                        serde_yaml::Value::String("homepage".into()),
-                        serde_yaml::Value::String(hp.clone()),
+                        serde_norway::Value::String("homepage".into()),
+                        serde_norway::Value::String(hp.clone()),
                     );
                 }
                 if let Some(ref maint) = meta.and_then(|m| m.maintainers.clone()) {
-                    let vals: Vec<serde_yaml::Value> = maint
+                    let vals: Vec<serde_norway::Value> = maint
                         .iter()
                         .cloned()
-                        .map(serde_yaml::Value::String)
+                        .map(serde_norway::Value::String)
                         .collect();
                     obj.insert(
-                        serde_yaml::Value::String("maintainers".into()),
-                        serde_yaml::Value::Sequence(vals),
+                        serde_norway::Value::String("maintainers".into()),
+                        serde_norway::Value::Sequence(vals),
                     );
                 }
                 if let Some(ref plats) = meta.and_then(|m| m.platforms.clone()) {
-                    let vals: Vec<serde_yaml::Value> = plats
+                    let vals: Vec<serde_norway::Value> = plats
                         .iter()
                         .cloned()
-                        .map(serde_yaml::Value::String)
+                        .map(serde_norway::Value::String)
                         .collect();
                     obj.insert(
-                        serde_yaml::Value::String("platforms".into()),
-                        serde_yaml::Value::Sequence(vals),
+                        serde_norway::Value::String("platforms".into()),
+                        serde_norway::Value::Sequence(vals),
                     );
                 }
                 if let Some(ref mp) = meta.and_then(|m| m.main_program.clone()) {
                     obj.insert(
-                        serde_yaml::Value::String("main_program".into()),
-                        serde_yaml::Value::String(mp.clone()),
+                        serde_norway::Value::String("main_program".into()),
+                        serde_norway::Value::String(mp.clone()),
                     );
                 }
             }
-            if let Ok(yaml) = serde_yaml::to_string(&obj) {
+            if let Ok(yaml) = serde_norway::to_string(&obj) {
                 print!("{yaml}{delim}");
                 true
             } else {
@@ -4051,17 +4051,39 @@ fn format_grouped(n: u64) -> String {
 
 #[cfg(feature = "huge_pages")]
 mod huge_pages {
-    #![allow(clippy::as_conversions)]
+    //! The only unsafe code in the workspace. `unsafe_code` is denied
+    //! everywhere else, so the opt-out stays inside this module.
+
+    #![allow(clippy::as_conversions, unsafe_code)]
+
+    /// Ask the kernel to back `ptr[..len]` with huge pages and to read it in.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point at the start of a mapping of at least `len` bytes.
+    /// Both callers pass a live `memmap2` mapping, so the range is mapped for
+    /// as long as the call runs. `madvise` only sets kernel hints: it never
+    /// writes through the pointer, so the mapping stays valid and unchanged.
     pub fn advise_huge_pages(ptr: *const u8, len: usize) {
         let ptr = ptr as *mut libc::c_void;
+        // SAFETY: see the function docs -- `ptr[..len]` is a live mapping and
+        // `madvise` only advises, so it cannot invalidate or write to it.
         unsafe {
             libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
             libc::madvise(ptr, len, libc::MADV_WILLNEED);
         }
     }
 
+    /// Ask the kernel to read `ptr[..len]` in ahead of the first access.
+    ///
+    /// # Safety
+    ///
+    /// Same requirement as [`advise_huge_pages`]: `ptr` must point at a live
+    /// mapping of at least `len` bytes.
     pub fn advise_willneed(ptr: *const u8, len: usize) {
         let ptr = ptr as *mut libc::c_void;
+        // SAFETY: see the function docs -- `ptr[..len]` is a live mapping and
+        // `madvise` only advises, so it cannot invalidate or write to it.
         unsafe {
             libc::madvise(ptr, len, libc::MADV_WILLNEED);
         }
