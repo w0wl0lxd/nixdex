@@ -391,10 +391,9 @@ fn render_daemon_text(matches: &[NixLocateMatch], opts: &RenderOpts, delim: &str
             let size_str = format_grouped(size);
             let sp = store_path_string(m);
             let path = m.path.clone().unwrap_or_else(String::new);
-            let mut line = format!(
-                "{:<40} {:>14} {:>1} {}{}{delim}",
-                m.attr, size_str, kind, sp, path
-            );
+            // The delimiter is appended last, after any `--details` fields, so a
+            // record never splits across the delimiter boundary.
+            let mut line = format!("{:<40} {:>14} {:>1} {}{}", m.attr, size_str, kind, sp, path);
             if opts.details {
                 if let Some(ref desc) = m.description {
                     use std::fmt::Write;
@@ -417,7 +416,49 @@ fn render_daemon_text(matches: &[NixLocateMatch], opts: &RenderOpts, delim: &str
                     let _ = write!(line, " main_program={mp}");
                 }
             }
+            line.push_str(delim);
             line
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NixLocateMatch, RenderOpts, render_daemon_text};
+
+    fn match_with_details() -> NixLocateMatch {
+        sonic_rs::from_str(
+            r#"{"attr":"hello","path":"/bin/hello","description":"a greeting","main_program":"hello"}"#,
+        )
+        .expect("fixture parses")
+    }
+
+    fn detail_opts() -> RenderOpts {
+        RenderOpts {
+            json: false,
+            yaml: false,
+            minimal: false,
+            null_output: false,
+            quiet: false,
+            details: true,
+        }
+    }
+
+    #[test]
+    fn detail_fields_stay_before_the_record_delimiter() {
+        let matches = [match_with_details()];
+        let lines = render_daemon_text(&matches, &detail_opts(), "\0");
+        let line = lines.first().expect("one line");
+        assert!(
+            line.ends_with('\0'),
+            "the delimiter must terminate the record: {line:?}"
+        );
+        assert_eq!(
+            line.matches('\0').count(),
+            1,
+            "the record must not be split by an interior delimiter: {line:?}"
+        );
+        assert!(line.contains("desc=a greeting"), "{line:?}");
+        assert!(line.contains("main_program=hello"), "{line:?}");
+    }
 }

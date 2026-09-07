@@ -16,27 +16,51 @@ fn mode_name(mode: SearchMode) -> &'static str {
 
 fn theme_colors(theme: Theme) -> ThemeColors {
     match theme {
-        Theme::TokyoNight | Theme::Nord => ThemeColors {
-            bg: Color::Rgb(30, 30, 46),
-            fg: Color::Rgb(220, 220, 220),
-            header_bg: Color::Rgb(40, 40, 60),
-            header_fg: Color::Rgb(220, 220, 220),
-            mode_fg: Color::Rgb(136, 192, 208),
-            selected_bg: Color::Rgb(50, 50, 70),
-            selected_fg: Color::Rgb(240, 240, 240),
+        // Tokyo Night: https://github.com/enkia/tokyo-night-vscode-theme
+        Theme::TokyoNight => ThemeColors {
+            bg: Color::Rgb(26, 27, 38),
+            fg: Color::Rgb(192, 202, 245),
+            header_bg: Color::Rgb(36, 40, 59),
+            header_fg: Color::Rgb(192, 202, 245),
+            mode_fg: Color::Rgb(122, 162, 247),
+            selected_bg: Color::Rgb(41, 46, 66),
+            selected_fg: Color::Rgb(192, 202, 245),
             selected_modifier: Modifier::BOLD,
-            attr_fg: Color::Rgb(163, 216, 163),
-            desc_fg: Color::Rgb(150, 150, 170),
-            status_fg: Color::Rgb(120, 120, 140),
-            accent_fg: Color::Rgb(136, 192, 208),
+            attr_fg: Color::Rgb(158, 206, 106),
+            desc_fg: Color::Rgb(86, 95, 137),
+            status_fg: Color::Rgb(86, 95, 137),
+            accent_fg: Color::Rgb(122, 162, 247),
+            detail_label_fg: Color::Rgb(122, 162, 247),
+            detail_value_fg: Color::Rgb(192, 202, 245),
+            overlay_bg: Color::Rgb(22, 22, 30),
+            overlay_border: Color::Rgb(59, 66, 97),
+            toast_bg: Color::Rgb(36, 40, 59),
+            toast_fg: Color::Rgb(192, 202, 245),
+            spinner_fg: Color::Rgb(224, 175, 104),
+            pinned_fg: Color::Rgb(187, 154, 247),
+        },
+        // Nord: https://www.nordtheme.com/docs/colors-and-palette
+        Theme::Nord => ThemeColors {
+            bg: Color::Rgb(46, 52, 64),
+            fg: Color::Rgb(216, 222, 233),
+            header_bg: Color::Rgb(59, 66, 82),
+            header_fg: Color::Rgb(236, 239, 244),
+            mode_fg: Color::Rgb(136, 192, 208),
+            selected_bg: Color::Rgb(67, 76, 94),
+            selected_fg: Color::Rgb(236, 239, 244),
+            selected_modifier: Modifier::BOLD,
+            attr_fg: Color::Rgb(163, 190, 140),
+            desc_fg: Color::Rgb(129, 161, 193),
+            status_fg: Color::Rgb(76, 86, 106),
+            accent_fg: Color::Rgb(143, 188, 187),
             detail_label_fg: Color::Rgb(136, 192, 208),
-            detail_value_fg: Color::Rgb(220, 220, 220),
-            overlay_bg: Color::Rgb(20, 20, 36),
-            overlay_border: Color::Rgb(80, 80, 120),
-            toast_bg: Color::Rgb(50, 50, 70),
-            toast_fg: Color::Rgb(220, 220, 220),
-            spinner_fg: Color::Rgb(240, 240, 240),
-            pinned_fg: Color::Rgb(240, 240, 240),
+            detail_value_fg: Color::Rgb(229, 233, 240),
+            overlay_bg: Color::Rgb(59, 66, 82),
+            overlay_border: Color::Rgb(94, 129, 172),
+            toast_bg: Color::Rgb(67, 76, 94),
+            toast_fg: Color::Rgb(236, 239, 244),
+            spinner_fg: Color::Rgb(235, 203, 139),
+            pinned_fg: Color::Rgb(180, 142, 173),
         },
         Theme::CatppuccinMocha => ThemeColors {
             bg: Color::Rgb(30, 30, 46),
@@ -119,7 +143,9 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
+            // The header draws a bordered block, so it needs three rows: the top
+            // border, the input line, and the bottom border.
+            Constraint::Length(3),
             Constraint::Min(1),
             Constraint::Length(1),
         ])

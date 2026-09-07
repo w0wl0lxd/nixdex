@@ -1613,12 +1613,12 @@ struct OptionsResponse {
 async fn stats_handler(State(index_state): State<Arc<IndexState>>) -> axum::Json<StatsResponse> {
     index_state.requests_total.fetch_add(1, Ordering::Relaxed);
 
-    let (history_count, options_count, sidecar_status) = match read_snapshot(&index_state) {
+    let (history_count, options_count, package_count) = match read_snapshot(&index_state) {
         Some(snapshot) => {
             let history_count = snapshot.history_db.as_ref().map(|db| db.attr_count());
             let options_count = snapshot.options_db.as_ref().map(|db| db.option_count());
-            let sidecar_status = snapshot.reader.package_count();
-            (history_count, options_count, sidecar_status)
+            let package_count = snapshot.reader.package_count();
+            (history_count, options_count, package_count)
         }
         None => (None, None, None),
     };
@@ -1628,7 +1628,7 @@ async fn stats_handler(State(index_state): State<Arc<IndexState>>) -> axum::Json
         uptime_seconds: index_state.start_time.elapsed().as_secs(),
         history_count,
         options_count,
-        sidecar_entry_count: sidecar_status,
+        package_count,
     })
 }
 
@@ -1640,7 +1640,9 @@ struct StatsResponse {
     uptime_seconds: u64,
     history_count: Option<usize>,
     options_count: Option<usize>,
-    sidecar_entry_count: Option<usize>,
+    /// Packages in the main index. This is not a sidecar count -- the history
+    /// and options sidecars are reported by the two fields above.
+    package_count: Option<usize>,
 }
 
 /// Query parameters for `GET /command`.

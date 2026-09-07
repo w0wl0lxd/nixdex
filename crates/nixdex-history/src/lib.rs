@@ -128,15 +128,19 @@ impl HistoryBuilder {
             date,
         };
         let versions = self.entries.entry(attr).or_default();
+        // Deduplicate by version string. Recording a version that is already
+        // present is a no-op, so the cap is only checked when a new version is
+        // actually pushed -- otherwise a full attr would reject its own
+        // idempotent re-record.
+        if versions.iter().any(|v| v.version == entry.version) {
+            return Ok(());
+        }
         if versions.len() >= MAX_VERSIONS_PER_ATTR {
             return Err(Error::Corrupt(format!(
                 "too many versions for attr (max {MAX_VERSIONS_PER_ATTR})"
             )));
         }
-        // Deduplicate by version string.
-        if !versions.iter().any(|v| v.version == entry.version) {
-            versions.push(entry);
-        }
+        versions.push(entry);
         Ok(())
     }
 
@@ -156,7 +160,11 @@ impl HistoryBuilder {
     /// Returns an error if the sidecar cannot be written.
     pub fn write_sidecar(&self, db_dir: &Path) -> Result<()> {
         let path = db_dir.join(HISTORY_FILE);
-        let mut file = File::create(&path)?;
+        // Write to a temporary file and rename it into place, so a reader never
+        // observes a half-written sidecar and a failed write leaves the previous
+        // sidecar intact.
+        let tmp_path = db_dir.join(format!("{HISTORY_FILE}.tmp"));
+        let mut file = File::create(&tmp_path)?;
 
         // Write magic + version header.
         file.write_all(HISTORY_MAGIC)?;
@@ -173,18 +181,24 @@ impl HistoryBuilder {
         }
 
         file.flush()?;
+        file.sync_all()?;
+        drop(file);
 
-        // Validate size against defensive cap.
-        let metadata = std::fs::metadata(&path)?;
+        // Validate size against defensive cap before the rename, so an oversized
+        // sidecar never replaces a good one.
+        let metadata = std::fs::metadata(&tmp_path)?;
         let max_bytes = MAX_HISTORY_BYTES;
         let max_bytes_u64 = u64::try_from(max_bytes)
             .map_err(|_| Error::Corrupt("size conversion overflow".into()))?;
         if metadata.len() > max_bytes_u64 {
+            let _ = std::fs::remove_file(&tmp_path);
             return Err(Error::Corrupt(format!(
                 "history sidecar too large: {} bytes (max {MAX_HISTORY_BYTES})",
                 metadata.len()
             )));
         }
+
+        std::fs::rename(&tmp_path, &path)?;
 
         Ok(())
     }
@@ -273,5 +287,78 @@ impl HistoryDb {
     #[must_use]
     pub fn attr_count(&self) -> usize {
         self.entries.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HistoryBuilder, HistoryDb, MAX_VERSIONS_PER_ATTR};
+
+    fn fill_to_capacity(builder: &mut HistoryBuilder) {
+        for i in 0..MAX_VERSIONS_PER_ATTR {
+            builder
+                .record_version(
+                    "pkgs.hello".to_string(),
+                    format!("1.{i}"),
+                    "cafe".to_string(),
+                    "2026-01-01".to_string(),
+                )
+                .expect("recording a fresh version below the cap succeeds");
+        }
+    }
+
+    #[test]
+    fn re_recording_a_known_version_at_capacity_is_a_no_op() {
+        let mut builder = HistoryBuilder::new();
+        fill_to_capacity(&mut builder);
+
+        builder
+            .record_version(
+                "pkgs.hello".to_string(),
+                "1.0".to_string(),
+                "cafe".to_string(),
+                "2026-01-01".to_string(),
+            )
+            .expect("re-recording an existing version must not hit the cap");
+    }
+
+    #[test]
+    fn a_new_version_at_capacity_is_rejected() {
+        let mut builder = HistoryBuilder::new();
+        fill_to_capacity(&mut builder);
+
+        let err = builder.record_version(
+            "pkgs.hello".to_string(),
+            "9.9".to_string(),
+            "cafe".to_string(),
+            "2026-01-01".to_string(),
+        );
+        assert!(err.is_err(), "a genuinely new version must still be capped");
+    }
+
+    #[test]
+    fn writing_the_sidecar_leaves_no_temporary_file_behind() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut builder = HistoryBuilder::new();
+        builder
+            .record_version(
+                "pkgs.hello".to_string(),
+                "1.0".to_string(),
+                "cafe".to_string(),
+                "2026-01-01".to_string(),
+            )
+            .expect("record");
+        builder.write_sidecar(dir.path()).expect("write sidecar");
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp file left behind: {leftovers:?}");
+
+        let db = HistoryDb::open(dir.path()).expect("the renamed sidecar is readable");
+        assert_eq!(db.attr_count(), 1);
     }
 }
