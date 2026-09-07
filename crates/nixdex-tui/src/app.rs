@@ -62,10 +62,10 @@ impl SearchDbCache {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Theme {
+    #[default]
     CatppuccinMocha,
     Nord,
     Dracula,
-    #[default]
     TokyoNight,
 }
 
@@ -181,7 +181,7 @@ impl App {
             search_color: false,
             search_quiet: false,
             search_details: false,
-            theme: Theme::CatppuccinMocha,
+            theme: Theme::default(),
             detail_pinned: false,
             expand_all: false,
             search_cache: BTreeMap::new(),
@@ -310,6 +310,10 @@ impl App {
     pub fn tick(&mut self) {
         self.status_tick += 1;
         self.toasts.retain(|t| !t.is_expired());
+        // Drop cache entries that have aged out. Without this the cache only
+        // ever grows: `is_cache_valid` skips an expired entry but never removes
+        // it, so a long session holds every result set it ever fetched.
+        self.clear_expired_cache();
     }
 
     pub fn selected_result(&self) -> Option<&SearchResult> {
@@ -505,4 +509,26 @@ pub struct SearchOutcome {
     pub mode: SearchMode,
     pub results: Option<Vec<SearchResult>>,
     pub status: Option<String>,
+}
+
+#[cfg(test)]
+mod cache_expiry_tests {
+    use super::App;
+    use std::time::Duration;
+
+    #[test]
+    fn a_tick_drops_cache_entries_that_have_aged_out() {
+        let mut app = App::new(std::path::PathBuf::from("/nonexistent"));
+        app.cache_ttl = Duration::ZERO;
+        app.cache_results("stale".to_string(), Vec::new());
+        assert_eq!(app.search_cache.len(), 1, "the entry was cached");
+
+        app.tick();
+
+        assert!(
+            app.search_cache.is_empty(),
+            "an expired entry must be evicted, not merely skipped"
+        );
+        assert!(app.cache_timestamps.is_empty());
+    }
 }

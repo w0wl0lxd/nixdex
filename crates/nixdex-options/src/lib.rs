@@ -106,6 +106,29 @@ pub struct OptionsDb {
     entries: BTreeMap<String, OptionRecord>,
 }
 
+/// Case-insensitive substring test.
+///
+/// `needle_lower` must already be lowercase. When both sides are ASCII the test
+/// runs over the bytes in place, so a scan over the whole option database does
+/// not allocate a lowercased copy of every attribute and description. Non-ASCII
+/// input falls back to full Unicode lowercasing, which keeps the result
+/// identical to `haystack.to_lowercase().contains(needle_lower)`.
+fn contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
+    if !haystack.is_ascii() || !needle_lower.is_ascii() {
+        return haystack.to_lowercase().contains(needle_lower);
+    }
+    if needle_lower.is_empty() {
+        return true;
+    }
+    let hay = haystack.as_bytes();
+    let needle = needle_lower.as_bytes();
+    if needle.len() > hay.len() {
+        return false;
+    }
+    hay.windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
 impl OptionsDb {
     /// Open the options sidecar from a database directory.
     ///
@@ -208,8 +231,8 @@ impl OptionsDb {
             self.entries
                 .values()
                 .filter(|record| {
-                    record.attr.to_lowercase().contains(&pattern_lower)
-                        || record.description.to_lowercase().contains(&pattern_lower)
+                    contains_ignore_case(&record.attr, &pattern_lower)
+                        || contains_ignore_case(&record.description, &pattern_lower)
                 })
                 .collect()
         };
@@ -354,5 +377,34 @@ mod tests {
         // Only the `| ` pair is the table artefact. A pipe that starts real
         // prose, or one with no following space, must survive.
         assert_eq!(normalize_description("|pipe".to_string()), "|pipe");
+    }
+}
+
+#[cfg(test)]
+mod case_fold_tests {
+    use super::contains_ignore_case;
+
+    #[test]
+    fn ascii_matching_ignores_case_without_allocating() {
+        assert!(contains_ignore_case("services.NGINX.enable", "nginx"));
+        assert!(!contains_ignore_case("services.nginx.enable", "apache"));
+        assert!(contains_ignore_case("anything", ""));
+        assert!(!contains_ignore_case("ab", "abc"));
+    }
+
+    #[test]
+    fn non_ascii_matching_agrees_with_full_lowercasing() {
+        for (haystack, needle) in [
+            ("Straße Wärme", "wärme"),
+            ("ÉCOLE normale", "école"),
+            ("plain ascii", "ÄÖÜ"),
+        ] {
+            let needle_lower = needle.to_lowercase();
+            assert_eq!(
+                contains_ignore_case(haystack, &needle_lower),
+                haystack.to_lowercase().contains(&needle_lower),
+                "mismatch for {haystack:?} / {needle:?}"
+            );
+        }
     }
 }
