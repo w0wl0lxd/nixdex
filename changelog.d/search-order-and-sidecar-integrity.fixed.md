@@ -1,9 +1,3 @@
-- Apply `--limit` after `--reverse`. The database truncated to the limit before
-  the reversal, so `--sort attr --reverse --limit 2` returned the two lowest
-  attributes rather than the two highest.
-- Emit `---` before each `--format yaml` result. Documents were concatenated
-  with no separator, so more than one result produced a single document with
-  every key repeated, which no YAML reader accepts.
-- Verify a downloaded sidecar against a published `<url>.sha256` before
-  installing it, using a constant-time comparison. A missing or malformed
-  checksum refuses the download rather than skipping the check.
+- Apply `--limit` after `--reverse`. The database truncated to the limit before the reversal, so `--sort attr --reverse --limit 2` returned the two lowest attributes rather than the two highest.
+- Emit `---` before each `--format yaml` result. Documents were concatenated with no separator, so more than one result produced a single document with every key repeated, which no YAML reader accepts.
+- Verify a downloaded sidecar against a published `<url>.sha256` before installing it, using a constant-time comparison. A missing or malformed checksum refuses the download rather than skipping the check.
