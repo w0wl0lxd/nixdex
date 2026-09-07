@@ -4115,6 +4115,11 @@ mod huge_pages {
         // SAFETY: see the function docs -- `ptr[..len]` is a live mapping and
         // `madvise` only advises, so it cannot invalidate or write to it.
         unsafe {
+            // `MADV_HUGEPAGE` is transparent-huge-page support, which only
+            // Linux has; `libc` does not define it elsewhere, so referring to
+            // it unconditionally broke the macOS build. The read-ahead hint
+            // below is portable and is all the other platforms offer.
+            #[cfg(target_os = "linux")]
             libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
             libc::madvise(ptr, len, libc::MADV_WILLNEED);
         }
