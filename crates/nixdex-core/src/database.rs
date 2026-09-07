@@ -122,8 +122,21 @@ impl NgramCache {
         }
     }
 
-    fn get(&self, key: &str) -> Option<Arc<RoaringBitmap>> {
-        self.map.get(key).cloned()
+    /// Looks up `key`, promoting it to most-recently-used.
+    ///
+    /// The promotion is what makes this an LRU rather than a FIFO: without it
+    /// a query hit thousands of times was still evicted once
+    /// `NGRAM_CACHE_CAPACITY` distinct patterns had been inserted after it,
+    /// which is exactly the daemon's hot-repeated-query workload.
+    fn get(&mut self, key: &str) -> Option<Arc<RoaringBitmap>> {
+        let value = self.map.get(key).cloned()?;
+        if let Some(pos) = self.order.iter().position(|k| k == key)
+            && pos != 0
+        {
+            let key = self.order.remove(pos);
+            self.order.insert(0, key);
+        }
+        Some(value)
     }
 
     fn insert(&mut self, key: String, value: Arc<RoaringBitmap>) {
@@ -857,13 +870,17 @@ impl Reader {
         })
     }
 
-    /// Touch every page of the mmap'd database file to eliminate minor page
-    /// faults during subsequent searches. Best called once during daemon
-    /// warm-up; for CLI use the cost is paid on every invocation so it is
-    /// left to the caller to decide.
+    /// Reduce minor page faults on the mmap'd database before searching.
     ///
-    /// Uses `std::hint::black_box` to prevent the compiler from optimising
-    /// away the reads.
+    /// Best called once during daemon warm-up; for CLI use the cost is paid on
+    /// every invocation, so the caller decides.
+    ///
+    /// What this does depends on the build. Without the `huge_pages` feature it
+    /// reads one byte per page and every page is resident when it returns,
+    /// with `std::hint::black_box` stopping the compiler from eliding the
+    /// reads. With `huge_pages` it issues `MADV_WILLNEED` instead: the kernel
+    /// faults the pages in on its own schedule, so this returns before the work
+    /// is done and residency is a hint rather than a guarantee.
     pub fn prefault(&self) {
         prefault_mmap(&self.data);
     }
@@ -1761,6 +1778,16 @@ pub fn read_frame_hashes(db_dir: &Path) -> Result<Option<Vec<(u32, [u8; 32])>>> 
     let count = usize::try_from(read_u32_le(&bytes, FRAME_HASHES_MAGIC.len() + 4)?)
         .map_err(|_| Error::Corrupt("frame hashes count overflow"))?;
 
+    // Cap the count before it reaches `Vec::with_capacity`, the way
+    // `parse_seek_table` does. The size check below already rejects a small
+    // file claiming a huge count, but the cap keeps the bound explicit and
+    // stops the multiplication below from having to be trusted.
+    if count > MAX_FRAME_COUNT {
+        return Err(Error::Corrupt(
+            "frame hashes sidecar declares too many frames",
+        ));
+    }
+
     let expected_len = FRAME_HASHES_MAGIC.len() + 8 + count * (4 + 32);
     if bytes.len() != expected_len {
         return Err(Error::Corrupt("frame hashes sidecar has invalid size"));
@@ -1819,6 +1846,8 @@ pub fn frame_hashes_diff(
     };
 
     let stored_map: std::collections::BTreeMap<u32, [u8; 32]> = stored.into_iter().collect();
+    let current_map: std::collections::BTreeMap<u32, [u8; 32]> =
+        current_hashes.iter().copied().collect();
 
     let mut changed = Vec::new();
     for &(frame_idx, ref hash) in current_hashes {
@@ -1826,6 +1855,18 @@ pub fn frame_hashes_diff(
             changed.push(frame_idx);
         }
     }
+
+    // A frame that disappeared is a change too. Walking only the current frames
+    // reported "nothing changed" when an update removed trailing frames, so
+    // regeneration was skipped and the sidecars kept entries for packages that
+    // no longer exist.
+    for &frame_idx in stored_map.keys() {
+        if !current_map.contains_key(&frame_idx) {
+            changed.push(frame_idx);
+        }
+    }
+    changed.sort_unstable();
+    changed.dedup();
 
     Ok(Some(changed))
 }
@@ -2616,9 +2657,13 @@ fn ngram_sidecars_exist(dir: &Path) -> bool {
     .any(|name| dir.join(name).is_file())
 }
 
-/// Touch every 4 KiB page in `data` to force minor page faults before the
-/// critical search path. The compiler is prevented from eliding the reads
-/// via [`std::hint::black_box`].
+/// Make `data` resident before the critical search path.
+///
+/// Without the `huge_pages` feature this touches every 4 KiB page and returns
+/// once they are all resident, using [`std::hint::black_box`] so the reads are
+/// not elided. With `huge_pages` it hands the whole range to the kernel with
+/// `MADV_WILLNEED`, which is an asynchronous hint: it returns immediately and
+/// the pages arrive later, if at all.
 fn prefault_mmap(data: &[u8]) {
     #[cfg(feature = "huge_pages")]
     {
@@ -2683,7 +2728,7 @@ fn resolve_ngram_ordinals_multi(
     // the lock across the computation would serialise all concurrent queries
     // in the daemon.
     {
-        let guard = cache
+        let mut guard = cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(cached) = guard.get(&cache_key) {
@@ -4030,6 +4075,56 @@ mod tests {
     use crate::store_path::Origin;
     use bytes::Bytes;
     use std::io::Read;
+
+    /// A frame removed by an update must count as a change.
+    ///
+    /// The diff walked only the current frames, so shrinking the database
+    /// reported "nothing changed" and sidecar regeneration was skipped: the
+    /// sidecars kept entries for packages that no longer existed.
+    #[test]
+    fn a_removed_trailing_frame_is_reported_as_changed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stored = vec![(0u32, [1u8; 32]), (1u32, [2u8; 32]), (2u32, [3u8; 32])];
+        write_frame_hashes(dir.path(), &stored).expect("write");
+
+        // The update dropped the last frame and left the others untouched.
+        let current = vec![(0u32, [1u8; 32]), (1u32, [2u8; 32])];
+        let changed = frame_hashes_diff(dir.path(), &current)
+            .expect("diff")
+            .expect("stored hashes present");
+        assert_eq!(changed, vec![2], "the removed frame must be reported");
+    }
+
+    #[test]
+    fn an_unchanged_frame_set_reports_no_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let frames = vec![(0u32, [1u8; 32]), (1u32, [2u8; 32])];
+        write_frame_hashes(dir.path(), &frames).expect("write");
+        let changed = frame_hashes_diff(dir.path(), &frames)
+            .expect("diff")
+            .expect("stored hashes present");
+        assert!(changed.is_empty(), "expected no changes, got {changed:?}");
+    }
+
+    /// Repeated hits must protect an entry from eviction.
+    ///
+    /// `get` did not touch the recency list, so eviction was FIFO: a hot key
+    /// was dropped once `NGRAM_CACHE_CAPACITY` newer keys had been inserted,
+    /// which is precisely the daemon's repeated-query workload.
+    #[test]
+    fn the_ngram_cache_evicts_by_recency_not_insertion_order() {
+        let mut cache = NgramCache::new();
+        cache.insert("hot".to_string(), Arc::new(RoaringBitmap::new()));
+        for i in 0..NGRAM_CACHE_CAPACITY - 1 {
+            cache.insert(format!("filler-{i}"), Arc::new(RoaringBitmap::new()));
+            // Keep "hot" the most recently used entry.
+            assert!(cache.get("hot").is_some(), "hot key evicted at {i}");
+        }
+        // One more insert evicts the least recently used key, which is now a
+        // filler rather than the repeatedly read "hot" key.
+        cache.insert("last".to_string(), Arc::new(RoaringBitmap::new()));
+        assert!(cache.get("hot").is_some(), "the hot key must survive");
+    }
 
     fn sample_store_path() -> StorePath {
         StorePath::new(
