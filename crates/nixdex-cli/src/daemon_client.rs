@@ -242,7 +242,7 @@ pub(crate) fn render(response: &NixLocateResponse, opts: &RenderOpts) -> Vec<Str
     if opts.yaml {
         render_daemon_yaml(&response.matches, opts, delim)
     } else if opts.json {
-        render_daemon_json(&response.matches, opts, delim)
+        render_daemon_json(&response.matches, delim)
     } else if opts.minimal {
         render_daemon_minimal(&response.matches, delim)
     } else {
@@ -334,7 +334,7 @@ fn append_daemon_yaml_details(obj: &mut serde_norway::Mapping, m: &NixLocateMatc
     }
 }
 
-fn render_daemon_json(matches: &[NixLocateMatch], opts: &RenderOpts, delim: &str) -> Vec<String> {
+fn render_daemon_json(matches: &[NixLocateMatch], delim: &str) -> Vec<String> {
     matches
         .iter()
         .map(|m| {
@@ -346,29 +346,32 @@ fn render_daemon_json(matches: &[NixLocateMatch], opts: &RenderOpts, delim: &str
                 "path": m.path.clone().unwrap_or_else(String::new),
                 "store_path": store_path_string(m),
             });
-            if opts.details {
-                if let Some(ref desc) = m.description {
-                    obj.insert("description", sonic_rs::Value::copy_str(desc));
-                }
-                if let Some(ref lic) = m.license {
-                    obj.insert("license", sonic_rs::Value::copy_str(lic));
-                }
-                if let Some(ref hp) = m.homepage {
-                    obj.insert("homepage", sonic_rs::Value::copy_str(hp));
-                }
-                if let Some(ref maint) = m.maintainers
-                    && let Ok(val) = sonic_rs::to_value(maint)
-                {
-                    obj.insert("maintainers", val);
-                }
-                if let Some(ref plats) = m.platforms
-                    && let Ok(val) = sonic_rs::to_value(plats)
-                {
-                    obj.insert("platforms", val);
-                }
-                if let Some(ref mp) = m.main_program {
-                    obj.insert("main_program", sonic_rs::Value::copy_str(mp));
-                }
+            // The local `--json` path (`print_match_json`) emits every metadata
+            // field it has, regardless of `--details`. Matching that here keeps
+            // the JSON schema identical whether or not the daemon served the
+            // query. `--details` still gates the text and YAML renders, which
+            // the local path gates the same way.
+            if let Some(ref desc) = m.description {
+                obj.insert("description", sonic_rs::Value::copy_str(desc));
+            }
+            if let Some(ref lic) = m.license {
+                obj.insert("license", sonic_rs::Value::copy_str(lic));
+            }
+            if let Some(ref hp) = m.homepage {
+                obj.insert("homepage", sonic_rs::Value::copy_str(hp));
+            }
+            if let Some(ref maint) = m.maintainers
+                && let Ok(val) = sonic_rs::to_value(maint)
+            {
+                obj.insert("maintainers", val);
+            }
+            if let Some(ref plats) = m.platforms
+                && let Ok(val) = sonic_rs::to_value(plats)
+            {
+                obj.insert("platforms", val);
+            }
+            if let Some(ref mp) = m.main_program {
+                obj.insert("main_program", sonic_rs::Value::copy_str(mp));
             }
             let line = sonic_rs::to_string(&obj).unwrap_or_else(|_| String::new());
             format!("{line}{delim}")
@@ -424,7 +427,7 @@ fn render_daemon_text(matches: &[NixLocateMatch], opts: &RenderOpts, delim: &str
 
 #[cfg(test)]
 mod tests {
-    use super::{NixLocateMatch, RenderOpts, render_daemon_text};
+    use super::{NixLocateMatch, RenderOpts, render, render_daemon_text};
 
     fn match_with_details() -> NixLocateMatch {
         sonic_rs::from_str(
@@ -442,6 +445,34 @@ mod tests {
             quiet: false,
             details: true,
         }
+    }
+
+    fn plain_opts() -> RenderOpts {
+        RenderOpts {
+            details: false,
+            ..detail_opts()
+        }
+    }
+
+    #[test]
+    fn json_carries_metadata_without_details_just_like_the_local_path() {
+        let matches = [match_with_details()];
+        let opts = RenderOpts {
+            json: true,
+            ..plain_opts()
+        };
+        let lines = render(
+            &super::NixLocateResponse {
+                count: None,
+                matches: matches.into_iter().collect(),
+            },
+            &opts,
+        );
+        let line = lines.first().expect("one line");
+        assert!(
+            line.contains("\"description\":\"a greeting\""),
+            "local --json always emits metadata, so the daemon path must too: {line:?}"
+        );
     }
 
     #[test]

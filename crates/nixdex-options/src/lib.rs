@@ -322,7 +322,11 @@ impl OptionsBuilder {
         }
 
         let path = db_dir.join(OPTIONS_FILE);
-        let mut file = File::create(&path)?;
+        // Write to a temporary file and rename it into place, so a reader never
+        // observes a half-written sidecar and a failed write leaves the previous
+        // sidecar intact.
+        let tmp_path = db_dir.join(format!("{OPTIONS_FILE}.tmp"));
+        let mut file = File::create(&tmp_path)?;
 
         // Write magic + version header.
         file.write_all(OPTIONS_MAGIC)?;
@@ -335,18 +339,24 @@ impl OptionsBuilder {
         }
 
         file.flush()?;
+        file.sync_all()?;
+        drop(file);
 
-        // Validate size against defensive cap.
-        let metadata = std::fs::metadata(&path)?;
+        // Validate size against defensive cap before the rename, so an oversized
+        // sidecar never replaces a good one.
+        let metadata = std::fs::metadata(&tmp_path)?;
         let max_bytes = MAX_OPTIONS_BYTES;
         let max_bytes_u64 = u64::try_from(max_bytes)
             .map_err(|_| Error::Corrupt("size conversion overflow".into()))?;
         if metadata.len() > max_bytes_u64 {
+            let _ = std::fs::remove_file(&tmp_path);
             return Err(Error::Corrupt(format!(
                 "options sidecar too large: {} bytes (max {MAX_OPTIONS_BYTES})",
                 metadata.len()
             )));
         }
+
+        std::fs::rename(&tmp_path, &path)?;
 
         Ok(())
     }

@@ -19,3 +19,10 @@ Tokyo Night uses its own palette, and `Theme::default()` now agrees with the
 theme `App::new` starts with. The header block gets the three rows its border
 needs, so the query line is visible again. Expired search-cache entries are
 dropped on each tick instead of accumulating for the life of the session.
+
+Daemon-backed `nixdex locate --json` emits package metadata whether or not
+`--details` is passed, matching the local `--json` path, so the JSON schema no
+longer depends on whether a daemon served the query.
+
+The options sidecar is written to a temporary file and renamed into place, like
+the history sidecar.
