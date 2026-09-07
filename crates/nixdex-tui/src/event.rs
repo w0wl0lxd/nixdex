@@ -194,17 +194,6 @@ impl AppEvent {
         )
     }
 
-    pub fn is_ctrl_n(&self) -> bool {
-        matches!(
-            self,
-            Self::Key(KeyEvent {
-                code: KeyCode::Char('n'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            })
-        )
-    }
-
     pub fn is_ctrl_j(&self) -> bool {
         matches!(
             self,
