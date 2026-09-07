@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::app::App;
+use crate::app::{App, SearchDbCache, SearchOutcome, SearchRequest};
 use crossterm::cursor::Show;
 use crossterm::event::{
     EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -60,6 +60,22 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
 
+    // The search reads the database, which takes long enough to be visible.
+    // Running it here would block the loop below, so no frame could be drawn
+    // and no key read until it finished. A blocking worker owns the database
+    // handle cache and answers requests instead; the loop only sends and
+    // receives.
+    let (search_tx, mut search_rx) = tokio::sync::mpsc::unbounded_channel::<SearchRequest>();
+    let (outcome_tx, mut outcome_rx) = tokio::sync::mpsc::unbounded_channel::<SearchOutcome>();
+    let search_handle = tokio::task::spawn_blocking(move || {
+        let mut cache = SearchDbCache::new();
+        while let Some(req) = search_rx.blocking_recv() {
+            if outcome_tx.send(run_search(&mut cache, &req)).is_err() {
+                break;
+            }
+        }
+    });
+
     // `crossterm::event::read()` blocks the calling thread until a key arrives,
     // which ties up a runtime worker for the whole session. `EventStream` is
     // the async reader for the same source and the `event-stream` feature is
@@ -95,6 +111,12 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
             _ = tick_interval.tick() => {
                 app.tick();
             }
+            maybe_outcome = outcome_rx.recv() => {
+                if let Some(outcome) = maybe_outcome {
+                    app.is_searching = false;
+                    apply_search_outcome(&mut app, outcome);
+                }
+            }
             () = async {
                 if let Some(deadline) = debounce_deadline {
                     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -110,15 +132,23 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
                     debounce_deadline = None;
                     if query != app.input {
                         app.set_input(query.clone());
-                        // Draw once with the flag set. The search is
-                        // synchronous, so setting and clearing the flag around
-                        // it inside one `select!` branch meant no frame was
-                        // ever rendered while it was true and the loading
-                        // indicator was unreachable.
-                        app.is_searching = true;
-                        terminal.draw(|frame| ui::render(frame, &app))?;
-                        perform_search(&mut app, &query);
-                        app.is_searching = false;
+                        if query.is_empty() {
+                            app.set_results(Vec::new());
+                        } else if app.is_cache_valid(&query)
+                            && let Some(cached) = app.get_cached_results(&query).cloned()
+                        {
+                            app.set_results(cached);
+                            app.set_status(format!(
+                                "Found {} result(s) (cached)",
+                                app.result_count()
+                            ));
+                        } else {
+                            app.is_searching = true;
+                            if search_tx.send(app.search_request(&query)).is_err() {
+                                app.is_searching = false;
+                                app.set_status(String::from("Search worker stopped"));
+                            }
+                        }
                     }
                 }
             }
@@ -126,6 +156,9 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
     }
 
     event_handle.abort();
+    // Dropping the request sender ends the worker's `blocking_recv` loop.
+    drop(search_tx);
+    let _ = search_handle.await;
 
     // `_terminal_guard` restores raw mode, the alternate screen and the cursor
     // as it drops, on this path and on every `?` above.
@@ -487,69 +520,77 @@ fn handle_detail_event(app: &mut App, event: AppEvent) {
     }
 }
 
-fn perform_search(app: &mut App, query: &str) {
-    if query.is_empty() {
-        app.set_results(Vec::new());
-        return;
-    }
-
-    if app.is_cache_valid(query)
-        && let Some(cached) = app.get_cached_results(query)
-    {
-        app.set_results(cached.clone());
-        app.set_status(format!("Found {} result(s) (cached)", app.result_count()));
-        return;
-    }
-
-    match app.mode {
-        SearchMode::Search => {
-            perform_package_search(app, query);
-        }
-        SearchMode::Locate => {
-            perform_locate_search(app, query);
-        }
-        SearchMode::Which => {
-            perform_which_search(app, query);
-        }
+/// Run one search on the blocking worker thread.
+///
+/// Takes a settings snapshot instead of `&mut App` so it can run off the event
+/// loop: the loop keeps drawing and reading keys while a database read is in
+/// flight, which is what makes the "Searching..." indicator worth showing.
+fn run_search(cache: &mut SearchDbCache, req: &SearchRequest) -> SearchOutcome {
+    match req.mode {
+        SearchMode::Search => perform_package_search(cache, req),
+        SearchMode::Locate => perform_locate_search(req),
+        SearchMode::Which => perform_which_search(req),
     }
 }
 
-fn perform_package_search(app: &mut App, query: &str) {
-    let sidecar = app.database.join("packages.json");
-    if !sidecar.exists() {
-        app.set_status(String::from(
-            "No package metadata sidecar found. Run nix-index first.",
-        ));
+/// Apply a finished search to the app.
+///
+/// A result that arrived for a query the user has already moved on from is
+/// dropped: the debounce fires again for the new text, and applying the old
+/// one would reset the selection to a list the user is not looking at.
+fn apply_search_outcome(app: &mut App, outcome: SearchOutcome) {
+    let stale_query = outcome.query != app.input;
+    let stale_mode = outcome.mode != app.mode;
+    if stale_query || stale_mode {
         return;
     }
+    if let Some(results) = outcome.results {
+        app.cache_results(outcome.query, results.clone());
+        app.set_results(results);
+    }
+    if let Some(status) = outcome.status {
+        app.set_status(status);
+    }
+}
 
-    let size_sort_unsupported =
-        matches!(app.search_sort, SearchSort::SizeAsc | SearchSort::SizeDesc);
-    if size_sort_unsupported {
-        app.set_status("Size sort is not available in package search mode".to_string());
+fn perform_package_search(cache: &mut SearchDbCache, req: &SearchRequest) -> SearchOutcome {
+    let query = req.query.as_str();
+    let fail = |status: String| SearchOutcome {
+        query: query.to_string(),
+        mode: req.mode,
+        results: None,
+        status: Some(status),
+    };
+
+    let sidecar = req.database.join("packages.json");
+    if !sidecar.exists() {
+        return fail(String::from(
+            "No package metadata sidecar found. Run nix-index first.",
+        ));
     }
 
-    let sort = match app.search_sort {
+    // Package search cannot sort by size, so the request is honoured minus the
+    // sort and the warning has to survive the "Found N result(s)" message.
+    let size_sort_unsupported = matches!(req.sort, SearchSort::SizeAsc | SearchSort::SizeDesc);
+
+    let sort = match req.sort {
         SearchSort::None | SearchSort::SizeAsc | SearchSort::SizeDesc => PkgSearchSort::None,
         SearchSort::AttrAsc => PkgSearchSort::Attr,
         SearchSort::Reverse => PkgSearchSort::Reverse,
     };
 
-    let db = match app.search_db_cache.get_or_open(&sidecar) {
+    let db = match cache.get_or_open(&sidecar) {
         Ok(db) => db,
-        Err(err) => {
-            app.set_status(format!("Failed to open package database: {}", err));
-            return;
-        }
+        Err(err) => return fail(format!("Failed to open package database: {err}")),
     };
 
-    let matches = if app.search_tiered_fuzzy {
+    let matches = if req.tiered_fuzzy {
         let fuzzy_results = db.search_fuzzy(
             query,
-            app.search_field,
-            app.search_case_sensitive,
+            req.field,
+            req.case_sensitive,
             PkgSearchSort::None,
-            app.search_limit,
+            req.limit,
         );
         match fuzzy_results {
             Ok(records) => {
@@ -563,30 +604,24 @@ fn perform_package_search(app: &mut App, query: &str) {
                 scored.sort_by(|(score_a, a), (score_b, b)| {
                     score_b.cmp(score_a).then_with(|| a.attr.cmp(&b.attr))
                 });
-                if let Some(limit) = app.search_limit {
+                if let Some(limit) = req.limit {
                     scored.truncate(limit);
                 }
                 Ok(scored.into_iter().map(|(_, r)| r).collect())
             }
             Err(e) => Err(e),
         }
-    } else if app.search_fuzzy {
-        db.search_fuzzy(
-            query,
-            app.search_field,
-            app.search_case_sensitive,
-            sort,
-            app.search_limit,
-        )
+    } else if req.fuzzy {
+        db.search_fuzzy(query, req.field, req.case_sensitive, sort, req.limit)
     } else {
         db.search(
             query,
-            app.search_regex,
-            app.search_field,
-            app.search_case_sensitive,
-            app.search_exact,
+            req.regex,
+            req.field,
+            req.case_sensitive,
+            req.exact,
             sort,
-            app.search_limit,
+            req.limit,
         )
     };
 
@@ -597,32 +632,41 @@ fn perform_package_search(app: &mut App, query: &str) {
                 .map(|r| crate::app::SearchResult {
                     attr: r.attr.clone(),
                     name: r.name.clone(),
-                    #[allow(clippy::unnecessary_lazy_evaluations)]
-                    description: r.description.as_deref().unwrap_or_else(|| "").to_string(),
+                    description: match r.description.as_deref() {
+                        Some(text) => text.to_string(),
+                        None => String::new(),
+                    },
                     path: None,
                     size: None,
                     license: r.license.clone(),
                     homepage: r.homepage.clone(),
-                    #[allow(clippy::unnecessary_lazy_evaluations)]
-                    maintainers: r.maintainers.as_deref().unwrap_or_else(|| &[]).to_vec(),
+                    maintainers: match r.maintainers.as_deref() {
+                        Some(names) => names.to_vec(),
+                        None => Vec::new(),
+                    },
                     main_program: r.main_program.clone(),
                 })
                 .collect();
-            app.cache_results(query.to_string(), results.clone());
-            app.set_results(results);
-            if !size_sort_unsupported {
-                app.set_status(format!("Found {} result(s)", app.result_count()));
+            let status = if size_sort_unsupported {
+                String::from("Size sort is not available in package search mode")
+            } else {
+                format!("Found {} result(s)", results.len())
+            };
+            SearchOutcome {
+                query: query.to_string(),
+                mode: req.mode,
+                results: Some(results),
+                status: Some(status),
             }
         }
-        Err(err) => {
-            app.set_status(format!("Search error: {}", err));
-        }
+        Err(err) => fail(format!("Search error: {err}")),
     }
 }
 
-fn perform_locate_search(app: &mut App, query: &str) {
+fn perform_locate_search(req: &SearchRequest) -> SearchOutcome {
+    let query = req.query.as_str();
     let options = SearchOptions {
-        database: app.database.clone(),
+        database: req.database.clone(),
         pattern: query.to_string(),
         hash: None,
         package_pattern: None,
@@ -634,15 +678,15 @@ fn perform_locate_search(app: &mut App, query: &str) {
         mode: nixdex_core::database::SearchMode::Minimal,
         json: false,
         yaml: false,
-        limit: app.search_limit,
+        limit: req.limit,
         count: false,
-        sort: app.search_sort,
+        sort: req.sort,
         min_size: None,
         max_size: None,
         exclude_fhs: false,
         null_output: false,
-        quiet: app.search_quiet,
-        details: app.search_details,
+        quiet: req.quiet,
+        details: req.details,
     };
 
     match nixdex_core::database::search_results(&options, None) {
@@ -667,27 +711,34 @@ fn perform_locate_search(app: &mut App, query: &str) {
                     }
                 })
                 .collect();
-            app.cache_results(query.to_string(), search_results.clone());
-            app.set_results(search_results);
-            app.set_status(format!("Found {} result(s)", app.result_count()));
+            let status = format!("Found {} result(s)", search_results.len());
+            SearchOutcome {
+                query: query.to_string(),
+                mode: req.mode,
+                results: Some(search_results),
+                status: Some(status),
+            }
         }
-        Err(err) => {
-            app.set_status(format!("Locate error: {}", err));
-        }
+        Err(err) => SearchOutcome {
+            query: query.to_string(),
+            mode: req.mode,
+            results: None,
+            status: Some(format!("Locate error: {err}")),
+        },
     }
 }
 
-#[allow(clippy::unnecessary_lazy_evaluations)]
-fn perform_which_search(app: &mut App, query: &str) {
+fn perform_which_search(req: &SearchRequest) -> SearchOutcome {
+    let query = req.query.as_str();
     let command = std::path::Path::new(query)
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or_else(|| query);
+        .map_or(query, |name| name);
 
-    match nixdex_core::command_index::CommandIndex::open(&app.database) {
+    match nixdex_core::command_index::CommandIndex::open(&req.database) {
         Ok(index) => {
             let providers = match index.lookup_command(command.as_bytes()) {
-                Ok(p) => p,
+                Ok(providers) => providers,
                 Err(_) => Vec::new(),
             };
             let results: Vec<crate::app::SearchResult> = providers
@@ -704,15 +755,22 @@ fn perform_which_search(app: &mut App, query: &str) {
                     main_program: None,
                 })
                 .collect();
-            app.cache_results(query.to_string(), results.clone());
-            app.set_results(results);
-            app.set_status(format!("Found {} provider(s)", app.result_count()));
+            let status = format!("Found {} provider(s)", results.len());
+            SearchOutcome {
+                query: query.to_string(),
+                mode: req.mode,
+                results: Some(results),
+                status: Some(status),
+            }
         }
-        Err(_) => {
-            app.set_status(String::from(
+        Err(_) => SearchOutcome {
+            query: query.to_string(),
+            mode: req.mode,
+            results: None,
+            status: Some(String::from(
                 "Command index not available. Run nix-index first.",
-            ));
-        }
+            )),
+        },
     }
 }
 
@@ -762,7 +820,10 @@ fn copy_to_clipboard(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, AppEvent, Instant, KeyCode, KeyEvent, KeyModifiers, handle_input_event};
+    use super::{
+        App, AppEvent, Instant, KeyCode, KeyEvent, KeyModifiers, SearchMode, SearchOutcome,
+        handle_input_event,
+    };
     use crate::app::DetailView;
     use std::path::PathBuf;
 
@@ -882,5 +943,78 @@ mod tests {
             app.status_message
         );
         assert!(!app.detail_pinned);
+    }
+
+    fn result(attr: &str) -> crate::app::SearchResult {
+        crate::app::SearchResult {
+            attr: String::from(attr),
+            name: String::from(attr),
+            description: String::new(),
+            path: None,
+            size: None,
+            license: None,
+            homepage: None,
+            maintainers: Vec::new(),
+            main_program: None,
+        }
+    }
+
+    fn outcome(query: &str, results: Option<Vec<crate::app::SearchResult>>) -> SearchOutcome {
+        SearchOutcome {
+            query: String::from(query),
+            mode: SearchMode::Search,
+            results,
+            status: Some(String::from("done")),
+        }
+    }
+
+    /// A result for a query the user has moved on from must be dropped.
+    ///
+    /// The search runs on a worker now, so a slow answer can arrive after more
+    /// typing. Applying it would reset the selection to a list that does not
+    /// match what is in the search box.
+    #[test]
+    fn a_search_result_for_an_old_query_is_ignored() {
+        let mut app = app();
+        app.set_input(String::from("sqlite"));
+        super::apply_search_outcome(&mut app, outcome("sql", Some(vec![result("sql")])));
+        assert!(app.results.is_empty(), "stale results must not be applied");
+        assert_ne!(app.status_message, "done");
+    }
+
+    /// A result for a query typed in another mode must be dropped too.
+    #[test]
+    fn a_search_result_from_another_mode_is_ignored() {
+        let mut app = app();
+        app.set_input(String::from("sqlite"));
+        app.set_mode(SearchMode::Locate);
+        super::apply_search_outcome(&mut app, outcome("sqlite", Some(vec![result("sqlite")])));
+        assert!(app.results.is_empty());
+    }
+
+    /// The matching result is applied and cached.
+    #[test]
+    fn a_search_result_for_the_current_query_is_applied() {
+        let mut app = app();
+        app.set_input(String::from("sqlite"));
+        super::apply_search_outcome(&mut app, outcome("sqlite", Some(vec![result("sqlite")])));
+        assert_eq!(app.results.len(), 1);
+        assert_eq!(app.status_message, "done");
+        assert_eq!(
+            app.get_cached_results("sqlite").map(Vec::len),
+            Some(1),
+            "a successful search must fill the cache"
+        );
+    }
+
+    /// A failed search reports the error and keeps the results already shown.
+    #[test]
+    fn a_failed_search_keeps_the_previous_results() {
+        let mut app = app();
+        app.set_input(String::from("sqlite"));
+        app.set_results(vec![result("sqlite")]);
+        super::apply_search_outcome(&mut app, outcome("sqlite", None));
+        assert_eq!(app.results.len(), 1, "a failure must not wipe the list");
+        assert_eq!(app.status_message, "done");
     }
 }
