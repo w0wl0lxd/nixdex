@@ -1,1 +1,2 @@
 - Stop tracking build scratch. A 4.5 MB unstripped `test_simd` binary and thirteen `*.log` files were committed; both are now ignored.
+- Stop tracking the nine `.kilo/plans/*.md` agent planning documents. `CONTRIBUTING.md` keeps agent tool directories local and `.gitignore` already lists `.kilo/`, but the files were tracked, so the ignore rule never applied to them.
