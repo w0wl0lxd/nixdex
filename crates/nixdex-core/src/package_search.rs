@@ -404,7 +404,11 @@ impl SearchDb {
         case_sensitive: bool,
         exact: bool,
     ) {
-        if sort == SearchSort::None {
+        // `Reverse` means "the default output, reversed", so it has to sort by
+        // relevance first. Reversing the incoming order on its own reversed
+        // sidecar insertion order, which has nothing to do with the order the
+        // default search prints.
+        if sort == SearchSort::None || sort == SearchSort::Reverse {
             let needle = if case_sensitive {
                 pattern.to_string()
             } else {
@@ -415,10 +419,9 @@ impl SearchDb {
                 let score_b = relevance_score(b, &needle, regex, field, case_sensitive, exact);
                 score_b.cmp(&score_a).then_with(|| a.attr.cmp(&b.attr))
             });
-            return;
-        }
-        if sort == SearchSort::Reverse {
-            matches.reverse();
+            if sort == SearchSort::Reverse {
+                matches.reverse();
+            }
             return;
         }
         matches.sort_by(|a, b| Self::compare_records(a, b, sort));
@@ -885,6 +888,62 @@ mod tests {
             let line = sonic_rs::to_string(record).expect("serialize");
             writeln!(file, "{line}").expect("write");
         }
+    }
+
+    /// `--sort reverse` must be the default output reversed.
+    ///
+    /// It reversed sidecar insertion order instead, so it had no relation to
+    /// the relevance order the default search prints.
+    #[test]
+    fn reverse_sort_reverses_the_relevance_order_not_the_file_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("packages.json");
+        // File order is deliberately neither the relevance order nor its
+        // reverse: an exact attr match sorts first by relevance, but sits in
+        // the middle of the file.
+        write_fixture(
+            &path,
+            &[
+                test_record("zzz-nix-tools", "helpers"),
+                test_record("nix", "The Nix package manager"),
+                test_record("aaa-nix-extras", "extras"),
+            ],
+        );
+
+        let db = SearchDb::open(&path).expect("open");
+        let default = db
+            .search(
+                "nix",
+                false,
+                SearchField::Attr,
+                false,
+                false,
+                SearchSort::None,
+                None,
+            )
+            .expect("search");
+        let reversed = db
+            .search(
+                "nix",
+                false,
+                SearchField::Attr,
+                false,
+                false,
+                SearchSort::Reverse,
+                None,
+            )
+            .expect("search");
+
+        let default_attrs: Vec<&str> = default.iter().map(|r| r.attr.as_str()).collect();
+        let reversed_attrs: Vec<&str> = reversed.iter().map(|r| r.attr.as_str()).collect();
+        let mut expected = default_attrs.clone();
+        expected.reverse();
+        assert_eq!(reversed_attrs, expected, "default was {default_attrs:?}");
+        assert_eq!(
+            default_attrs.first(),
+            Some(&"nix"),
+            "the exact match must lead the default order: {default_attrs:?}"
+        );
     }
 
     #[test]
