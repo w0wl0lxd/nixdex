@@ -1948,6 +1948,7 @@ dependencies = [
  "futures-util",
  "nixdex-core",
  "ratatui",
+ "regex",
  "tokio",
  "tracing",
  "tracing-subscriber",

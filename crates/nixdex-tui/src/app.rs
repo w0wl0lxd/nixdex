@@ -130,6 +130,8 @@ pub struct App {
     pub toasts: Vec<Toast>,
     pub is_searching: bool,
     pub show_help: bool,
+    /// Set by Ctrl+R. The event loop clears it and re-runs the current query.
+    pub reload_requested: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -188,6 +190,7 @@ impl App {
             toasts: Vec::new(),
             is_searching: false,
             show_help: false,
+            reload_requested: false,
         }
     }
 
@@ -333,6 +336,7 @@ impl App {
             exact: self.search_exact,
             quiet: self.search_quiet,
             details: self.search_details,
+            reload: false,
         }
     }
 
@@ -373,6 +377,12 @@ impl App {
         } else {
             false
         }
+    }
+
+    /// Drop every cached result, so the next search goes back to the database.
+    pub fn clear_search_cache(&mut self) {
+        self.search_cache.clear();
+        self.cache_timestamps.clear();
     }
 
     pub fn clear_expired_cache(&mut self) {
@@ -479,6 +489,9 @@ pub struct SearchRequest {
     pub exact: bool,
     pub quiet: bool,
     pub details: bool,
+    /// Drop the worker's cached database handle before searching, so a sidecar
+    /// rewritten since the last query is picked up.
+    pub reload: bool,
 }
 
 /// What one search produced, sent back to the event loop.

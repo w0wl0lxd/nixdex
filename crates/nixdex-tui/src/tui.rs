@@ -70,6 +70,9 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
     let search_handle = tokio::task::spawn_blocking(move || {
         let mut cache = SearchDbCache::new();
         while let Some(req) = search_rx.blocking_recv() {
+            if req.reload {
+                cache = SearchDbCache::new();
+            }
             if outcome_tx.send(run_search(&mut cache, &req)).is_err() {
                 break;
             }
@@ -104,6 +107,7 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
                     Some(app_event) => {
                         handle_input_event(&app, &app_event, &mut pending_query, &mut debounce_deadline);
                         handle_event(&mut app, app_event);
+                        dispatch_reload(&mut app, &search_tx);
                     }
                     None => break,
                 }
@@ -132,23 +136,7 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
                     debounce_deadline = None;
                     if query != app.input {
                         app.set_input(query.clone());
-                        if query.is_empty() {
-                            app.set_results(Vec::new());
-                        } else if app.is_cache_valid(&query)
-                            && let Some(cached) = app.get_cached_results(&query).cloned()
-                        {
-                            app.set_results(cached);
-                            app.set_status(format!(
-                                "Found {} result(s) (cached)",
-                                app.result_count()
-                            ));
-                        } else {
-                            app.is_searching = true;
-                            if search_tx.send(app.search_request(&query)).is_err() {
-                                app.is_searching = false;
-                                app.set_status(String::from("Search worker stopped"));
-                            }
-                        }
+                        dispatch_search(&mut app, &query, &search_tx);
                     }
                 }
             }
@@ -165,6 +153,55 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
     Ok(())
 }
 
+/// Answer a debounced query: from the cache when it is still warm, from the
+/// worker otherwise.
+fn dispatch_search(
+    app: &mut App,
+    query: &str,
+    search_tx: &tokio::sync::mpsc::UnboundedSender<SearchRequest>,
+) {
+    if query.is_empty() {
+        app.set_results(Vec::new());
+        return;
+    }
+    if app.is_cache_valid(query)
+        && let Some(cached) = app.get_cached_results(query).cloned()
+    {
+        app.set_results(cached);
+        app.set_status(format!("Found {} result(s) (cached)", app.result_count()));
+        return;
+    }
+    send_search(app, app.search_request(query), search_tx);
+}
+
+/// Act on a Ctrl+R, which asked for the current query to be run again against
+/// a freshly opened database.
+fn dispatch_reload(app: &mut App, search_tx: &tokio::sync::mpsc::UnboundedSender<SearchRequest>) {
+    if !app.reload_requested {
+        return;
+    }
+    app.reload_requested = false;
+    if app.input.is_empty() {
+        app.set_status(String::from("Nothing to refresh"));
+        return;
+    }
+    let mut request = app.search_request(&app.input);
+    request.reload = true;
+    send_search(app, request, search_tx);
+}
+
+fn send_search(
+    app: &mut App,
+    request: SearchRequest,
+    search_tx: &tokio::sync::mpsc::UnboundedSender<SearchRequest>,
+) {
+    app.is_searching = true;
+    if search_tx.send(request).is_err() {
+        app.is_searching = false;
+        app.set_status(String::from("Search worker stopped"));
+    }
+}
+
 fn handle_input_event(
     app: &App,
     event: &AppEvent,
@@ -177,12 +214,11 @@ fn handle_input_event(
             modifiers: KeyModifiers::NONE,
             ..
         }) => {
-            // `/`, `:` and `?` are documented shortcuts, so they are commands
-            // rather than query text. Letting them through here both typed
-            // them into the search box and left the shortcuts unreachable.
-            if matches!(c, '/' | ':' | '?') {
-                return;
-            }
+            // Every unmodified printable character is query text, `/`, `:` and
+            // `?` included. Treating them as shortcuts dropped them from the
+            // query in every mode: `bin/ls` in Locate mode searched for
+            // `binls`, and `?` cannot be typed in a regex query at all.
+            // Commands carry a modifier instead.
             let mut new_input = pending_query.take().unwrap_or_else(|| app.input.clone());
             // Drop a leading space. The guard has to read the pending buffer,
             // not `app.input`: while the debounce is still running `app.input`
@@ -225,20 +261,15 @@ fn handle_input_event(
 fn handle_event(app: &mut App, event: AppEvent) {
     if let Some(detail) = &app.detail {
         if detail.pinned {
-            if matches!(
-                event,
-                AppEvent::Key(
-                    KeyEvent {
-                        code: KeyCode::Esc,
-                        modifiers: KeyModifiers::NONE,
-                        ..
-                    } | KeyEvent {
-                        code: KeyCode::Char('q'),
-                        modifiers: KeyModifiers::NONE,
-                        ..
-                    }
-                )
-            ) {
+            // A pinned detail takes the keyboard, so it has to offer a way out.
+            // It used to accept only Esc and `q`, both of which close the pane
+            // outright: Ctrl+D could not reach `toggle_detail_pin`, so the pin
+            // the footer says to press Ctrl+D to release was one-way. `q` is
+            // search input everywhere else, so it is not a command here either.
+            if event.is_ctrl_d() {
+                app.toggle_detail_pin();
+                app.set_status(String::from("Detail unpinned"));
+            } else if event.is_escape() {
                 app.close_detail();
             }
             return;
@@ -264,25 +295,6 @@ fn handle_key_event(app: &mut App, event: AppEvent) {
         app.set_status(String::from("Quitting..."));
         return;
     }
-    if event.is_slash() {
-        app.set_status(String::from(
-            "Focus: search input — type to search, Esc to clear",
-        ));
-        return;
-    }
-    if event.is_colon() {
-        app.set_status(String::from("Command palette — not yet implemented"));
-        return;
-    }
-    if event.is_question() {
-        app.toggle_help();
-        if app.show_help {
-            app.set_status(String::from("Help overlay — press ? to close"));
-        } else {
-            app.set_status(String::from("Help overlay closed"));
-        }
-        return;
-    }
     // Every remaining plain printable character is search input, not a
     // command. `handle_input_event` has already appended it to the query, so
     // treating it as a command key here would also fire an unrelated action --
@@ -292,9 +304,28 @@ fn handle_key_event(app: &mut App, event: AppEvent) {
     if event.as_char().is_some() {
         return;
     }
+    if event.is_ctrl_h() {
+        app.toggle_help();
+        let message = if app.show_help {
+            "Help overlay -- press any key to close"
+        } else {
+            "Help overlay closed"
+        };
+        app.set_status(String::from(message));
+        return;
+    }
     if event.is_ctrl_t() {
         app.cycle_theme();
         app.set_status(format!("Theme: {:?}", app.theme));
+        return;
+    }
+    if event.is_escape() {
+        // Esc is documented as clearing the search. It used to drop only the
+        // queued keystrokes, so the committed query and its results stayed on
+        // screen and there was no way to get back to an empty view.
+        app.set_input(String::new());
+        app.set_results(Vec::new());
+        app.set_status(String::from("Search cleared"));
         return;
     }
     handle_navigation_key(app, &event);
@@ -344,6 +375,11 @@ fn handle_mode_key(app: &mut App, event: &AppEvent) {
 
 fn handle_search_toggle_key(app: &mut App, event: &AppEvent) {
     if event.is_ctrl_r() {
+        // Ctrl+R used to set this message and nothing else, so the cached
+        // results and the worker's open database handle both survived and a
+        // rebuilt index needed a restart to show up.
+        app.clear_search_cache();
+        app.reload_requested = true;
         app.set_status(String::from("Refreshing..."));
     } else if event.is_ctrl_n() {
         app.search_quiet = !app.search_quiet;
@@ -667,7 +703,11 @@ fn perform_locate_search(req: &SearchRequest) -> SearchOutcome {
     let query = req.query.as_str();
     let options = SearchOptions {
         database: req.database.clone(),
-        pattern: query.to_string(),
+        // `nixdex-core` compiles `pattern` with `compile_search_regex`, so a
+        // file name holding `.`, `+` or `[` was read as a regex: it matched too
+        // much, or failed to parse. `literal_pattern` only steers the n-gram
+        // candidate filter, so the escape has to happen here.
+        pattern: regex::escape(query),
         hash: None,
         package_pattern: None,
         exact_basename: None,
@@ -791,7 +831,10 @@ fn pipe_to_clipboard_command(command: &str, args: &[&str], text: &str) -> bool {
         // Drop stdin so the child sees EOF before we wait on it.
         drop(stdin);
     }
-    child.wait().is_ok()
+    // A non-zero exit means the copy failed. Reporting `wait()` succeeding as
+    // success made every failure look like a copy, and on Linux it stopped the
+    // `wl-copy` fallback from ever running after `xclip` failed.
+    matches!(child.wait(), Ok(status) if status.success())
 }
 
 /// Copy `text` to the system clipboard. Returns `true` if a clipboard backend
@@ -863,10 +906,10 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_characters_stay_out_of_the_query() {
-        // `/`, `:` and `?` are documented shortcuts. Appending them here both
-        // typed them into the box and left the shortcuts unreachable.
-        assert_eq!(type_text(&app(), "a/b:c?d").as_deref(), Some("abcd"));
+    fn punctuation_is_query_text_not_a_shortcut() {
+        // `/`, `:` and `?` were treated as commands, so they were stripped from
+        // every query. Commands carry a modifier now and these are just text.
+        assert_eq!(type_text(&app(), "a/b:c?d").as_deref(), Some("a/b:c?d"));
     }
 
     #[test]
@@ -1016,5 +1059,101 @@ mod tests {
         super::apply_search_outcome(&mut app, outcome("sqlite", None));
         assert_eq!(app.results.len(), 1, "a failure must not wipe the list");
         assert_eq!(app.status_message, "done");
+    }
+
+    /// A path typed in Locate mode must keep its separators.
+    ///
+    /// `/`, `:` and `?` were treated as shortcuts and dropped from the query in
+    /// every mode, so `bin/ls` searched for `binls`.
+    #[test]
+    fn punctuation_stays_in_the_query() {
+        let mut app = app();
+        app.set_mode(SearchMode::Locate);
+        assert_eq!(type_text(&app, "bin/ls"), Some(String::from("bin/ls")));
+        assert_eq!(type_text(&app, "a:b?c"), Some(String::from("a:b?c")));
+    }
+
+    /// Help moved to Ctrl+H because `?` is query text now.
+    #[test]
+    fn ctrl_h_toggles_the_help_overlay() {
+        let mut app = app();
+        super::handle_key_event(&mut app, ctrl(KeyCode::Char('h')));
+        assert!(app.show_help, "Ctrl+H must open the help overlay");
+        super::handle_key_event(&mut app, key(KeyCode::Char('x')));
+        assert!(!app.show_help, "any key must close it again");
+    }
+
+    /// Esc clears the committed query and its results, not just the queued keys.
+    #[test]
+    fn escape_clears_the_search_and_the_results() {
+        let mut app = app();
+        app.set_input(String::from("sqlite"));
+        app.set_results(vec![result("sqlite")]);
+        super::handle_key_event(&mut app, key(KeyCode::Esc));
+        assert!(app.input.is_empty(), "Esc must clear the query");
+        assert!(app.results.is_empty(), "Esc must clear the results");
+    }
+
+    /// A pinned detail must be releasable with the key the help advertises.
+    #[test]
+    fn ctrl_d_unpins_a_pinned_detail() {
+        let mut app = app();
+        app.set_detail(DetailView {
+            attr: String::from("hello"),
+            name: String::from("hello"),
+            description: String::new(),
+            path: None,
+            size: None,
+            license: None,
+            homepage: None,
+            maintainers: Vec::new(),
+            main_program: None,
+            pinned: true,
+        });
+        app.detail_pinned = true;
+
+        super::handle_event(&mut app, ctrl(KeyCode::Char('d')));
+        assert!(!app.detail_pinned, "Ctrl+D must release the pin");
+        assert!(
+            app.detail.is_some(),
+            "unpinning must not close the detail pane"
+        );
+    }
+
+    /// Ctrl+R must drop the cached results and ask for a fresh search.
+    ///
+    /// It used to set a "Refreshing..." status and change nothing else, so a
+    /// rebuilt index needed a restart of the TUI to show up.
+    #[test]
+    fn ctrl_r_clears_the_cache_and_asks_for_a_reload() {
+        let mut app = app();
+        app.set_input(String::from("sqlite"));
+        app.cache_results(String::from("sqlite"), vec![result("sqlite")]);
+        assert!(app.get_cached_results("sqlite").is_some());
+
+        super::handle_key_event(&mut app, ctrl(KeyCode::Char('r')));
+        assert!(app.reload_requested, "Ctrl+R must request a reload");
+        assert!(
+            app.get_cached_results("sqlite").is_none(),
+            "Ctrl+R must drop the cached results"
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        super::dispatch_reload(&mut app, &tx);
+        let request = rx.try_recv().expect("a search must be dispatched");
+        assert!(request.reload, "the worker must reopen the database");
+        assert_eq!(request.query, "sqlite");
+        assert!(!app.reload_requested, "the flag must be cleared");
+    }
+
+    /// Ctrl+R with an empty search box has nothing to re-run.
+    #[test]
+    fn ctrl_r_with_no_query_dispatches_nothing() {
+        let mut app = app();
+        app.reload_requested = true;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        super::dispatch_reload(&mut app, &tx);
+        assert!(rx.try_recv().is_err(), "no search should be sent");
+        assert_eq!(app.status_message, "Nothing to refresh");
     }
 }
