@@ -238,6 +238,37 @@ fn render_loading(frame: &mut Frame<'_>, area: ratatui::layout::Rect, tc: &Theme
     frame.render_widget(paragraph, area);
 }
 
+/// Render one result as a single-line JSON object, so the Ctrl+J toggle produces
+/// the same shape a `--json` run would, not a re-spaced text row.
+fn json_row(result: &crate::app::SearchResult) -> String {
+    let mut obj = sonic_rs::json!({
+        "attr": result.attr,
+        "name": result.name,
+        "description": result.description,
+    });
+    if let Some(ref path) = result.path {
+        obj.insert("path", sonic_rs::Value::copy_str(path));
+    }
+    if let Some(size) = result.size {
+        obj.insert("size", sonic_rs::Value::from(size));
+    }
+    if let Some(ref license) = result.license {
+        obj.insert("license", sonic_rs::Value::copy_str(license));
+    }
+    if let Some(ref homepage) = result.homepage {
+        obj.insert("homepage", sonic_rs::Value::copy_str(homepage));
+    }
+    if !result.maintainers.is_empty()
+        && let Ok(val) = sonic_rs::to_value(&result.maintainers)
+    {
+        obj.insert("maintainers", val);
+    }
+    if let Some(ref mp) = result.main_program {
+        obj.insert("main_program", sonic_rs::Value::copy_str(mp));
+    }
+    sonic_rs::to_string(&obj).unwrap_or_else(|_| String::new())
+}
+
 fn render_results(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App, tc: &ThemeColors) {
     let items: Vec<ListItem> = app
         .results
@@ -250,10 +281,7 @@ fn render_results(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App,
                     Style::default().fg(tc.attr_fg),
                 )])
             } else if app.search_json {
-                Line::from(vec![Span::raw(format!(
-                    "{}  {}  {}",
-                    result.attr, result.name, result.description
-                ))])
+                Line::from(vec![Span::raw(json_row(result))])
             } else {
                 let attr_span = if i == app.selected {
                     Span::styled(
@@ -449,7 +477,6 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: ratatui::layout::Rect, tc: &
         "  Ctrl+E       Copy a nix-env install command",
         "  Ctrl+P       Copy a nix profile install command",
         "  Ctrl+J       Toggle JSON output",
-        "  Ctrl+N       Toggle quiet mode",
         "  Ctrl+R       Refresh",
         "  Ctrl+T       Cycle the theme",
         "  Ctrl+H       Toggle this help",
@@ -468,4 +495,36 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: ratatui::layout::Rect, tc: &
 
     let overlay_area = centered_rect(area, 60, 70);
     frame.render_widget(paragraph, overlay_area);
+}
+
+#[cfg(test)]
+mod json_row_tests {
+    use super::json_row;
+    use crate::app::SearchResult;
+
+    #[test]
+    fn ctrl_j_rows_are_real_json_not_re_spaced_columns() {
+        let result = SearchResult {
+            attr: "hello".to_string(),
+            name: "hello-2.12".to_string(),
+            description: "a greeting".to_string(),
+            path: Some("/bin/hello".to_string()),
+            size: Some(42),
+            license: None,
+            homepage: None,
+            maintainers: Vec::new(),
+            main_program: Some("hello".to_string()),
+        };
+
+        let row = json_row(&result);
+
+        assert!(row.starts_with('{') && row.ends_with('}'), "{row:?}");
+        assert!(row.contains("\"attr\":\"hello\""), "{row:?}");
+        assert!(row.contains("\"size\":42"), "{row:?}");
+        assert!(row.contains("\"main_program\":\"hello\""), "{row:?}");
+        assert!(
+            !row.contains("\"license\""),
+            "absent fields stay out: {row:?}"
+        );
+    }
 }

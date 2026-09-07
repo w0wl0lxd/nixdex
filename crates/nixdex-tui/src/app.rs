@@ -119,7 +119,6 @@ pub struct App {
     pub search_json: bool,
     pub search_name_only: bool,
     pub search_color: bool,
-    pub search_quiet: bool,
     pub search_details: bool,
     pub theme: Theme,
     pub detail_pinned: bool,
@@ -179,7 +178,6 @@ impl App {
             search_json: false,
             search_name_only: false,
             search_color: false,
-            search_quiet: false,
             search_details: false,
             theme: Theme::default(),
             detail_pinned: false,
@@ -338,7 +336,6 @@ impl App {
             fuzzy: self.search_fuzzy,
             regex: self.search_regex,
             exact: self.search_exact,
-            quiet: self.search_quiet,
             details: self.search_details,
             reload: false,
         }
@@ -491,7 +488,6 @@ pub struct SearchRequest {
     pub fuzzy: bool,
     pub regex: bool,
     pub exact: bool,
-    pub quiet: bool,
     pub details: bool,
     /// Drop the worker's cached database handle before searching, so a sidecar
     /// rewritten since the last query is picked up.

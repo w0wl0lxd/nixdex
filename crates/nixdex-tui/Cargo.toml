@@ -14,6 +14,7 @@ ratatui = { workspace = true }
 crossterm = { workspace = true, features = ["event-stream"] }
 futures-util = { workspace = true }
 regex = { workspace = true }
+sonic-rs = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 color-eyre = { workspace = true }
 tracing = { workspace = true }

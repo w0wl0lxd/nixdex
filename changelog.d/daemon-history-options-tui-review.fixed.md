@@ -26,3 +26,7 @@ longer depends on whether a daemon served the query.
 
 The options sidecar is written to a temporary file and renamed into place, like
 the history sidecar.
+
+The TUI Ctrl+J toggle renders real JSON rows instead of re-spaced text columns.
+The Ctrl+N "quiet" toggle is removed: quiet output has no meaning in an
+interactive result list, and the toggle changed nothing.

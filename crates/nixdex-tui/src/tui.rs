@@ -381,12 +381,6 @@ fn handle_search_toggle_key(app: &mut App, event: &AppEvent) {
         app.clear_search_cache();
         app.reload_requested = true;
         app.set_status(String::from("Refreshing..."));
-    } else if event.is_ctrl_n() {
-        app.search_quiet = !app.search_quiet;
-        app.set_status(format!(
-            "Quiet mode {}",
-            if app.search_quiet { "on" } else { "off" }
-        ));
     } else if event.is_ctrl_j() {
         app.search_json = !app.search_json;
         app.set_status(format!(
@@ -725,7 +719,7 @@ fn perform_locate_search(req: &SearchRequest) -> SearchOutcome {
         max_size: None,
         exclude_fhs: false,
         null_output: false,
-        quiet: req.quiet,
+        quiet: false,
         details: req.details,
     };
 
