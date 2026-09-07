@@ -12,3 +12,4 @@
 - `nix-locate` says on stderr when several arguments were joined into one pattern, so a misplaced flag or an expanded shell glob no longer produces a silent no-match. `--quiet` suppresses the note.
 - `/history` and `/options` say which sidecar is absent and that `nixdex update` fetches it, instead of a bare "no history database loaded". The daemon still does not download sidecars itself.
 - The `parallel_search` benchmark is renamed to `package_search`, which is what it measures; the parallel trigram path and the n-gram cache are not exercised by it.
+- `advise_huge_pages` now asks for `MADV_HUGEPAGE` only on Linux, so the `huge_pages` feature builds on macOS again; the portable `MADV_WILLNEED` read-ahead hint still applies everywhere.
