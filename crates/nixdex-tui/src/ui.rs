@@ -273,6 +273,26 @@ fn json_row(result: &crate::app::SearchResult) -> String {
 ///
 /// Only the fields that carry a value are shown, so a sparse record does not
 /// leave blank lines behind.
+/// How many terminal rows `expanded_lines` draws for this result.
+///
+/// The click handler needs this: an expanded result is several rows tall, so a
+/// fixed one-row-per-result mapping drifts further down the list with every
+/// expanded entry above the pointer. Kept beside `expanded_lines` so the two
+/// cannot disagree about which fields draw a line.
+pub(crate) fn expanded_row_count(result: &crate::app::SearchResult) -> usize {
+    let mut rows = 1;
+    if !result.name.is_empty() {
+        rows += 1;
+    }
+    if !result.description.is_empty() {
+        rows += 1;
+    }
+    if result.path.is_some() {
+        rows += 1;
+    }
+    rows
+}
+
 fn expanded_lines<'a>(result: &'a crate::app::SearchResult, attr_span: Span<'a>) -> Vec<Line<'a>> {
     let mut lines = vec![Line::from(vec![attr_span])];
     if !result.name.is_empty() {
@@ -506,6 +526,9 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: ratatui::layout::Rect, tc: &
         "  Ctrl+Y       Copy the selected attribute",
         "  Ctrl+E       Copy a nix-env install command",
         "  Ctrl+P       Copy a nix profile install command",
+        "  Ctrl+F       Toggle fuzzy matching",
+        "  Ctrl+X       Toggle regex matching",
+        "  Ctrl+N       Show attribute names only",
         "  Ctrl+J / F2  Toggle JSON output",
         "  Ctrl+R       Refresh",
         "  Ctrl+T       Cycle the theme",

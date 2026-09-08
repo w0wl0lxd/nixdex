@@ -311,6 +311,31 @@ impl App {
         self.expand_all = !self.expand_all;
     }
 
+    /// Turn fuzzy matching on or off.
+    ///
+    /// The search worker tries fuzzy before regex, so a regex left on while
+    /// fuzzy is on would silently do nothing. Clearing it keeps the status
+    /// line and the query that actually runs in agreement.
+    pub fn toggle_fuzzy(&mut self) {
+        self.search_fuzzy = !self.search_fuzzy;
+        if self.search_fuzzy {
+            self.search_regex = false;
+        }
+    }
+
+    /// Turn regex matching on or off, clearing fuzzy for the same reason.
+    pub fn toggle_regex(&mut self) {
+        self.search_regex = !self.search_regex;
+        if self.search_regex {
+            self.search_fuzzy = false;
+        }
+    }
+
+    /// Show only the attribute name for each result, instead of the full line.
+    pub fn toggle_name_only(&mut self) {
+        self.search_name_only = !self.search_name_only;
+    }
+
     pub fn toggle_help(&mut self) {
         self.show_help = !self.show_help;
     }

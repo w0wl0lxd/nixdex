@@ -3726,6 +3726,18 @@ fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
                     crate::ngram_index::POSTINGS_FILE,
                 ]);
             }
+            // Only v2 databases carry the frames that make a frame map, and
+            // only the v2 scan below can rebuild one. Requiring it for v1 would
+            // make a v1 database rebuild forever waiting for a file it can
+            // never produce. Leaving it out entirely was the bug: a deleted
+            // frame map was never noticed, so selective frame decompression
+            // stayed broken and package counts vanished while this reported the
+            // database up to date. Keying on `reader.frame_map` instead is
+            // circular -- that field is loaded from this very file.
+            if reader.version == 2 {
+                required_sidecars.push(FRAME_MAP_FILE);
+            }
+
             let missing: Vec<&str> = required_sidecars
                 .iter()
                 .filter(|name| !db_dir.join(name).exists())
@@ -3778,6 +3790,10 @@ fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
     } else {
         None
     };
+    // Ordinal-to-frame map, rebuilt from the scan below. The reader's own
+    // `frame_map` is read back from the sidecar, so it cannot recreate a file
+    // that has been deleted; this can.
+    let mut rebuilt_frame_map: Vec<u32> = Vec::new();
     let mut all_package_labels: Vec<String> = Vec::new();
     let mut all_package_meta: Vec<PackageMeta> = Vec::new();
     let mut all_package_attrs: Vec<(String, String, String)> = Vec::new();
@@ -3805,7 +3821,7 @@ fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
             )?;
         }
     } else {
-        for (offset, len) in &reader.frames {
+        for (frame_idx, (offset, len)) in reader.frames.iter().enumerate() {
             let start = *offset;
             let end = start + *len;
             let compressed = reader
@@ -3830,6 +3846,14 @@ fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
                 &mut all_package_meta,
                 &mut all_package_attrs,
             )?;
+
+            // Every package the scan just found lives in this frame, so the
+            // ordinals added by this iteration map to `frame_idx`. Frames split
+            // on package boundaries, so no package spans two of them and this
+            // reproduces exactly what the writer recorded.
+            let frame_ordinal =
+                u32::try_from(frame_idx).map_err(|_| Error::Corrupt("frame index overflow"))?;
+            rebuilt_frame_map.resize(all_package_labels.len(), frame_ordinal);
         }
     }
 
@@ -3877,9 +3901,10 @@ fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
             .map_err(Error::NgramIndex)?;
     }
 
-    // Write frame_map sidecar if we have v2 frame data.
-    if let (Some(frame_map), Some(_frame_starts)) = (&reader.frame_map, &reader.frame_starts) {
-        write_frame_map(db_dir, frame_map, reader.frames.len())?;
+    // Write the frame_map sidecar from the map the scan rebuilt. Writing
+    // `reader.frame_map` instead only ever copied the file back onto itself.
+    if reader.version == 2 {
+        write_frame_map(db_dir, &rebuilt_frame_map, reader.frames.len())?;
     }
 
     // Synthesize a packages.json sidecar from package footers so that
@@ -5547,6 +5572,59 @@ mod tests {
             normalize(regex_pruned),
             normalize(baseline),
             "regex with prefix and suffix must match full scan"
+        );
+    }
+
+    /// A deleted frame map must be rebuilt, not reported as up to date.
+    ///
+    /// `required_sidecars` listed every other file the readers need but not
+    /// this one, so when the frame hashes matched, a deleted frame map was
+    /// never noticed. Selective frame decompression stayed broken and package
+    /// counts disappeared while `generate_sidecars` said the database was fine.
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_deleted_frame_map_is_regenerated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+        let path = sample_store_path();
+        let tree = FileTree::directory(vec![(
+            Bytes::from_static(b"bin"),
+            FileTree::directory(vec![(
+                Bytes::from_static(b"hello"),
+                FileTree::regular(10, true),
+            )]),
+        )]);
+
+        {
+            let mut writer = Writer::create(&db_path, 3).expect("create");
+            writer.add(&path, &tree, b"").expect("add");
+            writer.finish().expect("finish");
+        }
+        generate_sidecars(&db_path).expect("sidecars");
+
+        let frame_map = dir.path().join(FRAME_MAP_FILE);
+        if !frame_map.exists() {
+            // A v1 database writes no frame map, and must not be made to
+            // rebuild forever waiting for one.
+            generate_sidecars(&db_path).expect("a second pass must still succeed");
+            return;
+        }
+        let original = std::fs::read(&frame_map).expect("reading the frame map");
+
+        std::fs::remove_file(&frame_map).expect("removing the frame map");
+        // The frame hashes are unchanged, so this is exactly the path that
+        // used to short-circuit.
+        generate_sidecars(&db_path).expect("sidecars again");
+
+        assert!(
+            frame_map.exists(),
+            "a deleted frame map must be regenerated, not reported as up to date"
+        );
+        assert_eq!(
+            std::fs::read(&frame_map).expect("reading the rebuilt frame map"),
+            original,
+            "the rebuilt frame map must match the one the writer produced"
         );
     }
 
