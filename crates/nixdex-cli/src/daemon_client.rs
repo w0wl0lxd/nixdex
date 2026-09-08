@@ -79,22 +79,48 @@ impl std::fmt::Display for DaemonError {
     }
 }
 
+/// Environment variable holding the daemon's bearer token.
+///
+/// A daemon started with `--admin-token` requires it on every request, this
+/// client has no other way to learn it, and the token must not go on the
+/// command line where it would show up in `ps`.
+pub const DAEMON_TOKEN_ENV: &str = "NIXDEX_DAEMON_TOKEN";
+
 pub struct DaemonClient {
     base: String,
     client: reqwest::Client,
+    /// Bearer token, when the daemon was started with one.
+    token: Option<String>,
 }
 
 impl DaemonClient {
     pub fn new(addr: String) -> Self {
+        Self::with_token(addr, std::env::var(DAEMON_TOKEN_ENV).ok())
+    }
+
+    pub fn with_token(addr: String, token: Option<String>) -> Self {
         Self {
             base: addr,
             client: reqwest::Client::new(),
+            // An empty variable means "no token", not "the empty token".
+            token: token.filter(|token| !token.is_empty()),
+        }
+    }
+
+    /// Attach the bearer token, when there is one.
+    ///
+    /// A daemon with an admin token answers 401 to every unauthenticated
+    /// request, so without this every daemon-backed search failed and fell
+    /// back to the local path.
+    fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
         }
     }
 
     pub async fn ready(&self) -> bool {
-        self.client
-            .get(format!("http://{}/ready", self.base))
+        self.authorize(self.client.get(format!("http://{}/ready", self.base)))
             .send()
             .await
             .is_ok_and(|r| r.status().is_success())
@@ -105,8 +131,7 @@ impl DaemonClient {
         query: &[(String, String)],
     ) -> Result<NixLocateResponse, DaemonError> {
         let resp = self
-            .client
-            .get(format!("http://{}/nix-locate", self.base))
+            .authorize(self.client.get(format!("http://{}/nix-locate", self.base)))
             .query(query)
             .send()
             .await
@@ -215,80 +240,284 @@ fn format_grouped(n: u64) -> String {
     out
 }
 
+/// Options for rendering daemon responses.
+pub(crate) struct RenderOpts {
+    pub json: bool,
+    pub yaml: bool,
+    pub minimal: bool,
+    pub null_output: bool,
+    pub quiet: bool,
+    pub details: bool,
+}
+
 /// Render a daemon response into the same text/JSON/count lines the local
 /// search path would print. Colour highlighting is omitted because the daemon
 /// response does not carry per-match highlight ranges.
-pub(crate) fn render(
-    response: &NixLocateResponse,
-    json: bool,
-    minimal: bool,
-    null_output: bool,
-) -> Vec<String> {
+pub(crate) fn render(response: &NixLocateResponse, opts: &RenderOpts) -> Vec<String> {
+    if opts.quiet {
+        return Vec::new();
+    }
+
     if let Some(count) = response.count {
         return vec![count.to_string()];
     }
 
-    let delim = if null_output { "\0" } else { "\n" };
+    let delim = if opts.null_output { "\0" } else { "\n" };
 
-    if json {
-        response
-            .matches
+    if opts.yaml {
+        render_daemon_yaml(&response.matches, opts, delim)
+    } else if opts.json {
+        render_daemon_json(&response.matches, delim)
+    } else if opts.minimal {
+        render_daemon_minimal(&response.matches, delim)
+    } else {
+        render_daemon_text(&response.matches, opts, delim)
+    }
+}
+
+fn render_daemon_yaml(matches: &[NixLocateMatch], opts: &RenderOpts, delim: &str) -> Vec<String> {
+    matches
+        .iter()
+        .map(|m| {
+            let (kind, size) = node_kind_size(m.node.as_ref());
+            let mut obj = serde_norway::Mapping::new();
+            obj.insert(
+                serde_norway::Value::String("attr".into()),
+                serde_norway::Value::String(m.attr.clone()),
+            );
+            obj.insert(
+                serde_norway::Value::String("size".into()),
+                serde_norway::Value::Number(size.into()),
+            );
+            obj.insert(
+                serde_norway::Value::String("kind".into()),
+                serde_norway::Value::String(kind.to_string()),
+            );
+            obj.insert(
+                serde_norway::Value::String("path".into()),
+                serde_norway::Value::String(m.path.clone().unwrap_or_else(String::new)),
+            );
+            obj.insert(
+                serde_norway::Value::String("store_path".into()),
+                serde_norway::Value::String(store_path_string(m)),
+            );
+            if opts.details {
+                append_daemon_yaml_details(&mut obj, m);
+            }
+            let yaml = serde_norway::to_string(&obj).unwrap_or_else(|_| String::new());
+            // `---` opens a YAML document. Without it several matches
+            // concatenate into one invalid stream, unlike `yaml_document`,
+            // which every other YAML path here goes through.
+            format!("---\n{yaml}{delim}")
+        })
+        .collect()
+}
+
+fn append_daemon_yaml_details(obj: &mut serde_norway::Mapping, m: &NixLocateMatch) {
+    if let Some(ref desc) = m.description {
+        obj.insert(
+            serde_norway::Value::String("description".into()),
+            serde_norway::Value::String(desc.clone()),
+        );
+    }
+    if let Some(ref lic) = m.license {
+        obj.insert(
+            serde_norway::Value::String("license".into()),
+            serde_norway::Value::String(lic.clone()),
+        );
+    }
+    if let Some(ref hp) = m.homepage {
+        obj.insert(
+            serde_norway::Value::String("homepage".into()),
+            serde_norway::Value::String(hp.clone()),
+        );
+    }
+    if let Some(ref maint) = m.maintainers {
+        let vals: Vec<serde_norway::Value> = maint
             .iter()
-            .map(|m| {
-                let (kind, size) = node_kind_size(m.node.as_ref());
-                let mut obj = sonic_rs::json!({
-                    "attr": m.attr,
-                    "size": size,
-                    "kind": kind,
-                    "path": m.path.clone().unwrap_or_else(String::new),
-                    "store_path": store_path_string(m),
-                });
+            .cloned()
+            .map(serde_norway::Value::String)
+            .collect();
+        obj.insert(
+            serde_norway::Value::String("maintainers".into()),
+            serde_norway::Value::Sequence(vals),
+        );
+    }
+    if let Some(ref plats) = m.platforms {
+        let vals: Vec<serde_norway::Value> = plats
+            .iter()
+            .cloned()
+            .map(serde_norway::Value::String)
+            .collect();
+        obj.insert(
+            serde_norway::Value::String("platforms".into()),
+            serde_norway::Value::Sequence(vals),
+        );
+    }
+    if let Some(ref mp) = m.main_program {
+        obj.insert(
+            serde_norway::Value::String("main_program".into()),
+            serde_norway::Value::String(mp.clone()),
+        );
+    }
+}
+
+fn render_daemon_json(matches: &[NixLocateMatch], delim: &str) -> Vec<String> {
+    matches
+        .iter()
+        .map(|m| {
+            let (kind, size) = node_kind_size(m.node.as_ref());
+            let mut obj = sonic_rs::json!({
+                "attr": m.attr,
+                "size": size,
+                "kind": kind,
+                "path": m.path.clone().unwrap_or_else(String::new),
+                "store_path": store_path_string(m),
+            });
+            // The local `--json` path (`print_match_json`) emits every metadata
+            // field it has, regardless of `--details`. Matching that here keeps
+            // the JSON schema identical whether or not the daemon served the
+            // query. `--details` still gates the text and YAML renders, which
+            // the local path gates the same way.
+            if let Some(ref desc) = m.description {
+                obj.insert("description", sonic_rs::Value::copy_str(desc));
+            }
+            if let Some(ref lic) = m.license {
+                obj.insert("license", sonic_rs::Value::copy_str(lic));
+            }
+            if let Some(ref hp) = m.homepage {
+                obj.insert("homepage", sonic_rs::Value::copy_str(hp));
+            }
+            if let Some(ref maint) = m.maintainers
+                && let Ok(val) = sonic_rs::to_value(maint)
+            {
+                obj.insert("maintainers", val);
+            }
+            if let Some(ref plats) = m.platforms
+                && let Ok(val) = sonic_rs::to_value(plats)
+            {
+                obj.insert("platforms", val);
+            }
+            if let Some(ref mp) = m.main_program {
+                obj.insert("main_program", sonic_rs::Value::copy_str(mp));
+            }
+            let line = sonic_rs::to_string(&obj).unwrap_or_else(|_| String::new());
+            format!("{line}{delim}")
+        })
+        .collect()
+}
+
+fn render_daemon_minimal(matches: &[NixLocateMatch], delim: &str) -> Vec<String> {
+    matches
+        .iter()
+        .map(|m| format!("{}{delim}", m.attr))
+        .collect()
+}
+
+fn render_daemon_text(matches: &[NixLocateMatch], opts: &RenderOpts, delim: &str) -> Vec<String> {
+    matches
+        .iter()
+        .map(|m| {
+            let (kind, size) = node_kind_size(m.node.as_ref());
+            let size_str = format_grouped(size);
+            let sp = store_path_string(m);
+            let path = m.path.clone().unwrap_or_else(String::new);
+            // The delimiter is appended last, after any `--details` fields, so a
+            // record never splits across the delimiter boundary.
+            let mut line = format!("{:<40} {:>14} {:>1} {}{}", m.attr, size_str, kind, sp, path);
+            if opts.details {
                 if let Some(ref desc) = m.description {
-                    obj.insert("description", sonic_rs::Value::copy_str(desc));
+                    use std::fmt::Write;
+                    let _ = write!(line, " desc={desc}");
                 }
                 if let Some(ref lic) = m.license {
-                    obj.insert("license", sonic_rs::Value::copy_str(lic));
+                    use std::fmt::Write;
+                    let _ = write!(line, " license={lic}");
                 }
                 if let Some(ref hp) = m.homepage {
-                    obj.insert("homepage", sonic_rs::Value::copy_str(hp));
+                    use std::fmt::Write;
+                    let _ = write!(line, " homepage={hp}");
                 }
                 if let Some(ref maint) = m.maintainers {
-                    if let Ok(val) = sonic_rs::to_value(maint) {
-                        obj.insert("maintainers", val);
-                    }
-                }
-                if let Some(ref plats) = m.platforms {
-                    if let Ok(val) = sonic_rs::to_value(plats) {
-                        obj.insert("platforms", val);
-                    }
+                    use std::fmt::Write;
+                    let _ = write!(line, " maintainers={maint:?}");
                 }
                 if let Some(ref mp) = m.main_program {
-                    obj.insert("main_program", sonic_rs::Value::copy_str(mp));
+                    use std::fmt::Write;
+                    let _ = write!(line, " main_program={mp}");
                 }
-                let line = sonic_rs::to_string(&obj).unwrap_or_else(|_| String::new());
-                format!("{line}{delim}")
-            })
-            .collect()
-    } else if minimal {
-        response
-            .matches
-            .iter()
-            .map(|m| format!("{}{delim}", m.attr))
-            .collect()
-    } else {
-        response
-            .matches
-            .iter()
-            .map(|m| {
-                let (kind, size) = node_kind_size(m.node.as_ref());
-                let size_str = format_grouped(size);
-                let sp = store_path_string(m);
-                let path = m.path.clone().unwrap_or_else(String::new);
-                format!(
-                    "{:<40} {:>14} {:>1} {}{}{delim}",
-                    m.attr, size_str, kind, sp, path
-                )
-            })
-            .collect()
+            }
+            line.push_str(delim);
+            line
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NixLocateMatch, RenderOpts, render, render_daemon_text};
+
+    fn match_with_details() -> NixLocateMatch {
+        sonic_rs::from_str(
+            r#"{"attr":"hello","path":"/bin/hello","description":"a greeting","main_program":"hello"}"#,
+        )
+        .expect("fixture parses")
+    }
+
+    fn detail_opts() -> RenderOpts {
+        RenderOpts {
+            json: false,
+            yaml: false,
+            minimal: false,
+            null_output: false,
+            quiet: false,
+            details: true,
+        }
+    }
+
+    fn plain_opts() -> RenderOpts {
+        RenderOpts {
+            details: false,
+            ..detail_opts()
+        }
+    }
+
+    #[test]
+    fn json_carries_metadata_without_details_just_like_the_local_path() {
+        let matches = [match_with_details()];
+        let opts = RenderOpts {
+            json: true,
+            ..plain_opts()
+        };
+        let lines = render(
+            &super::NixLocateResponse {
+                count: None,
+                matches: matches.into_iter().collect(),
+            },
+            &opts,
+        );
+        let line = lines.first().expect("one line");
+        assert!(
+            line.contains("\"description\":\"a greeting\""),
+            "local --json always emits metadata, so the daemon path must too: {line:?}"
+        );
+    }
+
+    #[test]
+    fn detail_fields_stay_before_the_record_delimiter() {
+        let matches = [match_with_details()];
+        let lines = render_daemon_text(&matches, &detail_opts(), "\0");
+        let line = lines.first().expect("one line");
+        assert!(
+            line.ends_with('\0'),
+            "the delimiter must terminate the record: {line:?}"
+        );
+        assert_eq!(
+            line.matches('\0').count(),
+            1,
+            "the record must not be split by an interior delimiter: {line:?}"
+        );
+        assert!(line.contains("desc=a greeting"), "{line:?}");
+        assert!(line.contains("main_program=hello"), "{line:?}");
     }
 }

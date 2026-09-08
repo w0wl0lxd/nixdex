@@ -1,0 +1,2 @@
+- Declare the `stream` feature on `reqwest` and add `futures-util`, so the chunked sidecar download compiles; `Response::bytes_stream` lives behind that feature.
+- Compare `Content-Length` against the size cap by narrowing the header to `usize` rather than widening the cap with `as`, so a length that does not fit counts as too large instead of wrapping.

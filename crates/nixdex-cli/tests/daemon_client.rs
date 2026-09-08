@@ -102,3 +102,79 @@ async fn daemon_serves_locate_over_http() {
         response.matches
     );
 }
+
+/// A daemon with an admin token answers only authenticated requests.
+///
+/// `DaemonClient` sent no `Authorization` header at all, so every request to
+/// such a daemon came back 401 and daemon-backed searches always failed.
+#[tokio::test]
+async fn daemon_locate_carries_the_admin_token() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("files");
+    build_synthetic_db(&db_path);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free port");
+    let addr = listener.local_addr().expect("local addr");
+    drop(listener);
+    let addr_str = addr.to_string();
+
+    let token = String::from("s3cret-token");
+    let config = DaemonConfig {
+        prebuilt: nixdex_core::prebuilt::PrebuiltConfig::default(),
+        http_addr: addr_str.clone(),
+        local_database: Some(dir.path().to_path_buf()),
+        local_refresh_interval: Duration::from_secs(3600),
+        admin_token: Some(token.clone()),
+        index_cache_mode: IndexCacheMode::Resident,
+    };
+
+    tokio::spawn(async move {
+        let _ = nixdex_core::daemon::run(&config).await;
+    });
+
+    let authenticated = DaemonClient::with_token(addr_str.clone(), Some(token));
+    let anonymous = DaemonClient::with_token(addr_str, None);
+
+    let ready = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if authenticated.ready().await {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("daemon became ready");
+    assert!(ready, "the authenticated client should reach /ready");
+
+    // `/ready` sits outside the auth layer on purpose, so it answers either
+    // way. That is what made this bug quiet: the CLI saw a healthy daemon and
+    // then had every data request refused.
+    assert!(
+        anonymous.ready().await,
+        "the readiness probe is deliberately unauthenticated"
+    );
+
+    let query = vec![
+        ("pattern".to_string(), "bin/ls".to_string()),
+        ("regex".to_string(), "false".to_string()),
+    ];
+
+    let response = authenticated
+        .locate(&query)
+        .await
+        .expect("an authenticated locate succeeds");
+    assert!(
+        response
+            .matches
+            .iter()
+            .any(|m| m.path.as_deref() == Some("/bin/ls")),
+        "the authenticated locate should return /bin/ls; got {:?}",
+        response.matches
+    );
+
+    assert!(
+        anonymous.locate(&query).await.is_err(),
+        "an unauthenticated locate must fail rather than return data"
+    );
+}

@@ -1,0 +1,6 @@
+# Changelog fragments are bullet lists, not documents: each one is a chunk that
+# gets appended under a release heading in CHANGELOG.md. A top-level heading in
+# a fragment would end up nested inside that section, so MD041 does not apply
+# here. markdownlint reads the nearest config directory, so this file scopes the
+# exemption to changelog.d and leaves the rest of the repository alone.
+MD041: false

@@ -1,0 +1,4 @@
+- Regenerate sidecars when an update removes frames; `frame_hashes_diff` compared only the frames present in the new database, so shrinking it reported no changes and the sidecars kept entries for packages that no longer existed.
+- Evict the ngram candidate cache by recency rather than insertion order; `NgramCache::get` never touched the recency list, so a hot key was dropped once 256 distinct patterns had been inserted after it.
+- Reject a declared frame count above `MAX_FRAME_COUNT` in `read_frame_hashes` before allocating, matching the cap `parse_seek_table` already applies.
+- Correct the `Reader::prefault` and `prefault_mmap` documentation: under the `huge_pages` feature they issue an asynchronous `MADV_WILLNEED` hint rather than touching every page synchronously.

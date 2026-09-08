@@ -310,12 +310,12 @@ fn extract_license(value: &sonic_rs::Value) -> String {
         sonic_rs::ValueRef::String(s) => s.to_string(),
         sonic_rs::ValueRef::Object(map) => {
             let mut result = String::new();
-            for (k, v) in map.iter() {
-                if k == "spdx-id" || k == "fullName" || k == "name" {
-                    if let sonic_rs::ValueRef::String(s) = v.as_ref() {
-                        result = s.to_string();
-                        break;
-                    }
+            for (k, v) in map {
+                if (k == "spdx-id" || k == "fullName" || k == "name")
+                    && let sonic_rs::ValueRef::String(s) = v.as_ref()
+                {
+                    result = s.to_string();
+                    break;
                 }
             }
             if result.is_empty() {
@@ -340,19 +340,19 @@ fn extract_license(value: &sonic_rs::Value) -> String {
 }
 
 /// Convert a nixpkgs `meta.maintainers` list to a list of strings.
-fn extract_maintainers(values: &Vec<sonic_rs::Value>) -> Vec<String> {
+fn extract_maintainers(values: &[sonic_rs::Value]) -> Vec<String> {
     values
         .iter()
         .filter_map(|v| match v.as_ref() {
             sonic_rs::ValueRef::String(s) => Some(s.to_string()),
             sonic_rs::ValueRef::Object(map) => {
                 let mut result = None;
-                for (k, v) in map.iter() {
-                    if k == "email" || k == "github" || k == "name" {
-                        if let sonic_rs::ValueRef::String(s) = v.as_ref() {
-                            result = Some(s.to_string());
-                            break;
-                        }
+                for (k, v) in map {
+                    if (k == "email" || k == "github" || k == "name")
+                        && let sonic_rs::ValueRef::String(s) = v.as_ref()
+                    {
+                        result = Some(s.to_string());
+                        break;
                     }
                 }
                 result

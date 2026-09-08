@@ -10,10 +10,12 @@
 //! Optional secondary index (nixdex): basename FST sidecars next to `files`
 //! (see [`crate::basename_index`]).
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io;
 use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use byteorder::{LittleEndian, WriteBytesExt};
 use grep::matcher::{LineMatchKind, Matcher, NoError};
@@ -24,6 +26,7 @@ use rayon::prelude::*;
 use regex::bytes::{Regex, RegexBuilder};
 use regex_syntax::ast::{AssertionKind, Ast, LiteralKind};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sonic_rs;
 use thiserror::Error;
 
@@ -82,11 +85,78 @@ const ATTRS_VERSION: u32 = 1;
 /// Maximum size of the attrs sidecar (defensive cap).
 const MAX_ATTRS_BYTES: usize = 1024 * 1024 * 1024;
 
+/// Frame hashes sidecar filename for incremental builds.
+const FRAME_HASHES_FILE: &str = "files.frame_hashes";
+
+/// Magic for the frame hashes sidecar.
+const FRAME_HASHES_MAGIC: &[u8] = b"NFHS";
+
+/// Frame hashes sidecar version.
+const FRAME_HASHES_VERSION: u32 = 1;
+
 /// Defensive cap on the number of v2 frames (seek table entries).
 const MAX_FRAME_COUNT: usize = 1024 * 1024;
 
 /// Defensive cap on the on-disk database file size.
 const MAX_DATABASE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Maximum number of entries in the ngram result cache.
+const NGRAM_CACHE_CAPACITY: usize = 256;
+
+/// A bounded LRU cache for ngram candidate bitmaps.
+///
+/// Uses a `BTreeMap` for O(log n) lookups and a `Vec` to track insertion order
+/// for eviction. When the cache exceeds its capacity, the oldest entry is
+/// removed.
+#[derive(Debug)]
+struct NgramCache {
+    map: BTreeMap<String, Arc<RoaringBitmap>>,
+    order: Vec<String>,
+}
+
+impl NgramCache {
+    fn new() -> Self {
+        Self {
+            map: BTreeMap::new(),
+            order: Vec::with_capacity(NGRAM_CACHE_CAPACITY),
+        }
+    }
+
+    /// Looks up `key`, promoting it to most-recently-used.
+    ///
+    /// The promotion is what makes this an LRU rather than a FIFO: without it
+    /// a query hit thousands of times was still evicted once
+    /// `NGRAM_CACHE_CAPACITY` distinct patterns had been inserted after it,
+    /// which is exactly the daemon's hot-repeated-query workload.
+    fn get(&mut self, key: &str) -> Option<Arc<RoaringBitmap>> {
+        let value = self.map.get(key).cloned()?;
+        if let Some(pos) = self.order.iter().position(|k| k == key)
+            && pos != 0
+        {
+            let key = self.order.remove(pos);
+            self.order.insert(0, key);
+        }
+        Some(value)
+    }
+
+    fn insert(&mut self, key: String, value: Arc<RoaringBitmap>) {
+        if self.map.contains_key(&key) {
+            self.map.insert(key.clone(), value);
+            if let Some(pos) = self.order.iter().position(|k| k == &key) {
+                self.order.remove(pos);
+            }
+            self.order.insert(0, key);
+            return;
+        }
+        if self.map.len() >= NGRAM_CACHE_CAPACITY
+            && let Some(oldest) = self.order.pop()
+        {
+            self.map.remove(&oldest);
+        }
+        self.order.insert(0, key.clone());
+        self.map.insert(key, value);
+    }
+}
 
 /// Errors that can occur when reading or writing a database.
 #[derive(Error, Debug)]
@@ -672,6 +742,10 @@ pub struct Reader {
     /// a single large zstd frame; caching the decoded bytes lets repeated
     /// searches (in particular the daemon) avoid decompressing it every query.
     v1_decompressed: once_cell::sync::OnceCell<Vec<u8>>,
+    /// Bounded LRU cache for ngram candidate bitmaps. Keyed by pattern string,
+    /// shared across queries in daemon mode. Invalidated when the database is
+    /// reloaded (a new `Reader` is created).
+    ngram_cache: once_cell::sync::OnceCell<Mutex<NgramCache>>,
 }
 
 impl Reader {
@@ -696,6 +770,13 @@ impl Reader {
         }
 
         let data = mmap_guard::map_file(&path_buf)?;
+
+        #[cfg(feature = "huge_pages")]
+        {
+            let ptr = data.as_ptr();
+            let len = data.len();
+            huge_pages::advise_huge_pages(ptr, len);
+        }
 
         if data.len() < DATA_START {
             return Err(Error::Corrupt("database file too short for header"));
@@ -785,16 +866,21 @@ impl Reader {
             basename: once_cell::sync::OnceCell::new(),
             path_index: once_cell::sync::OnceCell::new(),
             v1_decompressed: once_cell::sync::OnceCell::new(),
+            ngram_cache: once_cell::sync::OnceCell::new(),
         })
     }
 
-    /// Touch every page of the mmap'd database file to eliminate minor page
-    /// faults during subsequent searches. Best called once during daemon
-    /// warm-up; for CLI use the cost is paid on every invocation so it is
-    /// left to the caller to decide.
+    /// Reduce minor page faults on the mmap'd database before searching.
     ///
-    /// Uses `std::hint::black_box` to prevent the compiler from optimising
-    /// away the reads.
+    /// Best called once during daemon warm-up; for CLI use the cost is paid on
+    /// every invocation, so the caller decides.
+    ///
+    /// What this does depends on the build. Without the `huge_pages` feature it
+    /// reads one byte per page and every page is resident when it returns,
+    /// with `std::hint::black_box` stopping the compiler from eliding the
+    /// reads. With `huge_pages` it issues `MADV_WILLNEED` instead: the kernel
+    /// faults the pages in on its own schedule, so this returns before the work
+    /// is done and residency is a hint rather than a guarantee.
     pub fn prefault(&self) {
         prefault_mmap(&self.data);
     }
@@ -803,6 +889,14 @@ impl Reader {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Return a reference to the ngram result cache, initializing it on
+    /// first access. The cache is per-Reader and is invalidated when the
+    /// database is reloaded (a new `Reader` is created).
+    fn ngram_cache(&self) -> &Mutex<NgramCache> {
+        self.ngram_cache
+            .get_or_init(|| Mutex::new(NgramCache::new()))
     }
 
     /// Return the on-disk format version of the opened database.
@@ -1215,20 +1309,22 @@ impl Reader {
 
         let needle = pattern.as_bytes();
 
-        // For basename-only queries, check the basename FST first so
-        // non-existent commands return near-instantly.
-        if !needle.contains(&b'/')
-            && let Some(basename_index) = self.basename()
-            && let Ok(ords) = basename_index.lookup_basename_ordinals(needle)
-            && !ords.is_empty()
-        {}
+        // A basename-FST probe used to run here with an empty body: it did the
+        // lookup and threw the answer away, so it was pure cost. It cannot
+        // become an early return either -- this is a substring search over full
+        // paths, so a basename miss does not mean there are no matches.
 
         let mut results = Vec::new();
         let path_count = entry.path_count();
 
-        let limit = match options.limit {
-            Some(v) => v,
-            None => usize::MAX,
+        // Stopping early is only safe when nothing re-orders the results
+        // afterwards. `search_results` sorts and then truncates, so under a
+        // sort this would hand back the first N found rather than the first N
+        // in the requested order: `--sort size --limit 1` returned whichever
+        // entry the index happened to reach first, not the smallest.
+        let limit = match (options.sort, options.limit) {
+            (SearchSort::None, Some(v)) => v,
+            _ => usize::MAX,
         };
         for path_id in 0..path_count {
             if results.len() >= limit {
@@ -1629,6 +1725,152 @@ pub fn read_attrs_sidecar(db_dir: &Path) -> Result<Option<Vec<(String, String, S
     }
 
     Ok(Some(attrs))
+}
+
+/// Write the frame hashes sidecar for incremental builds.
+///
+/// Stores SHA-256 hashes of each compressed frame so that
+/// unchanged frames can be skipped during sidecar regeneration.
+fn write_frame_hashes(db_dir: &Path, frame_hashes: &[(u32, [u8; 32])]) -> Result<()> {
+    let path = db_dir.join(FRAME_HASHES_FILE);
+    let mut file = File::create(&path)?;
+
+    file.write_all(FRAME_HASHES_MAGIC)?;
+    file.write_u32::<LittleEndian>(FRAME_HASHES_VERSION)?;
+    let count = u32::try_from(frame_hashes.len())
+        .map_err(|_| Error::Corrupt("frame hashes count overflow"))?;
+    file.write_u32::<LittleEndian>(count)?;
+
+    for &(frame_idx, ref hash) in frame_hashes {
+        file.write_u32::<LittleEndian>(frame_idx)?;
+        file.write_all(hash)?;
+    }
+
+    file.flush()?;
+    Ok(())
+}
+
+/// Read the frame hashes sidecar for incremental builds.
+///
+/// Returns `Ok(None)` if the file is missing or has an invalid magic/version.
+pub fn read_frame_hashes(db_dir: &Path) -> Result<Option<Vec<(u32, [u8; 32])>>> {
+    let path = db_dir.join(FRAME_HASHES_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+
+    if bytes.len() < FRAME_HASHES_MAGIC.len() + 8 {
+        return Ok(None);
+    }
+
+    let magic = bytes
+        .get(..FRAME_HASHES_MAGIC.len())
+        .ok_or(Error::Corrupt("frame hashes magic missing"))?;
+    if magic != FRAME_HASHES_MAGIC {
+        return Ok(None);
+    }
+
+    let version = read_u32_le(&bytes, FRAME_HASHES_MAGIC.len())?;
+    if version != FRAME_HASHES_VERSION {
+        return Ok(None);
+    }
+
+    let count = usize::try_from(read_u32_le(&bytes, FRAME_HASHES_MAGIC.len() + 4)?)
+        .map_err(|_| Error::Corrupt("frame hashes count overflow"))?;
+
+    // Cap the count before it reaches `Vec::with_capacity`, the way
+    // `parse_seek_table` does. The size check below already rejects a small
+    // file claiming a huge count, but the cap keeps the bound explicit and
+    // stops the multiplication below from having to be trusted.
+    if count > MAX_FRAME_COUNT {
+        return Err(Error::Corrupt(
+            "frame hashes sidecar declares too many frames",
+        ));
+    }
+
+    let expected_len = FRAME_HASHES_MAGIC.len() + 8 + count * (4 + 32);
+    if bytes.len() != expected_len {
+        return Err(Error::Corrupt("frame hashes sidecar has invalid size"));
+    }
+
+    let mut frame_hashes = Vec::with_capacity(count);
+    let mut offset = FRAME_HASHES_MAGIC.len() + 8;
+
+    for _ in 0..count {
+        let frame_idx = read_u32_le(&bytes, offset)?;
+        offset += 4;
+        let mut hash = [0u8; 32];
+        let end = offset.checked_add(32);
+        match end.and_then(|e| bytes.get(offset..e)) {
+            Some(slice) => hash.copy_from_slice(slice),
+            None => return Err(Error::Corrupt("frame hashes sidecar has truncated hash")),
+        }
+        offset += 32;
+        frame_hashes.push((frame_idx, hash));
+    }
+
+    Ok(Some(frame_hashes))
+}
+
+/// Compute SHA-256 hashes for each frame in the reader.
+fn compute_frame_hashes(reader: &Reader) -> Vec<(u32, [u8; 32])> {
+    reader
+        .frames
+        .iter()
+        .enumerate()
+        .map(|(i, (offset, len))| {
+            let frame_data = match reader.data.get(*offset..*offset + *len) {
+                Some(data) => data,
+                None => &[],
+            };
+            let mut hasher = Sha256::new();
+            hasher.update(frame_data);
+            let hash: [u8; 32] = hasher.finalize().into();
+            #[allow(clippy::unnecessary_lazy_evaluations)]
+            let idx = u32::try_from(i).unwrap_or_else(|_| u32::MAX);
+            (idx, hash)
+        })
+        .collect()
+}
+
+/// Compare stored frame hashes with current hashes and return
+/// the indices of frames whose sidecars need rebuilding.
+///
+/// Returns `None` if no stored hashes exist (full rebuild needed).
+pub fn frame_hashes_diff(
+    db_dir: &Path,
+    current_hashes: &[(u32, [u8; 32])],
+) -> Result<Option<Vec<u32>>> {
+    let Some(stored) = read_frame_hashes(db_dir)? else {
+        return Ok(None);
+    };
+
+    let stored_map: std::collections::BTreeMap<u32, [u8; 32]> = stored.into_iter().collect();
+    let current_map: std::collections::BTreeMap<u32, [u8; 32]> =
+        current_hashes.iter().copied().collect();
+
+    let mut changed = Vec::new();
+    for &(frame_idx, ref hash) in current_hashes {
+        if stored_map.get(&frame_idx) != Some(hash) {
+            changed.push(frame_idx);
+        }
+    }
+
+    // A frame that disappeared is a change too. Walking only the current frames
+    // reported "nothing changed" when an update removed trailing frames, so
+    // regeneration was skipped and the sidecars kept entries for packages that
+    // no longer exist.
+    for &frame_idx in stored_map.keys() {
+        if !current_map.contains_key(&frame_idx) {
+            changed.push(frame_idx);
+        }
+    }
+    changed.sort_unstable();
+    changed.dedup();
+
+    Ok(Some(changed))
 }
 
 /// Write a length-prefixed string (u32 LE length + UTF-8 bytes).
@@ -2261,6 +2503,8 @@ pub enum SearchSort {
     SizeDesc,
     /// Sort by attribute path ascending.
     AttrAsc,
+    /// Reverse the current sort order.
+    Reverse,
 }
 
 impl std::str::FromStr for SearchSort {
@@ -2272,6 +2516,7 @@ impl std::str::FromStr for SearchSort {
             "size" | "size-asc" => Ok(Self::SizeAsc),
             "size-desc" => Ok(Self::SizeDesc),
             "attr" | "attr-asc" => Ok(Self::AttrAsc),
+            "reverse" | "rev" => Ok(Self::Reverse),
             _ => Err(crate::Error::Parse(format!("unknown sort order: {s}"))),
         }
     }
@@ -2305,6 +2550,9 @@ pub struct SearchOptions<'a> {
     /// Emit each match as a JSON object (one per line) instead of the default
     /// human-readable format.
     pub json: bool,
+    /// Emit each match as a YAML document instead of the default
+    /// human-readable format.
+    pub yaml: bool,
     /// Maximum number of results to print. `None` means unlimited.
     pub limit: Option<usize>,
     /// Print the number of matching entries instead of the entries themselves.
@@ -2319,6 +2567,10 @@ pub struct SearchOptions<'a> {
     pub exclude_fhs: bool,
     /// Emit null bytes between results instead of newlines.
     pub null_output: bool,
+    /// Suppress all non-error output.
+    pub quiet: bool,
+    /// Show expanded metadata (description, license, homepage, maintainers).
+    pub details: bool,
 }
 
 /// Pre-loaded secondary indexes that a long-running holder (e.g. the daemon)
@@ -2407,10 +2659,26 @@ fn ngram_sidecars_exist(dir: &Path) -> bool {
     .any(|name| dir.join(name).is_file())
 }
 
-/// Touch every 4 KiB page in `data` to force minor page faults before the
-/// critical search path. The compiler is prevented from eliding the reads
-/// via [`std::hint::black_box`].
+/// Make `data` resident before the critical search path.
+///
+/// Without the `huge_pages` feature this touches every 4 KiB page and returns
+/// once they are all resident, using [`std::hint::black_box`] so the reads are
+/// not elided. With `huge_pages` it hands the whole range to the kernel with
+/// `MADV_WILLNEED`, which is an asynchronous hint: it returns immediately and
+/// the pages arrive later, if at all.
 fn prefault_mmap(data: &[u8]) {
+    #[cfg(feature = "huge_pages")]
+    {
+        let ptr = data.as_ptr();
+        let len = data.len();
+        huge_pages::advise_willneed(ptr, len);
+    }
+    #[cfg(not(feature = "huge_pages"))]
+    prefault_mmap_pages(data);
+}
+
+#[cfg(not(feature = "huge_pages"))]
+fn prefault_mmap_pages(data: &[u8]) {
     const PAGE_SIZE: usize = 4096;
     let len = data.len();
     if len == 0 {
@@ -2444,20 +2712,53 @@ fn resolve_ngram_ordinals_multi(
     regex_prefix: Option<&str>,
     regex_suffix: Option<&str>,
 ) -> Option<RoaringBitmap> {
+    #[allow(clippy::unnecessary_lazy_evaluations)]
+    let literal_str = literal.unwrap_or_else(|| "");
+    #[allow(clippy::unnecessary_lazy_evaluations)]
+    let regex_prefix_str = regex_prefix.unwrap_or_else(|| "");
+    #[allow(clippy::unnecessary_lazy_evaluations)]
+    let regex_suffix_str = regex_suffix.unwrap_or_else(|| "");
+    let cache_key = format!(
+        "{}\0{}\0{}",
+        literal_str, regex_prefix_str, regex_suffix_str
+    );
+
+    let cache = reader.ngram_cache();
+
+    // Read the cache under the lock, then release it immediately so the
+    // (potentially expensive) candidate computation runs lock-free. Holding
+    // the lock across the computation would serialise all concurrent queries
+    // in the daemon.
+    {
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = guard.get(&cache_key) {
+            return Some((*cached).clone());
+        }
+    }
+
     let mut result: Option<RoaringBitmap> = None;
     for pat in literal.into_iter().chain(regex_prefix).chain(regex_suffix) {
         if pat.len() < 3 {
             continue;
         }
-        let candidates = match resolve_ngram_ordinals(reader, Some(pat)) {
-            Some(c) => c,
-            None => continue,
+        let Some(candidates) = resolve_ngram_ordinals(reader, Some(pat)) else {
+            continue;
         };
         result = Some(match result {
             Some(bm) => bm & &candidates,
             None => candidates,
         });
     }
+
+    if let Some(ref bm) = result {
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.insert(cache_key, Arc::new(bm.clone()));
+    }
+
     result
 }
 
@@ -2596,7 +2897,9 @@ fn print_match(
 ) -> bool {
     let attr = format_attr(store_path);
 
-    if options.json {
+    if options.yaml {
+        print_match_yaml(options, package_db, printed_attrs, store_path, entry, &attr)
+    } else if options.json {
         print_match_json(options, package_db, printed_attrs, store_path, entry, &attr)
     } else {
         print_match_text(
@@ -2665,6 +2968,121 @@ fn print_match_json(
     }
 }
 
+#[allow(clippy::print_stdout, clippy::too_many_lines)]
+fn print_match_yaml(
+    options: &SearchOptions<'_>,
+    package_db: Option<&crate::package_search::SearchDb>,
+    printed_attrs: &mut IndexSet<String>,
+    store_path: &StorePath,
+    entry: &FileTreeEntry,
+    attr: &str,
+) -> bool {
+    let delim = if options.null_output { "\0" } else { "\n" };
+    match options.mode {
+        SearchMode::Minimal => {
+            if printed_attrs.insert(attr.into()) {
+                let mut obj = serde_norway::Mapping::new();
+                obj.insert(
+                    serde_norway::Value::String("attr".into()),
+                    serde_norway::Value::String(attr.to_string()),
+                );
+                if let Ok(yaml) = serde_norway::to_string(&obj) {
+                    // `---` opens a YAML document, so several matches form a
+                    // valid multi-document stream rather than one invalid one.
+                    print!("---\n{yaml}{delim}");
+                    return true;
+                }
+            }
+            false
+        }
+        SearchMode::Full { .. } => {
+            let (kind, size) = match &entry.node {
+                FileNode::Regular { executable, size } => {
+                    (if *executable { "x" } else { "r" }, *size)
+                }
+                FileNode::Directory { size, .. } => ("d", *size),
+                FileNode::Symlink { .. } => ("s", 0),
+            };
+            let meta = package_db.and_then(|db| db.lookup_attr(store_path.origin().attr.as_str()));
+            let mut obj = serde_norway::Mapping::new();
+            obj.insert(
+                serde_norway::Value::String("attr".into()),
+                serde_norway::Value::String(attr.to_string()),
+            );
+            obj.insert(
+                serde_norway::Value::String("size".into()),
+                serde_norway::Value::Number(size.into()),
+            );
+            obj.insert(
+                serde_norway::Value::String("kind".into()),
+                serde_norway::Value::String(kind.to_string()),
+            );
+            obj.insert(
+                serde_norway::Value::String("path".into()),
+                serde_norway::Value::String(String::from_utf8_lossy(&entry.path).into_owned()),
+            );
+            obj.insert(
+                serde_norway::Value::String("store_path".into()),
+                serde_norway::Value::String(store_path.as_str()),
+            );
+            if options.details {
+                if let Some(ref desc) = meta.and_then(|m| m.description.clone()) {
+                    obj.insert(
+                        serde_norway::Value::String("description".into()),
+                        serde_norway::Value::String(desc.clone()),
+                    );
+                }
+                if let Some(ref lic) = meta.and_then(|m| m.license.clone()) {
+                    obj.insert(
+                        serde_norway::Value::String("license".into()),
+                        serde_norway::Value::String(lic.clone()),
+                    );
+                }
+                if let Some(ref hp) = meta.and_then(|m| m.homepage.clone()) {
+                    obj.insert(
+                        serde_norway::Value::String("homepage".into()),
+                        serde_norway::Value::String(hp.clone()),
+                    );
+                }
+                if let Some(ref maint) = meta.and_then(|m| m.maintainers.clone()) {
+                    let vals: Vec<serde_norway::Value> = maint
+                        .iter()
+                        .cloned()
+                        .map(serde_norway::Value::String)
+                        .collect();
+                    obj.insert(
+                        serde_norway::Value::String("maintainers".into()),
+                        serde_norway::Value::Sequence(vals),
+                    );
+                }
+                if let Some(ref plats) = meta.and_then(|m| m.platforms.clone()) {
+                    let vals: Vec<serde_norway::Value> = plats
+                        .iter()
+                        .cloned()
+                        .map(serde_norway::Value::String)
+                        .collect();
+                    obj.insert(
+                        serde_norway::Value::String("platforms".into()),
+                        serde_norway::Value::Sequence(vals),
+                    );
+                }
+                if let Some(ref mp) = meta.and_then(|m| m.main_program.clone()) {
+                    obj.insert(
+                        serde_norway::Value::String("main_program".into()),
+                        serde_norway::Value::String(mp.clone()),
+                    );
+                }
+            }
+            if let Ok(yaml) = serde_norway::to_string(&obj) {
+                print!("---\n{yaml}{delim}");
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
 #[allow(clippy::print_stdout)]
 fn print_match_text(
     options: &SearchOptions<'_>,
@@ -2674,6 +3092,9 @@ fn print_match_text(
     entry: &FileTreeEntry,
     attr: &str,
 ) -> bool {
+    if options.quiet {
+        return false;
+    }
     let delim = if options.null_output { "\0" } else { "\n" };
     match options.mode {
         SearchMode::Minimal => {
@@ -2696,14 +3117,12 @@ fn print_match_text(
 
             let path_str = String::from_utf8_lossy(&entry.path);
             if color {
-                // Highlight all non-empty matches in the path.
                 let mut prev = 0usize;
                 let bytes = path_str.as_bytes();
                 for mat in path_pattern.find_iter(bytes) {
                     if mat.start() == mat.end() {
                         continue;
                     }
-                    // Safe because we only slice on byte offsets from the same str.
                     if let (Some(before), Some(matched)) = (
                         path_str.get(prev..mat.start()),
                         path_str.get(mat.start()..mat.end()),
@@ -2832,6 +3251,13 @@ pub fn search_results_with_reader(
         regex_literal_suffix.as_deref(),
     );
 
+    // Selectivity estimation: count ngram candidates to guide fast-path
+    // ordering. The path trigram fast path is most selective when candidates
+    // are below the limit.
+    let ngram_candidate_count = ngram_ordinals
+        .as_ref()
+        .map_or(0, roaring::RoaringBitmap::len);
+
     let package_ordinals: Option<RoaringBitmap> = match (base_ordinals, ngram_ordinals) {
         (Some(b), Some(ng)) => Some(b & &ng),
         (Some(b), None) => Some(b),
@@ -2852,12 +3278,24 @@ pub fn search_results_with_reader(
         return Ok(Vec::new());
     }
 
-    // Try the fast path sidecars in order of specificity:
-    // 1. exact full path, 2. exact basename, 3. literal substring.
+    // Try the fast path sidecars in order of estimated selectivity.
+    // We check the ngram candidate count first to determine the most
+    // selective path, then try fast paths from most to least selective.
     let mut results = Vec::new();
     let mut used_fast_path = false;
 
+    tracing::debug!(
+        ngram_candidate_count,
+        exact_path = options.exact_path.is_some(),
+        exact_basename = options.exact_basename.is_some(),
+        literal_pattern = options.literal_pattern.is_some(),
+        regex_prefix = regex_literal_prefix.is_some(),
+        regex_suffix = regex_literal_suffix.is_some(),
+        "search plan: selectivity estimation"
+    );
+
     // 1. Exact full path: prefer the per-path entry cache, then redb.
+    //    Most selective for exact path queries.
     if let Some(exact_path) = &options.exact_path {
         let bytes = exact_path.as_bytes();
         if let Some(path_entry) = reader.path_entry() {
@@ -2884,6 +3322,7 @@ pub fn search_results_with_reader(
             }
             results = hits;
             used_fast_path = true;
+            tracing::debug!(hits = results.len(), "search plan: exact path fast path");
         } else if let Some(redb) = reader.redb.get() {
             let mut hits = Vec::new();
             match redb.exact_path_entries(bytes) {
@@ -2903,6 +3342,10 @@ pub fn search_results_with_reader(
                     }
                     results = hits;
                     used_fast_path = true;
+                    tracing::debug!(
+                        hits = results.len(),
+                        "search plan: exact path (redb) fast path"
+                    );
                 }
                 Ok(None) => {}
                 Err(err) => {
@@ -2913,6 +3356,7 @@ pub fn search_results_with_reader(
     }
 
     // 2. Exact basename (whole_name without --root, or basename portion only).
+    //    Most selective for basename-only queries.
     if !used_fast_path
         && options.exact_basename.is_some()
         && options.exact_path.is_none()
@@ -2932,6 +3376,10 @@ pub fn search_results_with_reader(
             Ok(Some(entry_results)) => {
                 results = entry_results;
                 used_fast_path = true;
+                tracing::debug!(
+                    hits = results.len(),
+                    "search plan: exact basename fast path"
+                );
             }
             Ok(None) => {}
             Err(err) => {
@@ -2940,13 +3388,13 @@ pub fn search_results_with_reader(
         }
     }
 
-    // 3. Literal substring: path-level trigram + entry cache.
-    //    Also applies to regex queries whose AST yields a fixed literal prefix
-    //    and/or suffix (e.g. `bin/` and `test` from `bin/.*test$`): the path trigram
-    //    index narrows candidates and `should_include_match` applies the full
-    //    regex. When both prefix and suffix are available, both are passed to
-    //    `search_path_trigram` so it can intersect their candidate sets before the
-    //    candidate-limit check, avoiding fallback to a full scan.
+    // 3. Literal substring / regex with trigram candidates: path trigram
+    //    + entry cache. `search_path_trigram` performs its own candidate-limit
+    //    check internally and returns `Ok(None)` (falling back to a full scan)
+    //    when the trigram sidecar is absent or the candidate set is too large.
+    //    We therefore attempt this path for any literal/regex query and let it
+    //    decide, rather than gating on `ngram_candidate_count` (which is an
+    //    ordinal count and is 0 for short patterns and sidecar-less databases).
     if !used_fast_path
         && (options.literal_pattern.is_some()
             || regex_literal_prefix.is_some()
@@ -2980,8 +3428,14 @@ pub fn search_results_with_reader(
             Ok(Some(path_results)) => {
                 results = path_results;
                 used_fast_path = true;
+                tracing::debug!(hits = results.len(), "search plan: path trigram fast path");
             }
-            Ok(None) => {}
+            Ok(None) => {
+                tracing::debug!(
+                    ngram_candidate_count,
+                    "search plan: path trigram fell back to scan"
+                );
+            }
             Err(err) => {
                 tracing::debug!(%err, "path trigram search failed; falling back");
             }
@@ -3015,6 +3469,9 @@ pub fn search_results_with_reader(
         SearchSort::AttrAsc => {
             results.sort_by(|(a, _), (b, _)| a.origin().attr.cmp(&b.origin().attr));
         }
+        SearchSort::Reverse => {
+            results.reverse();
+        }
     }
 
     let mut results: Vec<_> = results
@@ -3044,14 +3501,14 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
     let results = search_results(options, None)?;
 
     // Load package metadata sidecar for enriched JSON output, if available.
-    let package_db = (|| {
+    let package_db = {
         let path = options.database.join("packages.json");
         if path.exists() {
             crate::package_search::SearchDb::open(&path).ok()
         } else {
             None
         }
-    })();
+    };
 
     // Track printed attrs for --minimal de-duplication (ordered set).
     let mut printed_attrs: IndexSet<String> = IndexSet::new();
@@ -3063,6 +3520,10 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
         matched += 1;
 
         if options.count {
+            continue;
+        }
+
+        if options.quiet {
             continue;
         }
 
@@ -3082,7 +3543,7 @@ pub fn search(options: &SearchOptions<'_>) -> crate::Result<()> {
         }
     }
 
-    if options.count {
+    if options.count && !options.quiet {
         println!("{matched}");
     }
 
@@ -3098,24 +3559,28 @@ pub fn search_batch(options: &SearchOptions<'_>, patterns: &[String]) -> crate::
         source: Box::new(source),
     })?;
 
-    let package_db = (|| {
+    let package_db = {
         let path = options.database.join("packages.json");
         if path.exists() {
             crate::package_search::SearchDb::open(&path).ok()
         } else {
             None
         }
-    })();
+    };
 
     for pattern in patterns {
         let mut batch_options = options.clone();
-        batch_options.pattern = pattern.clone();
+        batch_options.pattern.clone_from(pattern);
         batch_options.literal_pattern = None;
 
         let results = search_results_with_reader(&reader, &index_file, &batch_options, None)?;
 
-        if batch_options.count {
+        if batch_options.count && !batch_options.quiet {
             println!("{}", results.len());
+            continue;
+        }
+
+        if batch_options.quiet {
             continue;
         }
 
@@ -3162,6 +3627,22 @@ pub fn generate_sidecars(db_path: &Path) -> Result<()> {
     generate_sidecars_impl(db_path, true)
 }
 
+/// Compare stored frame hashes with current hashes and return
+/// the indices of frames whose sidecars need rebuilding.
+///
+/// Returns `Ok(None)` if no stored hashes exist (full rebuild needed).
+/// Returns `Ok(Some(vec![])` if all sidecars are up to date.
+pub fn sidecar_diff(db_path: &Path) -> Result<Option<Vec<u32>>> {
+    let reader = Reader::open(db_path)?;
+    let db_dir = db_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or(Error::Corrupt("database path has no parent directory"))?;
+
+    let current_hashes = compute_frame_hashes(&reader);
+    frame_hashes_diff(db_dir, &current_hashes)
+}
+
 /// Like [`generate_sidecars`], but when `include_heavy` is `false` the heavy
 /// entry/ngram secondary indexes are skipped. The daemon uses this in `Lru`
 /// cache mode to defer their construction; queries fall back to full scans
@@ -3172,6 +3653,33 @@ pub(crate) fn generate_sidecars_mode(db_path: &Path, include_heavy: bool) -> Res
     generate_sidecars_impl(db_path, include_heavy)
 }
 
+/// Warn when the command index is absent from a database whose sidecars are
+/// otherwise complete.
+///
+/// `generate_sidecars` cannot build it -- it comes from indexing -- so the only
+/// useful thing to do is say so. Without this, a database missing the command
+/// index reported "sidecars are up to date" and then failed a daemon reload,
+/// which kept serving the older snapshot with nothing explaining why.
+fn warn_on_missing_command_index(db_dir: &Path, db_path: &Path) {
+    let missing: Vec<&str> = [
+        crate::command_index::FST_FILE,
+        crate::command_index::POSTINGS_FILE,
+        crate::command_index::PROVIDERS_FILE,
+    ]
+    .into_iter()
+    .filter(|name| !db_dir.join(name).exists())
+    .collect();
+    if missing.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        db_path = %db_path.display(),
+        missing = ?missing,
+        "command index files are absent; re-run indexing to build them -- \
+         generate-sidecars cannot produce them"
+    );
+}
+
 #[allow(clippy::cognitive_complexity)]
 #[allow(clippy::too_many_lines)]
 fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
@@ -3180,6 +3688,89 @@ fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .ok_or(Error::Corrupt("database path has no parent directory"))?;
+
+    // Compute frame hashes for incremental update detection.
+    let current_hashes = compute_frame_hashes(&reader);
+
+    // Check if sidecars are already up to date.
+    if let Some(changed) = frame_hashes_diff(db_dir, &current_hashes)? {
+        if changed.is_empty() {
+            let mut required_sidecars = vec![
+                crate::basename_index::NAMES_FILE,
+                crate::basename_index::POSTINGS_FILE,
+                crate::basename_index::FST_FILE,
+                crate::path_index::POSTINGS_FILE,
+                crate::path_index::FST_FILE,
+                "packages.json",
+                ATTRS_FILE,
+            ];
+            if include_heavy {
+                // Every file the heavy readers map on `open`, not just the
+                // headline two per index. `EntryIndex::open` also reads the
+                // store-path table, and `PathEntryIndex::open` also maps the
+                // string table, the offset table and its own store-path table;
+                // deleting one of those left the index unopenable while this
+                // check still reported the database up to date.
+                required_sidecars.extend_from_slice(&[
+                    crate::entry_index::FST_FILE,
+                    crate::entry_index::POSTINGS_FILE,
+                    crate::entry_index::STORE_PATHS_FILE,
+                    crate::path_entry_index::FST_FILE,
+                    crate::path_entry_index::ENTRIES_FILE,
+                    crate::path_entry_index::STRINGS_FILE,
+                    crate::path_entry_index::OFFSETS_FILE,
+                    crate::path_entry_index::STORE_PATHS_FILE,
+                    crate::path_trigram_index::FST_FILE,
+                    crate::path_trigram_index::POSTINGS_FILE,
+                    crate::ngram_index::FST_FILE,
+                    crate::ngram_index::POSTINGS_FILE,
+                ]);
+            }
+            // Only v2 databases carry the frames that make a frame map, and
+            // only the v2 scan below can rebuild one. Requiring it for v1 would
+            // make a v1 database rebuild forever waiting for a file it can
+            // never produce. Leaving it out entirely was the bug: a deleted
+            // frame map was never noticed, so selective frame decompression
+            // stayed broken and package counts vanished while this reported the
+            // database up to date. Keying on `reader.frame_map` instead is
+            // circular -- that field is loaded from this very file.
+            if reader.version == 2 {
+                required_sidecars.push(FRAME_MAP_FILE);
+            }
+
+            let missing: Vec<&str> = required_sidecars
+                .iter()
+                .filter(|name| !db_dir.join(name).exists())
+                .copied()
+                .collect();
+            if missing.is_empty() {
+                // The command index is written by `Writer::do_finish` during
+                // indexing, not here, so it cannot go in `required_sidecars`:
+                // listing it would make this function rebuild forever without
+                // ever producing it. Warn instead, so a database that is
+                // missing it is not silently reported as up to date and then
+                // rejected later when the daemon reloads.
+                warn_on_missing_command_index(db_dir, db_path);
+                tracing::info!(
+                    db_path = %db_path.display(),
+                    "sidecars are up to date; skipping regeneration"
+                );
+                return Ok(());
+            }
+            tracing::warn!(
+                db_path = %db_path.display(),
+                missing = ?missing,
+                "frame hashes unchanged but sidecar files missing; rebuilding"
+            );
+        } else {
+            tracing::info!(
+                db_path = %db_path.display(),
+                changed_frames = changed.len(),
+                total_frames = reader.frames.len(),
+                "sidecar diff detected changed frames; rebuilding"
+            );
+        }
+    }
 
     // Scan all frames to extract package paths and build secondary indexes.
     let mut builder = BasenameIndexBuilder::new();
@@ -3199,6 +3790,10 @@ fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
     } else {
         None
     };
+    // Ordinal-to-frame map, rebuilt from the scan below. The reader's own
+    // `frame_map` is read back from the sidecar, so it cannot recreate a file
+    // that has been deleted; this can.
+    let mut rebuilt_frame_map: Vec<u32> = Vec::new();
     let mut all_package_labels: Vec<String> = Vec::new();
     let mut all_package_meta: Vec<PackageMeta> = Vec::new();
     let mut all_package_attrs: Vec<(String, String, String)> = Vec::new();
@@ -3226,7 +3821,7 @@ fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
             )?;
         }
     } else {
-        for (offset, len) in &reader.frames {
+        for (frame_idx, (offset, len)) in reader.frames.iter().enumerate() {
             let start = *offset;
             let end = start + *len;
             let compressed = reader
@@ -3251,6 +3846,14 @@ fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
                 &mut all_package_meta,
                 &mut all_package_attrs,
             )?;
+
+            // Every package the scan just found lives in this frame, so the
+            // ordinals added by this iteration map to `frame_idx`. Frames split
+            // on package boundaries, so no package spans two of them and this
+            // reproduces exactly what the writer recorded.
+            let frame_ordinal =
+                u32::try_from(frame_idx).map_err(|_| Error::Corrupt("frame index overflow"))?;
+            rebuilt_frame_map.resize(all_package_labels.len(), frame_ordinal);
         }
     }
 
@@ -3298,9 +3901,10 @@ fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
             .map_err(Error::NgramIndex)?;
     }
 
-    // Write frame_map sidecar if we have v2 frame data.
-    if let (Some(frame_map), Some(_frame_starts)) = (&reader.frame_map, &reader.frame_starts) {
-        write_frame_map(db_dir, frame_map, reader.frames.len())?;
+    // Write the frame_map sidecar from the map the scan rebuilt. Writing
+    // `reader.frame_map` instead only ever copied the file back onto itself.
+    if reader.version == 2 {
+        write_frame_map(db_dir, &rebuilt_frame_map, reader.frames.len())?;
     }
 
     // Synthesize a packages.json sidecar from package footers so that
@@ -3309,6 +3913,9 @@ fn generate_sidecars_impl(db_path: &Path, include_heavy: bool) -> Result<()> {
 
     // Write attrs sidecar so prebuilt indexes can be reused for incremental builds.
     write_attrs_sidecar(db_dir, &all_package_attrs)?;
+
+    // Write frame hashes sidecar for incremental update detection.
+    write_frame_hashes(db_dir, &current_hashes)?;
 
     tracing::info!(
         db_path = %db_path.display(),
@@ -3515,6 +4122,52 @@ fn format_grouped(n: u64) -> String {
     out
 }
 
+#[cfg(feature = "huge_pages")]
+mod huge_pages {
+    //! The only unsafe code in the workspace. `unsafe_code` is denied
+    //! everywhere else, so the opt-out stays inside this module.
+
+    #![allow(clippy::as_conversions, unsafe_code)]
+
+    /// Ask the kernel to back `ptr[..len]` with huge pages and to read it in.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point at the start of a mapping of at least `len` bytes.
+    /// Both callers pass a live `memmap2` mapping, so the range is mapped for
+    /// as long as the call runs. `madvise` only sets kernel hints: it never
+    /// writes through the pointer, so the mapping stays valid and unchanged.
+    pub fn advise_huge_pages(ptr: *const u8, len: usize) {
+        let ptr = ptr as *mut libc::c_void;
+        // SAFETY: see the function docs -- `ptr[..len]` is a live mapping and
+        // `madvise` only advises, so it cannot invalidate or write to it.
+        unsafe {
+            // `MADV_HUGEPAGE` is transparent-huge-page support, which only
+            // Linux has; `libc` does not define it elsewhere, so referring to
+            // it unconditionally broke the macOS build. The read-ahead hint
+            // below is portable and is all the other platforms offer.
+            #[cfg(target_os = "linux")]
+            libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
+            libc::madvise(ptr, len, libc::MADV_WILLNEED);
+        }
+    }
+
+    /// Ask the kernel to read `ptr[..len]` in ahead of the first access.
+    ///
+    /// # Safety
+    ///
+    /// Same requirement as [`advise_huge_pages`]: `ptr` must point at a live
+    /// mapping of at least `len` bytes.
+    pub fn advise_willneed(ptr: *const u8, len: usize) {
+        let ptr = ptr as *mut libc::c_void;
+        // SAFETY: see the function docs -- `ptr[..len]` is a live mapping and
+        // `madvise` only advises, so it cannot invalidate or write to it.
+        unsafe {
+            libc::madvise(ptr, len, libc::MADV_WILLNEED);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3522,6 +4175,56 @@ mod tests {
     use crate::store_path::Origin;
     use bytes::Bytes;
     use std::io::Read;
+
+    /// A frame removed by an update must count as a change.
+    ///
+    /// The diff walked only the current frames, so shrinking the database
+    /// reported "nothing changed" and sidecar regeneration was skipped: the
+    /// sidecars kept entries for packages that no longer existed.
+    #[test]
+    fn a_removed_trailing_frame_is_reported_as_changed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stored = vec![(0u32, [1u8; 32]), (1u32, [2u8; 32]), (2u32, [3u8; 32])];
+        write_frame_hashes(dir.path(), &stored).expect("write");
+
+        // The update dropped the last frame and left the others untouched.
+        let current = vec![(0u32, [1u8; 32]), (1u32, [2u8; 32])];
+        let changed = frame_hashes_diff(dir.path(), &current)
+            .expect("diff")
+            .expect("stored hashes present");
+        assert_eq!(changed, vec![2], "the removed frame must be reported");
+    }
+
+    #[test]
+    fn an_unchanged_frame_set_reports_no_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let frames = vec![(0u32, [1u8; 32]), (1u32, [2u8; 32])];
+        write_frame_hashes(dir.path(), &frames).expect("write");
+        let changed = frame_hashes_diff(dir.path(), &frames)
+            .expect("diff")
+            .expect("stored hashes present");
+        assert!(changed.is_empty(), "expected no changes, got {changed:?}");
+    }
+
+    /// Repeated hits must protect an entry from eviction.
+    ///
+    /// `get` did not touch the recency list, so eviction was FIFO: a hot key
+    /// was dropped once `NGRAM_CACHE_CAPACITY` newer keys had been inserted,
+    /// which is precisely the daemon's repeated-query workload.
+    #[test]
+    fn the_ngram_cache_evicts_by_recency_not_insertion_order() {
+        let mut cache = NgramCache::new();
+        cache.insert("hot".to_string(), Arc::new(RoaringBitmap::new()));
+        for i in 0..NGRAM_CACHE_CAPACITY - 1 {
+            cache.insert(format!("filler-{i}"), Arc::new(RoaringBitmap::new()));
+            // Keep "hot" the most recently used entry.
+            assert!(cache.get("hot").is_some(), "hot key evicted at {i}");
+        }
+        // One more insert evicts the least recently used key, which is now a
+        // filler rather than the repeatedly read "hot" key.
+        cache.insert("last".to_string(), Arc::new(RoaringBitmap::new()));
+        assert!(cache.get("hot").is_some(), "the hot key must survive");
+    }
 
     fn sample_store_path() -> StorePath {
         StorePath::new(
@@ -3547,6 +4250,8 @@ mod tests {
         )])
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn writer_reader_roundtrip_and_search() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3593,6 +4298,7 @@ mod tests {
             file_type: &[],
             mode: SearchMode::Minimal,
             json: false,
+            yaml: false,
             limit: None,
             count: false,
             sort: SearchSort::None,
@@ -3600,10 +4306,14 @@ mod tests {
             max_size: None,
             exclude_fhs: false,
             null_output: false,
+            quiet: false,
+            details: false,
         };
         search(&options).expect("search ok");
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn ngram_narrows_search_results() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3632,6 +4342,7 @@ mod tests {
             file_type: &[],
             mode: SearchMode::Minimal,
             json: false,
+            yaml: false,
             limit: None,
             count: false,
             sort: SearchSort::None,
@@ -3639,6 +4350,8 @@ mod tests {
             max_size: None,
             exclude_fhs: false,
             null_output: false,
+            quiet: false,
+            details: false,
         };
 
         let hits = search_results(&options, None).expect("search");
@@ -3652,6 +4365,8 @@ mod tests {
     // substring. The ngram sidecar narrows by *package* ordinal, so this exercises
     // that package ordinals in the sidecar indexes align with the decoder's
     // per-frame `current_ordinal` (incl. multi-frame `frame_starts` threading).
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn sidecar_search_matches_full_scan() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3831,6 +4546,7 @@ mod tests {
                 file_type: &[],
                 mode: SearchMode::Minimal,
                 json: false,
+                yaml: false,
                 limit: None,
                 count: false,
                 sort: SearchSort::None,
@@ -3838,6 +4554,8 @@ mod tests {
                 max_size: None,
                 exclude_fhs: false,
                 null_output: false,
+                quiet: false,
+                details: false,
             };
             let pruned = search_results(&options, None).expect("sidecar search");
 
@@ -3849,6 +4567,8 @@ mod tests {
         }
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn entry_index_exact_basename_matches_full_scan() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3895,6 +4615,7 @@ mod tests {
             file_type: &[],
             mode: SearchMode::Minimal,
             json: false,
+            yaml: false,
             limit: None,
             count: false,
             sort: SearchSort::None,
@@ -3902,6 +4623,8 @@ mod tests {
             max_size: None,
             exclude_fhs: false,
             null_output: false,
+            quiet: false,
+            details: false,
         };
         let pruned = search_results(&options, None).expect("entry-index search");
 
@@ -3921,6 +4644,8 @@ mod tests {
         );
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn normalized_path_fast_path_matches_full_scan() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3995,6 +4720,7 @@ mod tests {
                 file_type: &[],
                 mode: SearchMode::Minimal,
                 json: false,
+                yaml: false,
                 limit: None,
                 count: false,
                 sort: SearchSort::None,
@@ -4002,6 +4728,8 @@ mod tests {
                 max_size: None,
                 exclude_fhs: false,
                 null_output: false,
+                quiet: false,
+                details: false,
             };
             let pruned = search_results(&options, None).expect("sidecar search");
 
@@ -4013,6 +4741,8 @@ mod tests {
         }
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn fast_path_fallbacks_for_regex_and_short_literals() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4076,6 +4806,7 @@ mod tests {
             file_type: &[],
             mode: SearchMode::Minimal,
             json: false,
+            yaml: false,
             limit: None,
             count: false,
             sort: SearchSort::None,
@@ -4083,6 +4814,8 @@ mod tests {
             max_size: None,
             exclude_fhs: false,
             null_output: false,
+            quiet: false,
+            details: false,
         };
         let regex_baseline = reader
             .search_entries(&Regex::new("b.n").expect("regex"), None, None, None, None)
@@ -4097,6 +4830,8 @@ mod tests {
         // Short literal (<3 bytes): path trigram returns None, falls back.
         let short_options = SearchOptions {
             null_output: false,
+            quiet: false,
+            details: false,
             pattern: "he".into(),
             literal_pattern: Some("he".into()),
             ..regex_options.clone()
@@ -4112,6 +4847,8 @@ mod tests {
         );
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn missing_path_trigram_sidecars_fall_back_to_frcode() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4152,6 +4889,7 @@ mod tests {
             file_type: &[],
             mode: SearchMode::Minimal,
             json: false,
+            yaml: false,
             limit: None,
             count: false,
             sort: SearchSort::None,
@@ -4159,6 +4897,8 @@ mod tests {
             max_size: None,
             exclude_fhs: false,
             null_output: false,
+            quiet: false,
+            details: false,
         };
         let pruned = search_results(&options, None).expect("fallback search");
 
@@ -4173,6 +4913,8 @@ mod tests {
         );
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn filter_prefix_skips_non_matching() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4216,6 +4958,8 @@ mod tests {
         assert!(re.is_match(b"/bin/hello"));
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn writer_builds_fst_sidecar_queryable_by_basename() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4267,6 +5011,8 @@ mod tests {
         assert!(none.is_empty());
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn writer_builds_path_index_queryable_by_full_path() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4330,6 +5076,8 @@ mod tests {
         assert!(missing.is_empty());
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn v2_writer_reader_roundtrip_and_search() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4363,6 +5111,8 @@ mod tests {
         assert!(dir.path().join("files.basename.fst").is_file());
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn v2_multiple_packages_yield_per_cpu_frames() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4430,6 +5180,8 @@ mod tests {
         assert!(frame_count >= 1 && frame_count <= num_cpus.max(2));
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn v2_selective_search_by_ordinals() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4484,6 +5236,8 @@ mod tests {
         assert!(hits.iter().any(|(_, e)| e.path == b"/bin/cat"));
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn v2_corrupt_seek_table_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4510,6 +5264,8 @@ mod tests {
         assert!(matches!(err, Error::Corrupt(_)));
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn v2_seek_table_smaller_than_header_plus_trailer_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4530,6 +5286,8 @@ mod tests {
         assert!(matches!(err, Error::Corrupt(_)));
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn add_skips_entries_with_forbidden_bytes() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4633,6 +5391,8 @@ mod tests {
         assert_eq!(extract_regex_literal_suffix(".*"), None);
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn regex_with_literal_prefix_uses_ngram_candidates() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4693,6 +5453,7 @@ mod tests {
             file_type: &[],
             mode: SearchMode::Minimal,
             json: false,
+            yaml: false,
             limit: None,
             count: false,
             sort: SearchSort::None,
@@ -4700,6 +5461,8 @@ mod tests {
             max_size: None,
             exclude_fhs: false,
             null_output: false,
+            quiet: false,
+            details: false,
         };
         let regex_pruned = search_results(&regex_options, None).expect("regex search");
 
@@ -4716,6 +5479,8 @@ mod tests {
         );
     }
 
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn regex_with_prefix_and_suffix_uses_trigram_intersection() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4784,6 +5549,7 @@ mod tests {
             file_type: &[],
             mode: SearchMode::Minimal,
             json: false,
+            yaml: false,
             limit: None,
             count: false,
             sort: SearchSort::None,
@@ -4791,6 +5557,8 @@ mod tests {
             max_size: None,
             exclude_fhs: false,
             null_output: false,
+            quiet: false,
+            details: false,
         };
         let regex_pruned = search_results(&regex_options, None).expect("regex search");
 
@@ -4804,6 +5572,124 @@ mod tests {
             normalize(regex_pruned),
             normalize(baseline),
             "regex with prefix and suffix must match full scan"
+        );
+    }
+
+    /// A deleted frame map must be rebuilt, not reported as up to date.
+    ///
+    /// `required_sidecars` listed every other file the readers need but not
+    /// this one, so when the frame hashes matched, a deleted frame map was
+    /// never noticed. Selective frame decompression stayed broken and package
+    /// counts disappeared while `generate_sidecars` said the database was fine.
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_deleted_frame_map_is_regenerated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+        let path = sample_store_path();
+        let tree = FileTree::directory(vec![(
+            Bytes::from_static(b"bin"),
+            FileTree::directory(vec![(
+                Bytes::from_static(b"hello"),
+                FileTree::regular(10, true),
+            )]),
+        )]);
+
+        {
+            let mut writer = Writer::create(&db_path, 3).expect("create");
+            writer.add(&path, &tree, b"").expect("add");
+            writer.finish().expect("finish");
+        }
+        generate_sidecars(&db_path).expect("sidecars");
+
+        let frame_map = dir.path().join(FRAME_MAP_FILE);
+        if !frame_map.exists() {
+            // A v1 database writes no frame map, and must not be made to
+            // rebuild forever waiting for one.
+            generate_sidecars(&db_path).expect("a second pass must still succeed");
+            return;
+        }
+        let original = std::fs::read(&frame_map).expect("reading the frame map");
+
+        std::fs::remove_file(&frame_map).expect("removing the frame map");
+        // The frame hashes are unchanged, so this is exactly the path that
+        // used to short-circuit.
+        generate_sidecars(&db_path).expect("sidecars again");
+
+        assert!(
+            frame_map.exists(),
+            "a deleted frame map must be regenerated, not reported as up to date"
+        );
+        assert_eq!(
+            std::fs::read(&frame_map).expect("reading the rebuilt frame map"),
+            original,
+            "the rebuilt frame map must match the one the writer produced"
+        );
+    }
+
+    /// `--sort size --limit 1` must return the globally smallest match.
+    ///
+    /// A pattern shorter than three characters routes to
+    /// `search_short_literal`, which stopped collecting at `options.limit`.
+    /// `search_results` sorts *after* that, so the limit picked whichever entry
+    /// the index reached first rather than the smallest one.
+    // Miri cannot run this test: it uses mmap and/or zstd FFI.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_short_literal_with_a_sort_and_a_limit_returns_the_smallest_match() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("files");
+        let path = sample_store_path();
+        // Three files whose names all contain "z", written largest first so a
+        // premature truncation cannot accidentally pick the smallest.
+        let tree = FileTree::directory(vec![(
+            Bytes::from_static(b"bin"),
+            FileTree::directory(vec![
+                (Bytes::from_static(b"za"), FileTree::regular(9000, true)),
+                (Bytes::from_static(b"zb"), FileTree::regular(500, true)),
+                (Bytes::from_static(b"zc"), FileTree::regular(3000, true)),
+            ]),
+        )]);
+
+        {
+            let mut writer = Writer::create(&db_path, 3).expect("create");
+            writer.add(&path, &tree, b"").expect("add");
+            writer.finish().expect("finish");
+        }
+        generate_sidecars(&db_path).expect("sidecars");
+
+        let options = SearchOptions {
+            database: dir.path().to_path_buf(),
+            pattern: "z".into(),
+            hash: None,
+            package_pattern: None,
+            exact_basename: None,
+            exact_path: None,
+            path_prefix: None,
+            literal_pattern: Some("z".into()),
+            file_type: &[],
+            mode: SearchMode::Minimal,
+            json: false,
+            yaml: false,
+            limit: Some(1),
+            count: false,
+            sort: SearchSort::SizeAsc,
+            min_size: None,
+            max_size: None,
+            exclude_fhs: false,
+            null_output: false,
+            quiet: false,
+            details: false,
+        };
+
+        let results = search_results(&options, None).expect("search");
+        assert_eq!(results.len(), 1, "the limit must still be honoured");
+        let (_, entry) = &results[0];
+        assert_eq!(
+            entry.node.size(),
+            500,
+            "the limit must be applied after the sort, not during the scan"
         );
     }
 }
