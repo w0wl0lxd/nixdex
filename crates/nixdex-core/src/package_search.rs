@@ -34,6 +34,8 @@ pub enum SearchSort {
     MainProgram,
     /// Sort by `meta.mainProgram` descending.
     MainProgramDesc,
+    /// Reverse the current sort order.
+    Reverse,
 }
 
 impl fmt::Display for SearchSort {
@@ -46,6 +48,7 @@ impl fmt::Display for SearchSort {
             Self::NameDesc => write!(f, "name-desc"),
             Self::MainProgram => write!(f, "main-program"),
             Self::MainProgramDesc => write!(f, "main-program-desc"),
+            Self::Reverse => write!(f, "reverse"),
         }
     }
 }
@@ -64,6 +67,7 @@ impl FromStr for SearchSort {
             "main-program-desc" | "main-program:desc" | "mainprogram-desc" => {
                 Ok(Self::MainProgramDesc)
             }
+            "reverse" | "rev" => Ok(Self::Reverse),
             _ => Err(Error::Parse(format!("unknown search sort order: {s}"))),
         }
     }
@@ -80,6 +84,7 @@ impl clap::ValueEnum for SearchSort {
             Self::NameDesc,
             Self::MainProgram,
             Self::MainProgramDesc,
+            Self::Reverse,
         ]
     }
 
@@ -92,6 +97,7 @@ impl clap::ValueEnum for SearchSort {
             Self::NameDesc => clap::builder::PossibleValue::new("name-desc"),
             Self::MainProgram => clap::builder::PossibleValue::new("main-program"),
             Self::MainProgramDesc => clap::builder::PossibleValue::new("main-program-desc"),
+            Self::Reverse => clap::builder::PossibleValue::new("reverse"),
         })
     }
 }
@@ -358,6 +364,16 @@ impl SearchDb {
 
         if sort == SearchSort::None {
             scored.sort_by_key(|&(score, _)| std::cmp::Reverse(score));
+        } else if sort == SearchSort::Reverse {
+            // Reverse means the inverse of the default order, ties included.
+            // Breaking ties on `attr` instead left equally scored packages in
+            // ascending name order, which is the same direction the default
+            // leaves them in, so those rows were not reversed at all. Sorting
+            // exactly as the default does and then reversing is inverse by
+            // construction: the sort is stable, so tied rows come back in
+            // reverse insertion order.
+            scored.sort_by_key(|&(score, _)| std::cmp::Reverse(score));
+            scored.reverse();
         } else {
             scored.sort_by(|(score_a, a), (score_b, b)| {
                 let ord = Self::compare_records(a, b, sort);
@@ -389,7 +405,11 @@ impl SearchDb {
         case_sensitive: bool,
         exact: bool,
     ) {
-        if sort == SearchSort::None {
+        // `Reverse` means "the default output, reversed", so it has to sort by
+        // relevance first. Reversing the incoming order on its own reversed
+        // sidecar insertion order, which has nothing to do with the order the
+        // default search prints.
+        if sort == SearchSort::None || sort == SearchSort::Reverse {
             let needle = if case_sensitive {
                 pattern.to_string()
             } else {
@@ -400,6 +420,9 @@ impl SearchDb {
                 let score_b = relevance_score(b, &needle, regex, field, case_sensitive, exact);
                 score_b.cmp(&score_a).then_with(|| a.attr.cmp(&b.attr))
             });
+            if sort == SearchSort::Reverse {
+                matches.reverse();
+            }
             return;
         }
         matches.sort_by(|a, b| Self::compare_records(a, b, sort));
@@ -408,18 +431,14 @@ impl SearchDb {
     /// Compare two records according to `sort`.
     fn compare_records(a: &PackageMeta, b: &PackageMeta, sort: SearchSort) -> std::cmp::Ordering {
         let ord = match sort {
-            SearchSort::None => std::cmp::Ordering::Equal,
+            SearchSort::None | SearchSort::Reverse => std::cmp::Ordering::Equal,
             SearchSort::Attr | SearchSort::AttrDesc => a.attr.cmp(&b.attr),
             SearchSort::Name | SearchSort::NameDesc => a.name.cmp(&b.name),
             SearchSort::MainProgram | SearchSort::MainProgramDesc => {
-                let a_main = match a.main_program.as_deref() {
-                    Some(v) => v,
-                    None => "",
-                };
-                let b_main = match b.main_program.as_deref() {
-                    Some(v) => v,
-                    None => "",
-                };
+                #[allow(clippy::unnecessary_lazy_evaluations)]
+                let a_main = a.main_program.as_deref().unwrap_or_else(|| "");
+                #[allow(clippy::unnecessary_lazy_evaluations)]
+                let b_main = b.main_program.as_deref().unwrap_or_else(|| "");
                 a_main.cmp(b_main)
             }
         };
@@ -582,12 +601,14 @@ fn attr_regex_score(value: &str, pattern: &str, case_sensitive: bool, exact: boo
     } else {
         pattern.to_string()
     };
-    let re = RegexBuilder::new(&anchored)
+    let Ok(re) = RegexBuilder::new(&anchored)
         .case_insensitive(!case_sensitive)
         .size_limit(REGEX_SIZE_LIMIT)
         .dfa_size_limit(REGEX_SIZE_LIMIT)
         .build()
-        .unwrap();
+    else {
+        return 0;
+    };
     if let Some(m) = re.find(value) {
         if m.start() == 0 && m.end() == value.len() {
             3000
@@ -607,12 +628,14 @@ fn desc_regex_score(value: &str, pattern: &str, case_sensitive: bool, exact: boo
     } else {
         pattern.to_string()
     };
-    let re = RegexBuilder::new(&anchored)
+    let Ok(re) = RegexBuilder::new(&anchored)
         .case_insensitive(!case_sensitive)
         .size_limit(REGEX_SIZE_LIMIT)
         .dfa_size_limit(REGEX_SIZE_LIMIT)
         .build()
-        .unwrap();
+    else {
+        return 0;
+    };
     if let Some(m) = re.find(value) {
         if m.start() == 0 && m.end() == value.len() {
             300
@@ -632,12 +655,14 @@ fn main_regex_score(value: &str, pattern: &str, case_sensitive: bool, exact: boo
     } else {
         pattern.to_string()
     };
-    let re = RegexBuilder::new(&anchored)
+    let Ok(re) = RegexBuilder::new(&anchored)
         .case_insensitive(!case_sensitive)
         .size_limit(REGEX_SIZE_LIMIT)
         .dfa_size_limit(REGEX_SIZE_LIMIT)
         .build()
-        .unwrap();
+    else {
+        return 0;
+    };
     if let Some(m) = re.find(value) {
         if m.start() == 0 && m.end() == value.len() {
             300
@@ -665,32 +690,32 @@ fn exact_relevance(
             }
         }
         SearchField::Description => {
-            if let Some(desc) = record.description.as_deref() {
-                if value_equals(desc, pattern, case_sensitive) {
-                    score += 300;
-                }
+            if let Some(desc) = record.description.as_deref()
+                && value_equals(desc, pattern, case_sensitive)
+            {
+                score += 300;
             }
         }
         SearchField::MainProgram => {
-            if let Some(main) = record.main_program.as_deref() {
-                if value_equals(main, pattern, case_sensitive) {
-                    score += 300;
-                }
+            if let Some(main) = record.main_program.as_deref()
+                && value_equals(main, pattern, case_sensitive)
+            {
+                score += 300;
             }
         }
         SearchField::Both => {
             if value_equals(&record.attr, pattern, case_sensitive) {
                 score += 3000;
             }
-            if let Some(desc) = record.description.as_deref() {
-                if value_equals(desc, pattern, case_sensitive) {
-                    score += 300;
-                }
+            if let Some(desc) = record.description.as_deref()
+                && value_equals(desc, pattern, case_sensitive)
+            {
+                score += 300;
             }
-            if let Some(main) = record.main_program.as_deref() {
-                if value_equals(main, pattern, case_sensitive) {
-                    score += 300;
-                }
+            if let Some(main) = record.main_program.as_deref()
+                && value_equals(main, pattern, case_sensitive)
+            {
+                score += 300;
             }
         }
     }
@@ -864,6 +889,101 @@ mod tests {
             let line = sonic_rs::to_string(record).expect("serialize");
             writeln!(file, "{line}").expect("write");
         }
+    }
+
+    /// `--fuzzy --sort reverse` must also be the default output reversed.
+    ///
+    /// Ties were broken on `attr` ascending, the same direction the default
+    /// leaves them in, so equally scored packages were not reversed at all.
+    #[test]
+    fn fuzzy_reverse_sort_reverses_the_whole_relevance_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("packages.json");
+        // These three all score equally against "nix": every tie has to be
+        // reversed too, not just the rows whose scores differ.
+        write_fixture(
+            &path,
+            &[
+                test_record("nix-a", "one"),
+                test_record("nix-b", "two"),
+                test_record("nix-c", "three"),
+                test_record("nix", "the manager"),
+            ],
+        );
+
+        let db = SearchDb::open(&path).expect("open");
+        let default = db
+            .search_fuzzy("nix", SearchField::Attr, false, SearchSort::None, None)
+            .expect("fuzzy search");
+        let reversed = db
+            .search_fuzzy("nix", SearchField::Attr, false, SearchSort::Reverse, None)
+            .expect("fuzzy search");
+
+        let default_attrs: Vec<&str> = default.iter().map(|r| r.attr.as_str()).collect();
+        let reversed_attrs: Vec<&str> = reversed.iter().map(|r| r.attr.as_str()).collect();
+        let mut expected = default_attrs.clone();
+        expected.reverse();
+
+        assert_eq!(
+            reversed_attrs, expected,
+            "reverse must invert the whole order; default was {default_attrs:?}"
+        );
+    }
+
+    /// `--sort reverse` must be the default output reversed.
+    ///
+    /// It reversed sidecar insertion order instead, so it had no relation to
+    /// the relevance order the default search prints.
+    #[test]
+    fn reverse_sort_reverses_the_relevance_order_not_the_file_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("packages.json");
+        // File order is deliberately neither the relevance order nor its
+        // reverse: an exact attr match sorts first by relevance, but sits in
+        // the middle of the file.
+        write_fixture(
+            &path,
+            &[
+                test_record("zzz-nix-tools", "helpers"),
+                test_record("nix", "The Nix package manager"),
+                test_record("aaa-nix-extras", "extras"),
+            ],
+        );
+
+        let db = SearchDb::open(&path).expect("open");
+        let default = db
+            .search(
+                "nix",
+                false,
+                SearchField::Attr,
+                false,
+                false,
+                SearchSort::None,
+                None,
+            )
+            .expect("search");
+        let reversed = db
+            .search(
+                "nix",
+                false,
+                SearchField::Attr,
+                false,
+                false,
+                SearchSort::Reverse,
+                None,
+            )
+            .expect("search");
+
+        let default_attrs: Vec<&str> = default.iter().map(|r| r.attr.as_str()).collect();
+        let reversed_attrs: Vec<&str> = reversed.iter().map(|r| r.attr.as_str()).collect();
+        let mut expected = default_attrs.clone();
+        expected.reverse();
+        assert_eq!(reversed_attrs, expected, "default was {default_attrs:?}");
+        assert_eq!(
+            default_attrs.first(),
+            Some(&"nix"),
+            "the exact match must lead the default order: {default_attrs:?}"
+        );
     }
 
     #[test]

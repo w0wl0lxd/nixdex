@@ -149,6 +149,7 @@ fn bench_locate_ngram_search(c: &mut Criterion) {
         file_type: &[FileType::Regular { executable: false }],
         mode: SearchMode::Minimal,
         json: false,
+        yaml: false,
         limit: None,
         count: false,
         sort: SearchSort::None,
@@ -156,6 +157,8 @@ fn bench_locate_ngram_search(c: &mut Criterion) {
         max_size: None,
         exclude_fhs: false,
         null_output: false,
+        quiet: false,
+        details: false,
     };
 
     c.bench_function("locate search via ngram index", |b| {
@@ -226,6 +229,7 @@ fn search_results_baseline(c: &mut Criterion) {
                 file_type: &[],
                 mode: SearchMode::Minimal,
                 json: false,
+                yaml: false,
                 limit: None,
                 count: false,
                 sort: SearchSort::None,
@@ -233,6 +237,8 @@ fn search_results_baseline(c: &mut Criterion) {
                 max_size: None,
                 exclude_fhs: false,
                 null_output: false,
+                quiet: false,
+                details: false,
             };
             group.bench_with_input(BenchmarkId::new(label, count), &opts, |b, opts| {
                 b.iter(|| {

@@ -1,0 +1,7 @@
+- Stop a typed `q` from quitting the TUI; `is_quit` matched a plain `q` and ran before the guard that treats printable characters as search text, so any word containing `q` closed the session. Quit is `Ctrl+C`.
+- Restore the `/`, `:` and `?` shortcuts, which are characters and so were swallowed by that same guard and typed into the search box.
+- Keep a space inside a query; the leading-space guard read `app.input`, which is empty while characters are still queued, so typing "ab c" quickly produced "abc".
+- Discard the queued query when Tab switches mode, instead of running the previous mode's text against the newly selected mode.
+- Restore raw mode, the alternate screen and the cursor on every exit path via a guard type; an I/O error from `terminal.draw` used to leave the terminal unusable until the user ran `reset`.
+- Read terminal events through `crossterm::event::EventStream` rather than the blocking `event::read()`, which tied up a runtime worker thread for the whole session.
+- Map a mouse click through the scroll offset so it selects the row under the pointer, and draw a frame with `is_searching` set so the loading indicator is reachable.

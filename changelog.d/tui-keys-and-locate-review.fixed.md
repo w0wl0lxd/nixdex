@@ -1,0 +1,6 @@
+- Keep `/`, `:` and `?` in the search query. They were treated as shortcuts and stripped in every mode, so `bin/ls` in Locate mode searched for `binls`, and `?` could not be typed in a regex query. Help moves to Ctrl+H.
+- Escape the Locate pattern. `nixdex-core` compiles it as a regex, so a file name holding `.`, `+` or `[` matched too much or failed to parse.
+- Release a pinned detail with Ctrl+D. The pinned pane accepted only Esc and `q`, both of which close it, so the pin could not be undone.
+- Clear the search and its results on Escape, not just the queued keystrokes.
+- Make Ctrl+R reload. It set a status message and left the cached results and the open database handle untouched, so a rebuilt index needed a restart.
+- Report a clipboard copy as failed when the helper exits non-zero. Any completed process counted as success, which also stopped `wl-copy` from ever running after `xclip` failed.

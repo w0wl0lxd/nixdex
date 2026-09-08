@@ -7,6 +7,8 @@
 //! - `nixdex-core`: core indexing and search library
 //! - `nixdex-cli`: `nix-index`, `nix-locate`, and `nixdex` command-line tools
 //! - `nixdex-daemon`: optional background HTTP daemon
+//! - `nixdex-history`: package version history sidecar
+//! - `nixdex-options`: NixOS module options sidecar
 
 #[doc(inline)]
 pub use nixdex_core::*;

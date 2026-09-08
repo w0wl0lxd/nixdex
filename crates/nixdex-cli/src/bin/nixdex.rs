@@ -1,17 +1,20 @@
 //! Multi-purpose `nixdex` tool — currently provides package search by attribute
 //! and description from the `packages.json` sidecar.
 
+use nixdex_cli::default_db_dir;
 use std::io::IsTerminal;
+use std::io::Write;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate, generate_to};
 use color_eyre::eyre::WrapErr;
 use tracing_subscriber::EnvFilter;
 
-use nixdex_cli::{index, locate};
+use nixdex_cli::{index, locate, tui};
 use nixdex_core::package_search::{SearchDb, SearchField, SearchSort};
+use nixdex_history::HistoryDb;
+use nixdex_options::OptionsDb;
 
 /// Detect which comma command is available on `$PATH` ("," or "comma").
 /// Returns the detected command token, or `None` if neither is available.
@@ -45,19 +48,6 @@ fn comma_available() -> Option<&'static str> {
     None
 }
 
-/// Resolve the default nixdex database directory.
-fn default_db_dir() -> &'static str {
-    static CACHE: OnceLock<String> = OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            nixdex_core::nixdex_dir()
-                .into_os_string()
-                .into_string()
-                .unwrap_or_else(|_| String::from("/tmp/nixdex"))
-        })
-        .as_str()
-}
-
 /// Color policy for terminal output.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum Color {
@@ -83,6 +73,10 @@ enum Cmd {
     Search(SearchOpts),
     /// Show metadata for a single attribute.
     Info(InfoOpts),
+    /// Show version history for a package attribute.
+    History(HistoryOpts),
+    /// Search NixOS module options.
+    Options(OptionsOpts),
     /// Print database statistics and sidecar status.
     Stats(StatsOpts),
     /// Generate shell completions.
@@ -103,8 +97,12 @@ enum Cmd {
     Update(UpdateOpts),
     /// Generate sidecar indexes for an existing `files` database.
     GenerateSidecars(GenerateSidecarsOpts),
+    /// Check which sidecars need rebuilding after a database update.
+    SidecarDiff(SidecarDiffOpts),
     /// Print a command-not-found hint for a missing command.
     CommandNotFound(CommandNotFoundOpts),
+    /// Run the interactive TUI.
+    Tui(tui::TuiOpts),
     /// Run the background daemon (alias for `nixdex-daemon`).
     Daemon(DaemonOpts),
 }
@@ -114,8 +112,11 @@ enum Cmd {
 #[command(author, about, version)]
 struct SearchOpts {
     /// Pattern for which to search.
-    #[arg(value_name = "PATTERN")]
-    pattern: String,
+    ///
+    /// Multiple arguments are joined with spaces, so `nixdex search claude code`
+    /// is equivalent to `nixdex search "claude code"`.
+    #[arg(value_name = "PATTERN", num_args = 1..)]
+    pattern: Vec<String>,
 
     /// Directory where the index is stored.
     #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
@@ -164,9 +165,46 @@ struct SearchOpts {
     #[arg(long)]
     json: bool,
 
+    /// Stream results as they are found, flushing after each line.
+    #[arg(long)]
+    stream: bool,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    format: OutputFormat,
+
     /// Whether to use colors in output.
     #[arg(long, value_enum, default_value = "auto")]
     color: Color,
+
+    /// Alias for `--color=never`.
+    #[arg(long)]
+    no_color: bool,
+
+    /// Exclude results containing PATTERN as a literal substring.
+    #[arg(long)]
+    exclude: Option<String>,
+
+    /// Exclude results matching REGEX pattern.
+    #[arg(long)]
+    exclude_regex: Option<String>,
+
+    /// Reverse the sort order.
+    #[arg(long)]
+    reverse: bool,
+}
+
+/// Output format for search results.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum OutputFormat {
+    /// Human-readable tabular format.
+    Table,
+    /// NDJSON (one JSON object per line).
+    Ndjson,
+    /// CSV format.
+    Csv,
+    /// YAML format.
+    Yaml,
 }
 
 /// Show metadata for a single package attribute.
@@ -180,6 +218,51 @@ struct InfoOpts {
     /// Directory where the index is stored.
     #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
     database: PathBuf,
+
+    /// Print the result as JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Show version history for a package attribute.
+#[derive(Debug, Parser)]
+#[command(author, about, version)]
+struct HistoryOpts {
+    /// Attribute path to look up.
+    #[arg(value_name = "ATTR")]
+    attr: String,
+
+    /// Directory where the index is stored.
+    #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
+    database: PathBuf,
+
+    /// Print the result as JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Search NixOS module options.
+#[derive(Debug, Parser)]
+#[command(author, about, version)]
+struct OptionsOpts {
+    /// Search pattern.
+    ///
+    /// Multiple arguments are joined with spaces, so `nixdex options claude code`
+    /// is equivalent to `nixdex options "claude code"`.
+    #[arg(value_name = "PATTERN", num_args = 1..)]
+    pattern: Vec<String>,
+
+    /// Directory where the index is stored.
+    #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
+    database: PathBuf,
+
+    /// Match case-sensitively.
+    #[arg(long)]
+    case_sensitive: bool,
+
+    /// Maximum number of results.
+    #[arg(short, long)]
+    limit: Option<usize>,
 
     /// Print the result as JSON.
     #[arg(long)]
@@ -288,6 +371,15 @@ struct UpdateOpts {
 #[derive(Debug, Parser)]
 #[command(author, about, version)]
 struct GenerateSidecarsOpts {
+    /// Directory where the index is stored.
+    #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
+    database: PathBuf,
+}
+
+/// Options for `nixdex sidecar diff`.
+#[derive(Debug, Parser)]
+#[command(author, about, version)]
+struct SidecarDiffOpts {
     /// Directory where the index is stored.
     #[arg(short, long = "db", default_value = default_db_dir(), env = "NIX_INDEX_DATABASE")]
     database: PathBuf,
@@ -405,58 +497,190 @@ fn run_search(opts: SearchOpts) -> color_eyre::Result<()> {
     }
 
     let db = SearchDb::open(&sidecar).wrap_err("failed to load package metadata sidecar")?;
+
+    let pattern = opts.pattern.join(" ");
+
+    // Exclusion and `--reverse` both run after the search, so letting the search
+    // apply `--limit` would spend the budget on the wrong rows. Exclusion drops
+    // rows the limit already paid for: a limit of 10 with 3 excluded rows
+    // returned 7 results and undercounted `--count`. `--reverse` is worse -- the
+    // search truncates to the first N of the sort, so `--sort attr --reverse
+    // --limit 2` returned the two lowest attrs, not the two highest. When either
+    // is set the search runs unbounded and the limit is applied below instead.
+    let excluding = opts.exclude.is_some() || opts.exclude_regex.is_some();
+    let limit_after_search = excluding || opts.reverse;
+    let search_limit = if limit_after_search { None } else { opts.limit };
+
     let matches = if opts.fuzzy {
         db.search_fuzzy(
-            &opts.pattern,
+            &pattern,
             opts.field,
             opts.case_sensitive,
             opts.sort,
-            opts.limit,
+            search_limit,
         )
     } else {
         db.search(
-            &opts.pattern,
+            &pattern,
             opts.regex,
             opts.field,
             opts.case_sensitive,
             opts.exact,
             opts.sort,
-            opts.limit,
+            search_limit,
         )
     }
     .wrap_err("search failed")?;
+
+    // `--exclude` is a literal substring match; `--exclude-regex` is a regex.
+    // Both are applied independently against the attr, name, and description.
+    let exclude_regex = match opts.exclude_regex.as_deref() {
+        Some(pat) => Some(
+            regex::Regex::new(pat)
+                .wrap_err_with(|| format!("invalid exclude-regex pattern: {pat}"))?,
+        ),
+        None => None,
+    };
+    let exclude_literal = opts.exclude.as_deref();
+
+    let mut matches: Vec<_> = matches
+        .into_iter()
+        .filter(|r| {
+            let excluded_literal = exclude_literal.is_some_and(|lit| {
+                r.attr.contains(lit)
+                    || r.name.contains(lit)
+                    || r.description.as_deref().is_some_and(|d| d.contains(lit))
+            });
+            let excluded_regex = exclude_regex.as_ref().is_some_and(|re| {
+                re.is_match(&r.attr)
+                    || re.is_match(&r.name)
+                    || r.description.as_deref().is_some_and(|d| re.is_match(d))
+            });
+            !excluded_literal && !excluded_regex
+        })
+        .collect();
+
+    // `--reverse` inverts the requested sort order (or the natural order when no
+    // `--sort` is given) rather than replacing it.
+    if opts.reverse {
+        matches.reverse();
+    }
+
+    // Apply the limit the search was not allowed to apply. Truncating after the
+    // reverse keeps `--limit` meaning "the first N of what you asked to see".
+    if limit_after_search && let Some(limit) = opts.limit {
+        matches.truncate(limit);
+    }
 
     if opts.count {
         println!("{}", matches.len());
         return Ok(());
     }
 
-    if opts.json {
-        for record in matches {
-            let line = sonic_rs::to_string(record).wrap_err("failed to serialize search result")?;
-            println!("{line}");
-        }
-        return Ok(());
-    }
+    let use_color = if opts.no_color {
+        false
+    } else {
+        opts.color.use_color()
+    };
 
-    let use_color = opts.color.use_color();
-    for record in matches {
-        let desc = record.description.as_deref().map_or("—", |d| d);
-        if opts.name_only {
-            println!("{}", record.attr);
-        } else if use_color {
-            println!(
-                "{}\t{}\t{}",
-                colored(record.attr.as_str(), "1;32"),
-                colored(record.name.as_str(), "1"),
-                desc
-            );
-        } else {
-            println!("{}\t{}\t{}", record.attr, record.name, desc);
-        }
-    }
+    output_search_results(&matches, &opts, use_color)
+}
 
+/// Flushes after a record when `--stream` is set.
+///
+/// The flag promises a flush after every result for every format, not only the
+/// table one: the structured formats are the ones most likely to be piped.
+fn flush_if_streaming(out: &mut impl Write, stream: bool) -> color_eyre::Result<()> {
+    if stream {
+        out.flush().wrap_err("failed to flush stdout")?;
+    }
     Ok(())
+}
+
+fn output_search_results(
+    matches: &[&nixdex_core::nixpkgs::PackageMeta],
+    opts: &SearchOpts,
+    use_color: bool,
+) -> color_eyre::Result<()> {
+    // `--json` is shorthand for `--format ndjson`. Normalising it here keeps a
+    // single serialization path: the table arm carried its own copy of the
+    // NDJSON loop, which also returned early and so skipped the flush below.
+    let format = if opts.json {
+        OutputFormat::Ndjson
+    } else {
+        opts.format
+    };
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+
+    match format {
+        OutputFormat::Ndjson => {
+            for record in matches {
+                let line =
+                    sonic_rs::to_string(record).wrap_err("failed to serialize search result")?;
+                writeln!(out, "{line}").wrap_err("failed to write search result")?;
+                flush_if_streaming(&mut out, opts.stream)?;
+            }
+        }
+        OutputFormat::Csv => {
+            writeln!(out, "attr,name,description,main_program")
+                .wrap_err("failed to write search result")?;
+            for record in matches {
+                let desc = record.description.as_deref().map_or("", |d| d);
+                let main = record.main_program.as_deref().map_or("", |m| m);
+                writeln!(
+                    out,
+                    "{},{},{},{}",
+                    csv_escape(&record.attr),
+                    csv_escape(&record.name),
+                    csv_escape(desc),
+                    csv_escape(main),
+                )
+                .wrap_err("failed to write search result")?;
+                flush_if_streaming(&mut out, opts.stream)?;
+            }
+        }
+        OutputFormat::Yaml => {
+            for record in matches {
+                let doc = yaml_document(record)?;
+                write!(out, "{doc}").wrap_err("failed to write search result")?;
+                flush_if_streaming(&mut out, opts.stream)?;
+            }
+        }
+        OutputFormat::Table => {
+            for record in matches {
+                let desc = record.description.as_deref().map_or("\u{2014}", |d| d);
+                if opts.name_only {
+                    writeln!(out, "{}", record.attr)
+                } else if use_color {
+                    writeln!(
+                        out,
+                        "{}\t{}\t{}",
+                        colored(record.attr.as_str(), "1;32"),
+                        colored(record.name.as_str(), "1"),
+                        desc
+                    )
+                } else {
+                    writeln!(out, "{}\t{}\t{}", record.attr, record.name, desc)
+                }
+                .wrap_err("failed to write search result")?;
+                flush_if_streaming(&mut out, opts.stream)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Render one search result as a YAML document, with its `---` head marker.
+///
+/// Results were serialized one after another with no separator, so more than
+/// one produced a single document with every key repeated -- not a valid YAML
+/// stream. Each record is its own document now, which is what a reader
+/// consuming `--format yaml` expects.
+fn yaml_document<T: serde::Serialize>(record: &T) -> color_eyre::Result<String> {
+    let body =
+        serde_norway::to_string(record).wrap_err("failed to serialize search result as YAML")?;
+    Ok(format!("---\n{body}"))
 }
 
 fn run_info(opts: InfoOpts) -> color_eyre::Result<()> {
@@ -502,6 +726,78 @@ fn run_info(opts: InfoOpts) -> color_eyre::Result<()> {
     Ok(())
 }
 
+fn run_history(opts: HistoryOpts) -> color_eyre::Result<()> {
+    let history_file = opts.database.join("files.history");
+    if !history_file.exists() {
+        color_eyre::eyre::bail!(
+            "no version history sidecar found at {}. Run `nixdex update` to fetch it; \
+             local indexing does not produce this sidecar.",
+            history_file.display()
+        );
+    }
+
+    let db = HistoryDb::open(&opts.database).wrap_err("failed to load history sidecar")?;
+    let versions = db.lookup_attr(&opts.attr);
+
+    if versions.is_empty() {
+        color_eyre::eyre::bail!("no version history found for attr {}", opts.attr);
+    }
+
+    if opts.json {
+        println!(
+            "{}",
+            sonic_rs::to_string(&versions).wrap_err("failed to serialize history")?
+        );
+    } else {
+        println!("{}:", opts.attr);
+        for entry in &versions {
+            println!("  {}  {}  {}", entry.version, entry.commit, entry.date);
+        }
+    }
+
+    Ok(())
+}
+
+fn run_options(opts: OptionsOpts) -> color_eyre::Result<()> {
+    let options_file = opts.database.join("files.options");
+    if !options_file.exists() {
+        color_eyre::eyre::bail!(
+            "no options sidecar found at {}. Run `nixdex update` to fetch it; \
+             local indexing does not produce this sidecar.",
+            options_file.display()
+        );
+    }
+
+    let db = OptionsDb::open(&opts.database).wrap_err("failed to load options sidecar")?;
+    let pattern = opts.pattern.join(" ");
+    let mut results = db.search(&pattern, opts.case_sensitive);
+
+    if let Some(limit) = opts.limit {
+        results.truncate(limit);
+    }
+
+    if opts.json {
+        println!(
+            "{}",
+            sonic_rs::to_string(&results).wrap_err("failed to serialize options results")?
+        );
+    } else {
+        for record in &results {
+            println!("{}:", record.attr);
+            println!("  type: {}", record.r#type);
+            println!("  description: {}", record.description);
+            if let Some(default) = &record.default {
+                println!("  default: {default}");
+            }
+            if let Some(example) = &record.example {
+                println!("  example: {example}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn run_stats(opts: StatsOpts) -> color_eyre::Result<()> {
     let files = opts.database.join("files");
     if !files.is_file() {
@@ -522,6 +818,8 @@ fn run_stats(opts: StatsOpts) -> color_eyre::Result<()> {
         "files.path.fst",
         "files.path.postings",
         "files.attrs",
+        "files.history",
+        "files.options",
         "packages.json",
     ];
     let mut sidecar_sizes = std::collections::BTreeMap::new();
@@ -624,7 +922,39 @@ fn format_which_attr(store_path: &nixdex_core::StorePath) -> String {
     attr
 }
 
+fn csv_escape(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// Rejects a release URL that would fetch index data over plaintext HTTP.
+///
+/// A downloaded sidecar is checked against a published SHA-256 before it is
+/// installed, but that digest is fetched from the same server as the artifact,
+/// so it only catches a mirror or a corrupted transfer. Anyone able to rewrite
+/// the response can rewrite the digest with it, which makes transport security
+/// the part that stops a MITM. Loopback stays allowed so a local mirror or a
+/// test server still works.
+fn validate_release_url(url: &str) -> color_eyre::Result<()> {
+    let rest = match url.split_once("://") {
+        Some(("https", _)) => return Ok(()),
+        Some(("http", rest)) => rest,
+        _ => return Err(color_eyre::eyre::eyre!("release URL must use https: {url}")),
+    };
+    let host = rest.split(['/', ':']).next();
+    if matches!(host, Some("localhost" | "127.0.0.1" | "::1" | "[::1]")) {
+        return Ok(());
+    }
+    Err(color_eyre::eyre::eyre!(
+        "release URL must use https (plaintext http is only allowed for loopback): {url}"
+    ))
+}
+
 async fn run_update(opts: UpdateOpts) -> color_eyre::Result<()> {
+    validate_release_url(&opts.release_url)?;
     let config = nixdex_core::prebuilt::PrebuiltConfig {
         release_url: opts.release_url,
         architecture: opts.architecture,
@@ -639,7 +969,409 @@ async fn run_update(opts: UpdateOpts) -> color_eyre::Result<()> {
         .await
         .wrap_err("failed to download prebuilt index")?;
 
+    let stale = download_sidecars(&config, &opts.database).await;
+
     println!("updated index at {}", opts.database.display());
+    // A sidecar download failure leaves the previous file in place. Reporting a
+    // clean update anyway let `nixdex history` and `nixdex options` keep
+    // answering from data that describes an older release, with no sign that
+    // the refresh had partly failed.
+    if !stale.is_empty() {
+        println!(
+            "warning: kept the existing {} sidecar; it may describe an older release. \
+             Re-run `nixdex update` to refresh it.",
+            stale.join(" and ")
+        );
+    }
+    Ok(())
+}
+
+/// Downloads the optional sidecars, returning the names of those that failed
+/// while an older copy is still on disk.
+async fn download_sidecars(
+    config: &nixdex_core::prebuilt::PrebuiltConfig,
+    dest_dir: &std::path::Path,
+) -> Vec<&'static str> {
+    let mut stale = Vec::new();
+    let attempts = [
+        (
+            download_history_sidecar(config, dest_dir).await,
+            "history",
+            nixdex_history::HISTORY_FILE,
+        ),
+        (
+            download_options_sidecar(config, dest_dir).await,
+            "options",
+            nixdex_options::OPTIONS_FILE,
+        ),
+    ];
+    for (result, name, file) in attempts {
+        if let Err(err) = result {
+            tracing::warn!(error = %err, "failed to download {} sidecar", name);
+            if dest_dir.join(file).exists() {
+                stale.push(name);
+            }
+        }
+    }
+    stale
+}
+
+const MAX_SIDECAR_RETRIES: usize = 3;
+
+async fn download_history_sidecar(
+    config: &nixdex_core::prebuilt::PrebuiltConfig,
+    dest_dir: &std::path::Path,
+) -> color_eyre::Result<()> {
+    let filename = if config.small {
+        format!("index-{}-small.history", config.architecture)
+    } else {
+        format!("index-{}.history", config.architecture)
+    };
+    let url = format!("{}/{}", config.release_url, filename);
+    let dest = dest_dir.join(nixdex_history::HISTORY_FILE);
+    let max_bytes = nixdex_history::MAX_HISTORY_BYTES;
+    download_sidecar_with_retry(
+        &url,
+        &dest,
+        nixdex_history::HISTORY_MAGIC,
+        max_bytes,
+        "history",
+    )
+    .await
+}
+
+async fn download_options_sidecar(
+    config: &nixdex_core::prebuilt::PrebuiltConfig,
+    dest_dir: &std::path::Path,
+) -> color_eyre::Result<()> {
+    let filename = if config.small {
+        format!("index-{}-small.options", config.architecture)
+    } else {
+        format!("index-{}.options", config.architecture)
+    };
+    let url = format!("{}/{}", config.release_url, filename);
+    let dest = dest_dir.join(nixdex_options::OPTIONS_FILE);
+    let max_bytes = nixdex_options::MAX_OPTIONS_BYTES;
+    download_sidecar_with_retry(
+        &url,
+        &dest,
+        nixdex_options::OPTIONS_MAGIC,
+        max_bytes,
+        "options",
+    )
+    .await
+}
+
+async fn download_sidecar_with_retry(
+    url: &str,
+    dest: &std::path::Path,
+    expected_magic: &[u8],
+    max_bytes: usize,
+    name: &str,
+) -> color_eyre::Result<()> {
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("nixdex/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|err| color_eyre::eyre::eyre!("failed to build HTTP client: {err}"))?;
+
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let temp_path = sidecar_temp_path(dest);
+    retry_sidecar_download(
+        &client,
+        url,
+        &temp_path,
+        dest,
+        expected_magic,
+        max_bytes,
+        name,
+    )
+    .await
+}
+
+fn sidecar_temp_path(dest: &std::path::Path) -> std::path::PathBuf {
+    let ext = dest
+        .extension()
+        .map_or_else(String::new, |e| e.to_string_lossy().to_string());
+    dest.with_extension(format!("{ext}.tmp"))
+}
+
+async fn retry_sidecar_download(
+    client: &reqwest::Client,
+    url: &str,
+    temp_path: &std::path::Path,
+    dest: &std::path::Path,
+    expected_magic: &[u8],
+    max_bytes: usize,
+    name: &str,
+) -> color_eyre::Result<()> {
+    let mut last_err = None;
+    for attempt in 1..=MAX_SIDECAR_RETRIES {
+        match attempt_sidecar_download(
+            client,
+            url,
+            temp_path,
+            dest,
+            expected_magic,
+            max_bytes,
+            name,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                tracing::warn!(error = %err, attempt, "failed to download {} sidecar", name);
+                last_err = Some(err);
+                if attempt < MAX_SIDECAR_RETRIES {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+
+    discard_partial_sidecar(temp_path, name).await;
+
+    match last_err {
+        Some(err) => Err(err),
+        None => Err(color_eyre::eyre::eyre!(
+            "failed to download {} sidecar after {MAX_SIDECAR_RETRIES} attempts",
+            name
+        )),
+    }
+}
+
+/// Downloads the sidecar once and moves it into place.
+///
+/// A failed rename is retried alongside a failed download: both leave the
+/// destination untouched, so the next attempt starts from the same state.
+async fn attempt_sidecar_download(
+    client: &reqwest::Client,
+    url: &str,
+    temp_path: &std::path::Path,
+    dest: &std::path::Path,
+    expected_magic: &[u8],
+    max_bytes: usize,
+    name: &str,
+) -> color_eyre::Result<()> {
+    download_sidecar_once(client, url, temp_path, expected_magic, max_bytes, name).await?;
+    finalize_sidecar_download(temp_path, dest, name).await
+}
+
+/// Removes the partial download left by a failed attempt.
+///
+/// Every attempt failed, so the bytes on disk are worthless. Leaving them
+/// behind put a stray `files.history.tmp` / `files.options.tmp` in the database
+/// directory that nothing ever cleaned up.
+async fn discard_partial_sidecar(temp_path: &std::path::Path, name: &str) {
+    match tokio::fs::remove_file(temp_path).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                path = %temp_path.display(),
+                "failed to remove the partial {} sidecar",
+                name
+            );
+        }
+    }
+}
+
+async fn finalize_sidecar_download(
+    temp_path: &std::path::Path,
+    dest: &std::path::Path,
+    name: &str,
+) -> color_eyre::Result<()> {
+    tokio::fs::rename(temp_path, dest).await.map_err(|err| {
+        tracing::warn!(error = %err, "failed to atomically rename {} sidecar", name);
+        color_eyre::eyre::eyre!("failed to rename {} sidecar: {err}", name)
+    })?;
+    tracing::info!(path = %dest.display(), "downloaded {} sidecar", name);
+    Ok(())
+}
+
+/// Longest `.sha256` body accepted. A sha256sum line is 64 hex digits plus a
+/// separator and a file name; anything much larger is not a checksum file.
+const MAX_CHECKSUM_BYTES: usize = 4096;
+
+/// Parse the digest out of a `.sha256` file.
+///
+/// Accepts both the bare 64-hex-digit form and GNU `sha256sum` output
+/// (`<hex>  <name>`), which is what release tooling usually publishes.
+fn parse_sha256_hex(text: &str) -> color_eyre::Result<[u8; 32]> {
+    let field = text
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| color_eyre::eyre::eyre!("checksum file is empty"))?;
+    if field.len() != 64 {
+        return Err(color_eyre::eyre::eyre!(
+            "checksum must be 64 hex digits, got {} characters",
+            field.len()
+        ));
+    }
+    let mut digest = [0u8; 32];
+    for (i, byte) in digest.iter_mut().enumerate() {
+        let pair = field
+            .get(i * 2..i * 2 + 2)
+            .ok_or_else(|| color_eyre::eyre::eyre!("checksum is not valid hex"))?;
+        *byte = u8::from_str_radix(pair, 16)
+            .map_err(|_| color_eyre::eyre::eyre!("checksum is not valid hex"))?;
+    }
+    Ok(digest)
+}
+
+/// Fetch the published SHA-256 for a sidecar.
+///
+/// The digest lives next to the artifact as `<url>.sha256`. A missing or
+/// malformed checksum is an error, not a reason to skip the check: accepting
+/// the bytes anyway would make the whole verification optional for whoever
+/// controls the server.
+async fn fetch_expected_digest(
+    client: &reqwest::Client,
+    url: &str,
+    name: &str,
+) -> color_eyre::Result<[u8; 32]> {
+    let checksum_url = format!("{url}.sha256");
+    let response = client.get(&checksum_url).send().await.map_err(|err| {
+        color_eyre::eyre::eyre!("failed to download {name} sidecar checksum: {err}")
+    })?;
+    if !response.status().is_success() {
+        return Err(color_eyre::eyre::eyre!(
+            "failed to download {} sidecar checksum: HTTP {}",
+            name,
+            response.status()
+        ));
+    }
+    // Cap before buffering. `Response::bytes` reads the whole body first, so a
+    // host serving a large `.sha256` used to drive an allocation of that size
+    // and only then fail the length check.
+    let bytes = read_body_capped(
+        response,
+        MAX_CHECKSUM_BYTES,
+        &format!("{name} sidecar checksum"),
+    )
+    .await?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| color_eyre::eyre::eyre!("{name} sidecar checksum is not text"))?;
+    parse_sha256_hex(text).wrap_err_with(|| format!("invalid checksum for the {name} sidecar"))
+}
+
+/// Read a response body, refusing one larger than `max_bytes`.
+///
+/// The cap is applied twice: `Content-Length` is rejected up front when the
+/// server sends one, and the body is then read in chunks so a server that
+/// omits or understates the header still cannot drive an unbounded
+/// allocation. `label` names the thing being downloaded, for the error text.
+async fn read_body_capped(
+    response: reqwest::Response,
+    max_bytes: usize,
+    label: &str,
+) -> color_eyre::Result<Vec<u8>> {
+    use futures_util::StreamExt;
+
+    // `content_length` is a u64 and the cap a usize, so the header is
+    // narrowed rather than cast: a length that does not fit in a `usize`
+    // cannot fit under the cap either, so it counts as too large.
+    if let Some(content_length) = response.content_length()
+        && usize::try_from(content_length)
+            .ok()
+            .is_none_or(|length| length > max_bytes)
+    {
+        return Err(color_eyre::eyre::eyre!(
+            "{} too large: Content-Length {} bytes exceeds limit of {} bytes",
+            label,
+            content_length,
+            max_bytes
+        ));
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|err| color_eyre::eyre::eyre!("failed to read {label}: {err}"))?;
+        if bytes.len() + chunk.len() > max_bytes {
+            return Err(color_eyre::eyre::eyre!(
+                "{} too large: exceeds {} bytes during streaming",
+                label,
+                max_bytes
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+
+    Ok(bytes)
+}
+
+/// Compare a sidecar body against its published digest.
+///
+/// This catches a mirror or CDN serving different bytes than the release, and
+/// a truncated or corrupted transfer. It is not a signature: it does not help
+/// if the release host itself is compromised, because the digest comes from
+/// that same host. Signing the digest is the fix for that, and needs a key
+/// distribution story this CLI does not have yet.
+fn verify_sha256(bytes: &[u8], expected: &[u8; 32], name: &str) -> color_eyre::Result<()> {
+    use sha2::Digest;
+    use subtle::ConstantTimeEq;
+
+    let actual = sha2::Sha256::digest(bytes);
+    if actual.ct_eq(expected).into() {
+        return Ok(());
+    }
+    Err(color_eyre::eyre::eyre!(
+        "{name} sidecar checksum mismatch: refusing to install the download"
+    ))
+}
+
+async fn download_sidecar_once(
+    client: &reqwest::Client,
+    url: &str,
+    temp_path: &std::path::Path,
+    expected_magic: &[u8],
+    max_bytes: usize,
+    name: &str,
+) -> color_eyre::Result<()> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|err| color_eyre::eyre::eyre!("failed to download {} sidecar: {err}", name))?;
+
+    if !response.status().is_success() {
+        return Err(color_eyre::eyre::eyre!(
+            "failed to download {} sidecar: HTTP {}",
+            name,
+            response.status()
+        ));
+    }
+
+    let bytes = read_body_capped(response, max_bytes, &format!("{name} sidecar")).await?;
+
+    let magic_slice = match bytes.get(..expected_magic.len()) {
+        Some(slice) => slice,
+        None => &[],
+    };
+    if bytes.len() < expected_magic.len() || magic_slice != expected_magic {
+        return Err(color_eyre::eyre::eyre!(
+            "{} sidecar magic mismatch: expected {:?}, got {:?}",
+            name,
+            expected_magic,
+            magic_slice
+        ));
+    }
+
+    // Verify the published digest before anything touches the disk, so a
+    // mismatched download never becomes a file another process could pick up.
+    let expected = fetch_expected_digest(client, url, name).await?;
+    verify_sha256(&bytes, &expected, name)?;
+
+    tokio::fs::write(temp_path, &bytes).await.map_err(|err| {
+        color_eyre::eyre::eyre!("failed to write {} sidecar to temp file: {err}", name)
+    })?;
+
     Ok(())
 }
 
@@ -648,6 +1380,29 @@ fn run_generate_sidecars(opts: GenerateSidecarsOpts) -> color_eyre::Result<()> {
     nixdex_core::generate_sidecars(&files)
         .wrap_err_with(|| format!("failed to generate sidecars for {}", files.display()))?;
     println!("generated sidecars for {}", opts.database.display());
+    Ok(())
+}
+
+fn run_sidecar_diff(opts: SidecarDiffOpts) -> color_eyre::Result<()> {
+    let files = opts.database.join("files");
+    let diff = nixdex_core::sidecar_diff(&files)
+        .wrap_err_with(|| format!("failed to check sidecar diff for {}", files.display()))?;
+
+    match diff {
+        None => {
+            println!("no stored frame hashes found; full sidecar rebuild needed");
+        }
+        Some(changed) if changed.is_empty() => {
+            println!("all sidecars are up to date");
+        }
+        Some(changed) => {
+            println!("{} frame(s) need sidecar rebuild:", changed.len());
+            for idx in changed {
+                println!("  frame {idx}");
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1163,7 +1918,11 @@ struct Opts {
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
-    color_eyre::install()?;
+    // The result is discarded because `nixdex locate` is reachable both as a
+    // subcommand here and as its own binary, and `locate::run` installs the
+    // handler too. A second install is an error, not a failure worth aborting
+    // on: the only cost of losing this race is the default `Debug` report.
+    let _ = color_eyre::install();
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
@@ -1175,6 +1934,8 @@ async fn main() -> color_eyre::Result<()> {
     match opts.cmd {
         Cmd::Search(search_opts) => run_search(search_opts),
         Cmd::Info(info_opts) => run_info(info_opts),
+        Cmd::History(history_opts) => run_history(history_opts),
+        Cmd::Options(options_opts) => run_options(options_opts),
         Cmd::Stats(stats_opts) => run_stats(stats_opts),
         Cmd::Completions(opts) => {
             run_completions(opts);
@@ -1187,7 +1948,115 @@ async fn main() -> color_eyre::Result<()> {
         Cmd::Which(which_opts) => run_which(which_opts),
         Cmd::Update(update_opts) => run_update(update_opts).await,
         Cmd::GenerateSidecars(opts) => run_generate_sidecars(opts),
+        Cmd::SidecarDiff(opts) => run_sidecar_diff(opts),
         Cmd::CommandNotFound(opts) => run_command_not_found(opts),
+        Cmd::Tui(tui_opts) => {
+            tui::run_tui(tui_opts.database).await?;
+            Ok(())
+        }
         Cmd::Daemon(daemon_opts) => run_daemon(daemon_opts).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_release_url;
+
+    #[test]
+    fn https_release_urls_are_accepted() {
+        assert!(
+            validate_release_url("https://github.com/nix-community/nix-index-database/releases")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn plaintext_http_is_refused_for_a_remote_host() {
+        // A sidecar is installed after only a four-byte magic check, so anyone
+        // who can rewrite the response chooses its contents.
+        let err = validate_release_url("http://example.com/releases")
+            .expect_err("plaintext http must be refused");
+        assert!(err.to_string().contains("must use https"), "{err}");
+    }
+
+    #[test]
+    fn plaintext_http_stays_allowed_for_loopback() {
+        // The prebuilt download tests serve fixtures from a local HTTP server,
+        // and a local mirror is a legitimate use.
+        assert!(validate_release_url("http://127.0.0.1:8080/releases").is_ok());
+        assert!(validate_release_url("http://localhost:8080/releases").is_ok());
+    }
+
+    #[test]
+    fn a_url_without_a_scheme_is_refused() {
+        assert!(validate_release_url("example.com/releases").is_err());
+    }
+
+    /// A multi-result YAML stream needs a `---` head marker per document.
+    ///
+    /// Without one the documents concatenate into a single document with every
+    /// key repeated, which no YAML reader accepts.
+    #[test]
+    fn each_yaml_result_is_its_own_document() {
+        #[derive(serde::Serialize)]
+        struct Row {
+            attr: String,
+        }
+        let rows = [
+            Row {
+                attr: String::from("a"),
+            },
+            Row {
+                attr: String::from("b"),
+            },
+        ];
+        let stream: String = rows
+            .iter()
+            .map(|r| super::yaml_document(r).expect("serialize"))
+            .collect();
+        assert_eq!(stream, "---\nattr: a\n---\nattr: b\n");
+
+        let docs: Vec<serde_norway::Value> = serde_norway::Deserializer::from_str(&stream)
+            .map(|d| serde::Deserialize::deserialize(d).expect("document"))
+            .collect();
+        assert_eq!(docs.len(), 2, "the stream must parse as two documents");
+    }
+
+    /// The digest of the empty string, as published by `sha256sum`.
+    const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    #[test]
+    fn a_bare_hex_digest_parses() {
+        let digest = super::parse_sha256_hex(EMPTY_SHA256).expect("parse");
+        super::verify_sha256(b"", &digest, "test").expect("empty input must match");
+    }
+
+    #[test]
+    fn a_sha256sum_line_parses() {
+        let line = format!("{EMPTY_SHA256}  files.history\n");
+        let digest = super::parse_sha256_hex(&line).expect("parse");
+        super::verify_sha256(b"", &digest, "test").expect("empty input must match");
+    }
+
+    #[test]
+    fn a_malformed_checksum_is_rejected() {
+        for bad in ["", "not-hex", "abc", &"z".repeat(64)] {
+            assert!(
+                super::parse_sha256_hex(bad).is_err(),
+                "{bad:?} must not parse as a digest"
+            );
+        }
+    }
+
+    /// A body that does not match its published digest must never be installed.
+    #[test]
+    fn a_body_that_does_not_match_its_digest_is_refused() {
+        let digest = super::parse_sha256_hex(EMPTY_SHA256).expect("parse");
+        let err = super::verify_sha256(b"tampered", &digest, "history")
+            .expect_err("a mismatched body must be refused");
+        assert!(
+            err.to_string().contains("checksum mismatch"),
+            "unexpected error: {err}"
+        );
     }
 }

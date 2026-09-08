@@ -1,0 +1,8 @@
+- Flush after every result for every output format when `--stream` is set; it previously flushed only in the plain table branch, so `--format ndjson|csv|yaml` and `--json` stayed buffered when piped.
+- Normalise `--json` to `--format ndjson` instead of carrying a duplicate serialization loop that also bypassed the flush.
+- Stop `--exclude` and `--exclude-regex` from consuming the `--limit` budget; exclusions run after the search, so a truncated result set dropped eligible matches and `--count` underreported them.
+- Strip the `| ` Markdown table prefix from option descriptions at ingest and when decoding a sidecar, not only when printing; `--json`, the daemon `/options` response and `OptionsDb::search` all saw the prefixed text.
+- Refuse a `--release-url` that is not HTTPS, except on loopback; a sidecar is installed after only a four-byte magic check and there is no signature or checksum.
+- Report a kept-but-stale sidecar after a failed download, and remove the partial temp file instead of leaving `files.history.tmp` behind.
+- Point the missing-sidecar errors at `nixdex update`; `nix-index --options` does not exist and local indexing produces neither sidecar.
+- Read the sidecar size caps from `nixdex_history::MAX_HISTORY_BYTES` and `nixdex_options::MAX_OPTIONS_BYTES` instead of repeating the literals in the CLI.

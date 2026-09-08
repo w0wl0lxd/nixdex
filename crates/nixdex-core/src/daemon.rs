@@ -50,6 +50,10 @@ struct IndexSnapshot {
     reader: Arc<Reader>,
     /// Loaded package metadata database, if present.
     package_db: Option<Arc<crate::package_search::SearchDb>>,
+    /// Loaded version history database, if present.
+    history_db: Option<Arc<nixdex_history::HistoryDb>>,
+    /// Loaded options database, if present.
+    options_db: Option<Arc<nixdex_options::OptionsDb>>,
 }
 
 #[cfg(feature = "daemon")]
@@ -418,6 +422,36 @@ fn load_and_store_index(cache_dir: &std::path::Path, index_state: &IndexState) {
         }
     };
 
+    let history_db = {
+        let history_file = index_dir.join("files.history");
+        if history_file.exists() {
+            match nixdex_history::HistoryDb::open(&index_dir) {
+                Ok(db) => Some(Arc::new(db)),
+                Err(err) => {
+                    tracing::warn!(error = %err, path = %history_file.display(), "failed to load history sidecar");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
+    let options_db = {
+        let options_file = index_dir.join("files.options");
+        if options_file.exists() {
+            match nixdex_options::OptionsDb::open(&index_dir) {
+                Ok(db) => Some(Arc::new(db)),
+                Err(err) => {
+                    tracing::warn!(error = %err, path = %options_file.display(), "failed to load options sidecar");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
     let snapshot = IndexSnapshot {
         database_dir: index_dir.clone(),
         basename: Arc::new(basename),
@@ -425,6 +459,8 @@ fn load_and_store_index(cache_dir: &std::path::Path, index_state: &IndexState) {
         command_index: Arc::new(command_index),
         reader: Arc::new(reader),
         package_db,
+        history_db,
+        options_db,
     };
 
     if let Ok(mut state) = index_state.index.write() {
@@ -502,8 +538,11 @@ async fn download_and_update(config: &PrebuiltConfig, cache_dir: &std::path::Pat
 /// If `admin_token` is configured, the caller must present it as an
 /// `Authorization: Bearer <token>` header (compared in constant time).
 /// If no token is configured, the endpoint is restricted to loopback addresses.
+///
+/// This guards every route that returns indexed data or operational detail,
+/// not just `/reload`.
 #[cfg(feature = "daemon")]
-async fn admin_auth_middleware(
+async fn auth_middleware(
     State(index_state): State<Arc<IndexState>>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
     request: axum::extract::Request,
@@ -567,22 +606,33 @@ fn constant_time_bearer_eq(presented: &str, expected: &str) -> bool {
 /// Run the HTTP server for basename lookups.
 #[cfg(feature = "daemon")]
 async fn run_http_server(addr: &str, index_state: Arc<IndexState>) -> Result<()> {
+    // Every route that returns indexed data or operational detail sits behind
+    // `auth_middleware`: with a token configured it must be presented, and
+    // without one the route is loopback-only. A daemon bound to a non-loopback
+    // address therefore cannot serve the index to an unauthenticated client.
+    // `/health`, `/ready`, `/version` and `/metrics` stay open, because probes
+    // and scrapers expect them to be and they expose no index content.
+    let data_routes = Router::new()
+        .route("/reload", post(reload_handler))
+        .route("/locate", get(locate_handler))
+        .route("/nix-locate", get(nix_locate_handler))
+        .route("/search", get(search_handler))
+        .route("/info", get(info_handler))
+        .route("/history", get(history_handler))
+        .route("/options", get(options_handler))
+        .route("/stats", get(stats_handler))
+        .route("/command", get(command_handler))
+        .route_layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&index_state),
+            auth_middleware,
+        ));
+
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler))
         .route("/version", get(version_handler))
         .route("/metrics", get(metrics_handler))
-        .route(
-            "/reload",
-            post(reload_handler).route_layer(axum::middleware::from_fn_with_state(
-                Arc::clone(&index_state),
-                admin_auth_middleware,
-            )),
-        )
-        .route("/locate", get(locate_handler))
-        .route("/nix-locate", get(nix_locate_handler))
-        .route("/search", get(search_handler))
-        .route("/command", get(command_handler))
+        .merge(data_routes)
         .with_state(index_state);
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -764,6 +814,7 @@ async fn nix_locate_handler(
                 only_toplevel: !params.all,
             },
             json: false,
+            yaml: false,
             limit: Some(limit),
             count: false,
             sort,
@@ -771,6 +822,8 @@ async fn nix_locate_handler(
             max_size: params.max_size,
             exclude_fhs: params.exclude_fhs,
             null_output: params.null_output,
+            quiet: params.quiet,
+            details: params.details,
             literal_pattern: (!params.regex
                 && !params.at_root
                 && !params.whole_name
@@ -972,6 +1025,10 @@ struct NixLocateParams {
     exclude_fhs: bool,
     #[serde(default)]
     null_output: bool,
+    #[serde(default)]
+    quiet: bool,
+    #[serde(default)]
+    details: bool,
 }
 
 #[cfg(feature = "daemon")]
@@ -1324,6 +1381,284 @@ struct SearchResponse {
     results: Vec<crate::PackageMeta>,
 }
 
+/// Query parameters for `GET /info`.
+#[cfg(feature = "daemon")]
+#[derive(Deserialize)]
+struct InfoParams {
+    /// Attribute path to look up.
+    attr: String,
+}
+
+/// HTTP handler for `/info`.
+///
+/// Returns package metadata for a single attribute.
+#[cfg(feature = "daemon")]
+async fn info_handler(
+    State(index_state): State<Arc<IndexState>>,
+    axum::extract::Query(params): axum::extract::Query<InfoParams>,
+) -> std::result::Result<
+    axum::Json<InfoResponse>,
+    (axum::http::StatusCode, axum::Json<ErrorResponse>),
+> {
+    index_state.requests_total.fetch_add(1, Ordering::Relaxed);
+
+    if params.attr.len() > MAX_PATTERN_BYTES {
+        return Err(json_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("attr exceeds maximum length of {MAX_PATTERN_BYTES} bytes"),
+        ));
+    }
+
+    let db = match read_snapshot(&index_state) {
+        Some(snapshot) => snapshot.package_db,
+        None => {
+            return Err(json_error(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "no package database loaded",
+            ));
+        }
+    };
+
+    let Some(db) = db else {
+        return Err(json_error(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "no package database loaded",
+        ));
+    };
+
+    let results = db
+        .search(
+            &params.attr,
+            false,
+            crate::package_search::SearchField::Attr,
+            true,
+            true,
+            crate::package_search::SearchSort::None,
+            Some(1),
+        )
+        .map_err(|err| json_error(axum::http::StatusCode::BAD_REQUEST, err.to_string()))?;
+
+    let Some(record) = results.first() else {
+        return Err(json_error(
+            axum::http::StatusCode::NOT_FOUND,
+            format!("no package found with attr {}", params.attr),
+        ));
+    };
+
+    Ok(axum::Json(InfoResponse {
+        attr: record.attr.clone(),
+        name: record.name.clone(),
+        description: record.description.clone(),
+        main_program: record.main_program.clone(),
+        license: record.license.clone(),
+        homepage: record.homepage.clone(),
+        maintainers: record.maintainers.clone(),
+        platforms: record.platforms.clone(),
+        versions: None,
+    }))
+}
+
+/// Response for `/info`.
+#[cfg(feature = "daemon")]
+#[derive(Serialize)]
+struct InfoResponse {
+    attr: String,
+    name: String,
+    description: Option<String>,
+    main_program: Option<String>,
+    license: Option<String>,
+    homepage: Option<String>,
+    maintainers: Option<Vec<String>>,
+    platforms: Option<Vec<String>>,
+    versions: Option<Vec<String>>,
+}
+
+/// Query parameters for `GET /history`.
+#[cfg(feature = "daemon")]
+#[derive(Deserialize)]
+struct HistoryParams {
+    /// Attribute path to look up.
+    attr: String,
+}
+
+/// HTTP handler for `/history`.
+///
+/// Returns version history for a package attribute.
+#[cfg(feature = "daemon")]
+async fn history_handler(
+    State(index_state): State<Arc<IndexState>>,
+    axum::extract::Query(params): axum::extract::Query<HistoryParams>,
+) -> std::result::Result<
+    axum::Json<HistoryResponse>,
+    (axum::http::StatusCode, axum::Json<ErrorResponse>),
+> {
+    index_state.requests_total.fetch_add(1, Ordering::Relaxed);
+
+    if params.attr.len() > MAX_PATTERN_BYTES {
+        return Err(json_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("attr exceeds maximum length of {MAX_PATTERN_BYTES} bytes"),
+        ));
+    }
+
+    let history_db = match read_snapshot(&index_state) {
+        Some(snapshot) => snapshot.history_db,
+        None => {
+            return Err(json_error(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "no index loaded",
+            ));
+        }
+    };
+
+    let Some(history_db) = history_db else {
+        return Err(json_error(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "no history sidecar loaded: the daemon expects files.history in its \
+             index directory and does not download it -- run `nixdex update` \
+             against the same --db to fetch it",
+        ));
+    };
+
+    let versions = history_db.lookup_attr(&params.attr);
+
+    Ok(axum::Json(HistoryResponse {
+        attr: params.attr,
+        versions,
+    }))
+}
+
+/// Response for `/history`.
+#[cfg(feature = "daemon")]
+#[derive(Serialize)]
+struct HistoryResponse {
+    attr: String,
+    versions: Vec<nixdex_history::VersionEntry>,
+}
+
+/// Query parameters for `GET /options`.
+#[cfg(feature = "daemon")]
+#[derive(Deserialize)]
+struct OptionsParams {
+    /// Search pattern.
+    pattern: String,
+    /// Match case-sensitively.
+    #[serde(default)]
+    case_sensitive: bool,
+    /// Maximum number of results.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// HTTP handler for `/options`.
+///
+///Searches NixOS module options by pattern.
+#[cfg(feature = "daemon")]
+async fn options_handler(
+    State(index_state): State<Arc<IndexState>>,
+    axum::extract::Query(params): axum::extract::Query<OptionsParams>,
+) -> std::result::Result<
+    axum::Json<OptionsResponse>,
+    (axum::http::StatusCode, axum::Json<ErrorResponse>),
+> {
+    index_state.requests_total.fetch_add(1, Ordering::Relaxed);
+
+    if params.pattern.len() > MAX_PATTERN_BYTES {
+        return Err(json_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("pattern exceeds maximum length of {MAX_PATTERN_BYTES} bytes"),
+        ));
+    }
+
+    let options_db = match read_snapshot(&index_state) {
+        Some(snapshot) => snapshot.options_db,
+        None => {
+            return Err(json_error(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "no index loaded",
+            ));
+        }
+    };
+
+    let Some(options_db) = options_db else {
+        return Err(json_error(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "no options sidecar loaded: the daemon expects files.options in its \
+             index directory and does not download it -- run `nixdex update` \
+             against the same --db to fetch it",
+        ));
+    };
+
+    let limit = match params.limit {
+        Some(limit) => limit,
+        None => MAX_RESULT_LIMIT,
+    };
+    if limit > MAX_RESULT_LIMIT {
+        return Err(json_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("limit must be at most {MAX_RESULT_LIMIT}"),
+        ));
+    }
+
+    let matched = options_db.search(&params.pattern, params.case_sensitive);
+    let results: Vec<nixdex_options::OptionRecord> =
+        matched.into_iter().take(limit).cloned().collect();
+
+    Ok(axum::Json(OptionsResponse {
+        pattern: params.pattern,
+        count: results.len(),
+        results,
+    }))
+}
+
+/// Response for `/options`.
+#[cfg(feature = "daemon")]
+#[derive(Serialize)]
+struct OptionsResponse {
+    pattern: String,
+    count: usize,
+    results: Vec<nixdex_options::OptionRecord>,
+}
+
+/// HTTP handler for `/stats`.
+///
+///Returns database statistics including sidecar status.
+#[cfg(feature = "daemon")]
+async fn stats_handler(State(index_state): State<Arc<IndexState>>) -> axum::Json<StatsResponse> {
+    index_state.requests_total.fetch_add(1, Ordering::Relaxed);
+
+    let (history_count, options_count, package_count) = match read_snapshot(&index_state) {
+        Some(snapshot) => {
+            let history_count = snapshot.history_db.as_ref().map(|db| db.attr_count());
+            let options_count = snapshot.options_db.as_ref().map(|db| db.option_count());
+            let package_count = snapshot.reader.package_count();
+            (history_count, options_count, package_count)
+        }
+        None => (None, None, None),
+    };
+
+    axum::Json(StatsResponse {
+        version: env!("CARGO_PKG_VERSION"),
+        uptime_seconds: index_state.start_time.elapsed().as_secs(),
+        history_count,
+        options_count,
+        package_count,
+    })
+}
+
+/// Response for `/stats`.
+#[cfg(feature = "daemon")]
+#[derive(Serialize)]
+struct StatsResponse {
+    version: &'static str,
+    uptime_seconds: u64,
+    history_count: Option<usize>,
+    options_count: Option<usize>,
+    /// Packages in the main index. This is not a sidecar count -- the history
+    /// and options sidecars are reported by the two fields above.
+    package_count: Option<usize>,
+}
+
 /// Query parameters for `GET /command`.
 #[cfg(feature = "daemon")]
 #[derive(serde::Deserialize)]
@@ -1438,11 +1773,61 @@ mod tests {
                 "/reload",
                 post(reload_handler).route_layer(axum::middleware::from_fn_with_state(
                     Arc::clone(&state),
-                    admin_auth_middleware,
+                    auth_middleware,
                 )),
             )
             .layer(axum::extract::connect_info::MockConnectInfo(addr))
             .with_state(state)
+    }
+
+    /// Every data route must sit behind the same guard `/reload` has.
+    ///
+    /// `/locate`, `/nix-locate`, `/search`, `/info`, `/history`, `/options`,
+    /// `/stats` and `/command` were plain routes, so a daemon bound to a
+    /// non-loopback address served the whole index to any client that could
+    /// reach it.
+    fn guarded_app(state: Arc<IndexState>, addr: SocketAddr) -> Router {
+        Router::new()
+            .route("/stats", get(stats_handler))
+            .route("/info", get(info_handler))
+            .route_layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                auth_middleware,
+            ))
+            .layer(axum::extract::connect_info::MockConnectInfo(addr))
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn data_routes_reject_a_non_loopback_client_without_a_token() {
+        for path in ["/stats", "/info"] {
+            let mut app = guarded_app(empty_state(), SocketAddr::from(([203, 0, 113, 5], 1234)));
+            let request = axum::http::Request::builder()
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = tower::ServiceExt::<axum::extract::Request>::oneshot(&mut app, request)
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::UNAUTHORIZED,
+                "{path} must not answer an unauthenticated non-loopback client"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn data_routes_still_answer_a_loopback_client_without_a_token() {
+        let mut app = guarded_app(empty_state(), SocketAddr::from(([127, 0, 0, 1], 1234)));
+        let request = axum::http::Request::builder()
+            .uri("/stats")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::<axum::extract::Request>::oneshot(&mut app, request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
     }
 
     #[tokio::test]
