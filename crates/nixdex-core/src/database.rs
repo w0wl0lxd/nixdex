@@ -2987,7 +2987,9 @@ fn print_match_yaml(
                     serde_norway::Value::String(attr.to_string()),
                 );
                 if let Ok(yaml) = serde_norway::to_string(&obj) {
-                    print!("{yaml}{delim}");
+                    // `---` opens a YAML document, so several matches form a
+                    // valid multi-document stream rather than one invalid one.
+                    print!("---\n{yaml}{delim}");
                     return true;
                 }
             }
@@ -3072,7 +3074,7 @@ fn print_match_yaml(
                 }
             }
             if let Ok(yaml) = serde_norway::to_string(&obj) {
-                print!("{yaml}{delim}");
+                print!("---\n{yaml}{delim}");
                 true
             } else {
                 false

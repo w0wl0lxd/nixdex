@@ -189,20 +189,37 @@ impl OptionsDb {
             let mut record: OptionRecord =
                 sonic_rs::from_slice(line).map_err(|err| Error::Json(err.to_string()))?;
             record.description = normalize_description(std::mem::take(&mut record.description));
+            // The reader enforces the same per-field caps as the builder. A
+            // downloaded sidecar is untrusted input and does not have to have
+            // come from `OptionsBuilder`, so checking only `attr` here let an
+            // over-long type or description through.
             if record.attr.len() > MAX_OPTION_ATTR_BYTES {
                 return Err(Error::Corrupt(format!(
                     "option attr too long: {} (max {MAX_OPTION_ATTR_BYTES})",
                     record.attr.len()
                 )));
             }
+            if record.r#type.len() > MAX_OPTION_TYPE_BYTES {
+                return Err(Error::Corrupt(format!(
+                    "option type too long: {} (max {MAX_OPTION_TYPE_BYTES})",
+                    record.r#type.len()
+                )));
+            }
+            if record.description.len() > MAX_OPTION_DESC_BYTES {
+                return Err(Error::Corrupt(format!(
+                    "option description too long: {} (max {MAX_OPTION_DESC_BYTES})",
+                    record.description.len()
+                )));
+            }
+            // Checked as entries are added, not afterwards: the old check let a
+            // file with many times the cap be materialised in full before it
+            // was rejected.
+            if entries.len() >= MAX_OPTION_COUNT {
+                return Err(Error::Corrupt(format!(
+                    "too many options: more than {MAX_OPTION_COUNT}"
+                )));
+            }
             entries.insert(record.attr.clone(), record);
-        }
-
-        if entries.len() > MAX_OPTION_COUNT {
-            return Err(Error::Corrupt(format!(
-                "too many options: {} (max {MAX_OPTION_COUNT})",
-                entries.len()
-            )));
         }
 
         Ok(Self { entries })

@@ -269,6 +269,30 @@ fn json_row(result: &crate::app::SearchResult) -> String {
     sonic_rs::to_string(&obj).unwrap_or_else(|_| String::new())
 }
 
+/// One result rendered across several lines, for Ctrl+A expanded mode.
+///
+/// Only the fields that carry a value are shown, so a sparse record does not
+/// leave blank lines behind.
+fn expanded_lines<'a>(result: &'a crate::app::SearchResult, attr_span: Span<'a>) -> Vec<Line<'a>> {
+    let mut lines = vec![Line::from(vec![attr_span])];
+    if !result.name.is_empty() {
+        lines.push(Line::from(vec![
+            Span::raw("    name  "),
+            Span::raw(&result.name),
+        ]));
+    }
+    if !result.description.is_empty() {
+        lines.push(Line::from(vec![
+            Span::raw("    desc  "),
+            Span::raw(&result.description),
+        ]));
+    }
+    if let Some(path) = &result.path {
+        lines.push(Line::from(vec![Span::raw("    path  "), Span::raw(path)]));
+    }
+    lines
+}
+
 fn render_results(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App, tc: &ThemeColors) {
     let items: Vec<ListItem> = app
         .results
@@ -293,6 +317,12 @@ fn render_results(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App,
                 } else {
                     Span::styled(&result.attr, Style::default().fg(tc.attr_fg))
                 };
+                if app.expand_all {
+                    // Ctrl+A used to change only the status message: nothing
+                    // read the flag, so the results looked identical either
+                    // way. Expanded rows put the fields on their own lines.
+                    return ListItem::new(expanded_lines(result, attr_span));
+                }
                 let name_span = Span::raw("  ");
                 let name_val = Span::raw(&result.name);
                 let desc_span = Span::raw("  ");
@@ -466,20 +496,20 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: ratatui::layout::Rect, tc: &
         "  type         Search -- every plain character goes to the query,",
         "               including / : and ?",
         "  Tab          Switch search mode (Search/Locate/Which)",
-        "  Enter        Submit the search now",
+        "  Enter        Open the detail pane for the selected result",
         "  Esc          Clear the search",
         "  Up/Down      Move the selection",
         "  PgUp/PgDn    Move the selection by a page",
         "  Home/End     Jump to the first or last result",
         "  Ctrl+D       Pin or unpin the detail pane",
-        "  Ctrl+A       Expand or collapse every result",
+        "  Ctrl+A       Expand or collapse the detail lines on every result",
         "  Ctrl+Y       Copy the selected attribute",
         "  Ctrl+E       Copy a nix-env install command",
         "  Ctrl+P       Copy a nix profile install command",
-        "  Ctrl+J       Toggle JSON output",
+        "  Ctrl+J / F2  Toggle JSON output",
         "  Ctrl+R       Refresh",
         "  Ctrl+T       Cycle the theme",
-        "  Ctrl+H       Toggle this help",
+        "  Ctrl+H / F1  Toggle this help",
         "  Ctrl+C       Quit",
         "",
         " Press any key or Esc to continue.",

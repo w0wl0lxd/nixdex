@@ -101,8 +101,14 @@ impl HistoryBuilder {
 
     /// Record a version for a package attribute.
     ///
-    /// Versions are stored newest-first; duplicate versions for the same
+    /// Versions are stored newest-first and duplicate versions for the same
     /// attr are deduplicated.
+    ///
+    /// The order is established here rather than asked of the caller. The
+    /// entry is placed by `date`, so recording in any order still yields a
+    /// newest-first list. `date` must therefore be an ISO-8601 date
+    /// (`YYYY-MM-DD`, git's `%cs`), which orders correctly as a string; two
+    /// entries sharing a date keep the order they were recorded in.
     pub fn record_version(
         &mut self,
         attr: String,
@@ -140,7 +146,18 @@ impl HistoryBuilder {
                 "too many versions for attr (max {MAX_VERSIONS_PER_ATTR})"
             )));
         }
-        versions.push(entry);
+        // Insert ahead of the first older entry. Appending made "newest-first"
+        // an obligation on the caller that nothing checked and no caller
+        // established.
+        let position = match versions
+            .iter()
+            .position(|existing| entry.date > existing.date)
+        {
+            Some(index) => index,
+            // Older than everything recorded so far, so it goes last.
+            None => versions.len(),
+        };
+        versions.insert(position, entry);
         Ok(())
     }
 
@@ -305,6 +322,42 @@ mod tests {
                 )
                 .expect("recording a fresh version below the cap succeeds");
         }
+    }
+
+    /// The newest-first promise must hold whatever order the caller records in.
+    ///
+    /// `record_version` appended, so the order was whatever the caller happened
+    /// to use. Nothing checked it and no production caller established it.
+    #[test]
+    fn versions_come_back_newest_first_whatever_order_they_were_recorded_in() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut builder = HistoryBuilder::new();
+
+        // Deliberately out of order: oldest, newest, middle.
+        for (version, date) in [
+            ("1.0", "2024-01-01"),
+            ("3.0", "2026-01-01"),
+            ("2.0", "2025-01-01"),
+        ] {
+            builder
+                .record_version(
+                    "pkgs.hello".to_string(),
+                    version.to_string(),
+                    "cafe".to_string(),
+                    date.to_string(),
+                )
+                .expect("recording a fresh version succeeds");
+        }
+
+        builder.write_sidecar(dir.path()).expect("write sidecar");
+        let db = HistoryDb::open(dir.path()).expect("open sidecar");
+        let versions: Vec<String> = db
+            .lookup_attr("pkgs.hello")
+            .into_iter()
+            .map(|entry| entry.version)
+            .collect();
+
+        assert_eq!(versions, vec!["3.0", "2.0", "1.0"]);
     }
 
     #[test]

@@ -79,22 +79,48 @@ impl std::fmt::Display for DaemonError {
     }
 }
 
+/// Environment variable holding the daemon's bearer token.
+///
+/// A daemon started with `--admin-token` requires it on every request, this
+/// client has no other way to learn it, and the token must not go on the
+/// command line where it would show up in `ps`.
+pub const DAEMON_TOKEN_ENV: &str = "NIXDEX_DAEMON_TOKEN";
+
 pub struct DaemonClient {
     base: String,
     client: reqwest::Client,
+    /// Bearer token, when the daemon was started with one.
+    token: Option<String>,
 }
 
 impl DaemonClient {
     pub fn new(addr: String) -> Self {
+        Self::with_token(addr, std::env::var(DAEMON_TOKEN_ENV).ok())
+    }
+
+    pub fn with_token(addr: String, token: Option<String>) -> Self {
         Self {
             base: addr,
             client: reqwest::Client::new(),
+            // An empty variable means "no token", not "the empty token".
+            token: token.filter(|token| !token.is_empty()),
+        }
+    }
+
+    /// Attach the bearer token, when there is one.
+    ///
+    /// A daemon with an admin token answers 401 to every unauthenticated
+    /// request, so without this every daemon-backed search failed and fell
+    /// back to the local path.
+    fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
         }
     }
 
     pub async fn ready(&self) -> bool {
-        self.client
-            .get(format!("http://{}/ready", self.base))
+        self.authorize(self.client.get(format!("http://{}/ready", self.base)))
             .send()
             .await
             .is_ok_and(|r| r.status().is_success())
@@ -105,8 +131,7 @@ impl DaemonClient {
         query: &[(String, String)],
     ) -> Result<NixLocateResponse, DaemonError> {
         let resp = self
-            .client
-            .get(format!("http://{}/nix-locate", self.base))
+            .authorize(self.client.get(format!("http://{}/nix-locate", self.base)))
             .query(query)
             .send()
             .await
@@ -280,7 +305,10 @@ fn render_daemon_yaml(matches: &[NixLocateMatch], opts: &RenderOpts, delim: &str
                 append_daemon_yaml_details(&mut obj, m);
             }
             let yaml = serde_norway::to_string(&obj).unwrap_or_else(|_| String::new());
-            format!("{yaml}{delim}")
+            // `---` opens a YAML document. Without it several matches
+            // concatenate into one invalid stream, unlike `yaml_document`,
+            // which every other YAML path here goes through.
+            format!("---\n{yaml}{delim}")
         })
         .collect()
 }

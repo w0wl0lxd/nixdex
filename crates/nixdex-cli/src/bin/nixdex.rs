@@ -1245,18 +1245,65 @@ async fn fetch_expected_digest(
             response.status()
         ));
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|err| color_eyre::eyre::eyre!("failed to read {name} sidecar checksum: {err}"))?;
-    if bytes.len() > MAX_CHECKSUM_BYTES {
-        return Err(color_eyre::eyre::eyre!(
-            "{name} sidecar checksum file is too large"
-        ));
-    }
+    // Cap before buffering. `Response::bytes` reads the whole body first, so a
+    // host serving a large `.sha256` used to drive an allocation of that size
+    // and only then fail the length check.
+    let bytes = read_body_capped(
+        response,
+        MAX_CHECKSUM_BYTES,
+        &format!("{name} sidecar checksum"),
+    )
+    .await?;
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| color_eyre::eyre::eyre!("{name} sidecar checksum is not text"))?;
     parse_sha256_hex(text).wrap_err_with(|| format!("invalid checksum for the {name} sidecar"))
+}
+
+/// Read a response body, refusing one larger than `max_bytes`.
+///
+/// The cap is applied twice: `Content-Length` is rejected up front when the
+/// server sends one, and the body is then read in chunks so a server that
+/// omits or understates the header still cannot drive an unbounded
+/// allocation. `label` names the thing being downloaded, for the error text.
+async fn read_body_capped(
+    response: reqwest::Response,
+    max_bytes: usize,
+    label: &str,
+) -> color_eyre::Result<Vec<u8>> {
+    use futures_util::StreamExt;
+
+    // `content_length` is a u64 and the cap a usize, so the header is
+    // narrowed rather than cast: a length that does not fit in a `usize`
+    // cannot fit under the cap either, so it counts as too large.
+    if let Some(content_length) = response.content_length()
+        && usize::try_from(content_length)
+            .ok()
+            .is_none_or(|length| length > max_bytes)
+    {
+        return Err(color_eyre::eyre::eyre!(
+            "{} too large: Content-Length {} bytes exceeds limit of {} bytes",
+            label,
+            content_length,
+            max_bytes
+        ));
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|err| color_eyre::eyre::eyre!("failed to read {label}: {err}"))?;
+        if bytes.len() + chunk.len() > max_bytes {
+            return Err(color_eyre::eyre::eyre!(
+                "{} too large: exceeds {} bytes during streaming",
+                label,
+                max_bytes
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+
+    Ok(bytes)
 }
 
 /// Compare a sidecar body against its published digest.
@@ -1301,39 +1348,7 @@ async fn download_sidecar_once(
         ));
     }
 
-    // Check Content-Length header if present and reject if too large.
-    // `content_length` is a u64 and the cap a usize, so the header is
-    // narrowed rather than cast: a length that does not fit in a `usize`
-    // cannot fit under the cap either, so it counts as too large.
-    if let Some(content_length) = response.content_length()
-        && usize::try_from(content_length)
-            .ok()
-            .is_none_or(|length| length > max_bytes)
-    {
-        return Err(color_eyre::eyre::eyre!(
-            "{} sidecar too large: Content-Length {} bytes exceeds limit of {} bytes",
-            name,
-            content_length,
-            max_bytes
-        ));
-    }
-
-    // Stream the response body with chunked reads to enforce size limit
-    use futures_util::StreamExt;
-    let mut stream = response.bytes_stream();
-    let mut bytes = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk
-            .map_err(|err| color_eyre::eyre::eyre!("failed to read {} sidecar: {err}", name))?;
-        if bytes.len() + chunk.len() > max_bytes {
-            return Err(color_eyre::eyre::eyre!(
-                "{} sidecar too large: exceeds {} bytes during streaming",
-                name,
-                max_bytes
-            ));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
+    let bytes = read_body_capped(response, max_bytes, &format!("{name} sidecar")).await?;
 
     let magic_slice = match bytes.get(..expected_magic.len()) {
         Some(slice) => slice,

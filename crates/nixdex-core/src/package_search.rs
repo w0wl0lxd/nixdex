@@ -365,14 +365,15 @@ impl SearchDb {
         if sort == SearchSort::None {
             scored.sort_by_key(|&(score, _)| std::cmp::Reverse(score));
         } else if sort == SearchSort::Reverse {
-            scored.sort_by(|(score_a, a), (score_b, b)| {
-                let ord = score_a.cmp(score_b);
-                if ord == std::cmp::Ordering::Equal {
-                    a.attr.cmp(&b.attr)
-                } else {
-                    ord
-                }
-            });
+            // Reverse means the inverse of the default order, ties included.
+            // Breaking ties on `attr` instead left equally scored packages in
+            // ascending name order, which is the same direction the default
+            // leaves them in, so those rows were not reversed at all. Sorting
+            // exactly as the default does and then reversing is inverse by
+            // construction: the sort is stable, so tied rows come back in
+            // reverse insertion order.
+            scored.sort_by_key(|&(score, _)| std::cmp::Reverse(score));
+            scored.reverse();
         } else {
             scored.sort_by(|(score_a, a), (score_b, b)| {
                 let ord = Self::compare_records(a, b, sort);
@@ -888,6 +889,45 @@ mod tests {
             let line = sonic_rs::to_string(record).expect("serialize");
             writeln!(file, "{line}").expect("write");
         }
+    }
+
+    /// `--fuzzy --sort reverse` must also be the default output reversed.
+    ///
+    /// Ties were broken on `attr` ascending, the same direction the default
+    /// leaves them in, so equally scored packages were not reversed at all.
+    #[test]
+    fn fuzzy_reverse_sort_reverses_the_whole_relevance_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("packages.json");
+        // These three all score equally against "nix": every tie has to be
+        // reversed too, not just the rows whose scores differ.
+        write_fixture(
+            &path,
+            &[
+                test_record("nix-a", "one"),
+                test_record("nix-b", "two"),
+                test_record("nix-c", "three"),
+                test_record("nix", "the manager"),
+            ],
+        );
+
+        let db = SearchDb::open(&path).expect("open");
+        let default = db
+            .search_fuzzy("nix", SearchField::Attr, false, SearchSort::None, None)
+            .expect("fuzzy search");
+        let reversed = db
+            .search_fuzzy("nix", SearchField::Attr, false, SearchSort::Reverse, None)
+            .expect("fuzzy search");
+
+        let default_attrs: Vec<&str> = default.iter().map(|r| r.attr.as_str()).collect();
+        let reversed_attrs: Vec<&str> = reversed.iter().map(|r| r.attr.as_str()).collect();
+        let mut expected = default_attrs.clone();
+        expected.reverse();
+
+        assert_eq!(
+            reversed_attrs, expected,
+            "reverse must invert the whole order; default was {default_attrs:?}"
+        );
     }
 
     /// `--sort reverse` must be the default output reversed.

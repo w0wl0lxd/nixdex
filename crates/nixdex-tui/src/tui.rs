@@ -8,9 +8,13 @@ use crossterm::cursor::Show;
 use crossterm::event::{
     EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use crossterm::event::{
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 use futures_util::StreamExt;
 use nixdex_core::database::{SearchOptions, SearchSort};
@@ -34,13 +38,20 @@ const CACHE_TTL: Duration = Duration::from_secs(30);
 /// Restoring only after a normal `break` therefore left the terminal in raw
 /// mode, on the alternate screen and with no cursor on every error path, which
 /// the user could escape only with a manual `reset`.
-struct TerminalGuard;
+struct TerminalGuard {
+    /// Whether `PushKeyboardEnhancementFlags` was issued, so the matching pop
+    /// runs only when there is something to pop.
+    keyboard_enhanced: bool,
+}
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         // A failure here cannot be reported usefully: the process is on its way
         // out and the message would be drawn onto the alternate screen that is
         // being torn down. Restoring as much as possible beats aborting.
+        if self.keyboard_enhanced {
+            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
     }
@@ -50,7 +61,17 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
-    let _terminal_guard = TerminalGuard;
+    // Ask the terminal to report Ctrl+H and Ctrl+J as themselves. Legacy
+    // terminals send 0x08 and 0x0a for those, which decode as Backspace and
+    // Enter, so the shortcuts never matched. Not every terminal supports the
+    // request, hence the fallback bindings in `event.rs`.
+    let keyboard_enhanced = matches!(supports_keyboard_enhancement(), Ok(true))
+        && execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .is_ok();
+    let _terminal_guard = TerminalGuard { keyboard_enhanced };
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -108,7 +129,19 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
             maybe_event = rx.recv() => {
                 match maybe_event {
                     Some(app_event) => {
-                        handle_input_event(&mut app, &app_event, &mut pending_query, &mut debounce_deadline);
+                        // A pinned detail owns the keyboard. Without this
+                        // guard a printable character reached `set_input`,
+                        // which clears `detail` and `detail_pinned`, so typing
+                        // closed the pane the pin was meant to hold open.
+                        if !app.detail_is_pinned() {
+                            handle_input_event(
+                                &mut app,
+                                &app_event,
+                                &mut pending_query,
+                                &mut debounce_deadline,
+                                &mut dispatched_query,
+                            );
+                        }
                         handle_event(&mut app, app_event);
                         dispatch_reload(&mut app, &search_tx);
                     }
@@ -164,6 +197,7 @@ fn dispatch_search(
     search_tx: &tokio::sync::mpsc::UnboundedSender<SearchRequest>,
 ) {
     if query.is_empty() {
+        app.cancel_search();
         app.set_results(Vec::new());
         return;
     }
@@ -174,7 +208,8 @@ fn dispatch_search(
         app.set_status(format!("Found {} result(s) (cached)", app.result_count()));
         return;
     }
-    send_search(app, app.search_request(query), search_tx);
+    let request = app.search_request(query);
+    send_search(app, request, search_tx);
 }
 
 /// Act on a Ctrl+R, which asked for the current query to be run again against
@@ -188,7 +223,9 @@ fn dispatch_reload(app: &mut App, search_tx: &tokio::sync::mpsc::UnboundedSender
         app.set_status(String::from("Nothing to refresh"));
         return;
     }
-    let mut request = app.search_request(&app.input);
+    // Clone first: `search_request` takes `&mut self` to allocate the id.
+    let input = app.input.clone();
+    let mut request = app.search_request(&input);
     request.reload = true;
     send_search(app, request, search_tx);
 }
@@ -199,8 +236,9 @@ fn send_search(
     search_tx: &tokio::sync::mpsc::UnboundedSender<SearchRequest>,
 ) {
     app.is_searching = true;
+    app.active_request = Some(request.id);
     if search_tx.send(request).is_err() {
-        app.is_searching = false;
+        app.cancel_search();
         app.set_status(String::from("Search worker stopped"));
     }
 }
@@ -210,6 +248,7 @@ fn handle_input_event(
     event: &AppEvent,
     pending_query: &mut Option<String>,
     debounce_deadline: &mut Option<Instant>,
+    dispatched_query: &mut Option<String>,
 ) {
     match event {
         AppEvent::Key(KeyEvent {
@@ -261,6 +300,11 @@ fn handle_input_event(
         }) => {
             *pending_query = None;
             *debounce_deadline = None;
+            // Forget what was last dispatched. Escape and Tab clear the
+            // results, so retyping the same text has to search again: the memo
+            // used to suppress that dispatch and leave the screen empty.
+            *dispatched_query = None;
+            app.cancel_search();
         }
         _ => {}
     }
@@ -577,14 +621,18 @@ fn run_search(cache: &mut SearchDbCache, req: &SearchRequest) -> SearchOutcome {
 /// dropped: the debounce fires again for the new text, and applying the old
 /// one would reset the selection to a list the user is not looking at.
 fn apply_search_outcome(app: &mut App, outcome: SearchOutcome) {
-    let stale_query = outcome.query != app.input;
-    let stale_mode = outcome.mode != app.mode;
-    if stale_query || stale_mode {
+    // Match on the request id, not on `(query, mode)`.  Those two do not
+    // identify a request: Ctrl+R re-runs the same pair, so the pre-reload
+    // outcome used to look current and stop the spinner while the reload was
+    // still queued.  Escape and Tab retire a request without replacing it, and
+    // its outcome then never matched, so the spinner ran forever.
+    if app.active_request != Some(outcome.id) {
         // Leave `is_searching` alone. Clearing it here would hide the loading
         // indicator while the search the user is actually waiting for still
         // runs.
         return;
     }
+    app.active_request = None;
     app.is_searching = false;
     if let Some(results) = outcome.results {
         app.cache_results(outcome.query, results.clone());
@@ -595,9 +643,33 @@ fn apply_search_outcome(app: &mut App, outcome: SearchOutcome) {
     }
 }
 
+/// A package sidecar record as a result row.
+///
+/// Package search has no file entry behind it, so `path` and `size` stay empty.
+fn package_meta_to_result(record: &nixdex_core::nixpkgs::PackageMeta) -> crate::app::SearchResult {
+    crate::app::SearchResult {
+        attr: record.attr.clone(),
+        name: record.name.clone(),
+        description: match record.description.as_deref() {
+            Some(text) => text.to_string(),
+            None => String::new(),
+        },
+        path: None,
+        size: None,
+        license: record.license.clone(),
+        homepage: record.homepage.clone(),
+        maintainers: match record.maintainers.as_deref() {
+            Some(names) => names.to_vec(),
+            None => Vec::new(),
+        },
+        main_program: record.main_program.clone(),
+    }
+}
+
 fn perform_package_search(cache: &mut SearchDbCache, req: &SearchRequest) -> SearchOutcome {
     let query = req.query.as_str();
     let fail = |status: String| SearchOutcome {
+        id: req.id,
         query: query.to_string(),
         mode: req.mode,
         results: None,
@@ -669,32 +741,15 @@ fn perform_package_search(cache: &mut SearchDbCache, req: &SearchRequest) -> Sea
 
     match matches {
         Ok(records) => {
-            let results: Vec<crate::app::SearchResult> = records
-                .into_iter()
-                .map(|r| crate::app::SearchResult {
-                    attr: r.attr.clone(),
-                    name: r.name.clone(),
-                    description: match r.description.as_deref() {
-                        Some(text) => text.to_string(),
-                        None => String::new(),
-                    },
-                    path: None,
-                    size: None,
-                    license: r.license.clone(),
-                    homepage: r.homepage.clone(),
-                    maintainers: match r.maintainers.as_deref() {
-                        Some(names) => names.to_vec(),
-                        None => Vec::new(),
-                    },
-                    main_program: r.main_program.clone(),
-                })
-                .collect();
+            let results: Vec<crate::app::SearchResult> =
+                records.into_iter().map(package_meta_to_result).collect();
             let status = if size_sort_unsupported {
                 String::from("Size sort is not available in package search mode")
             } else {
                 format!("Found {} result(s)", results.len())
             };
             SearchOutcome {
+                id: req.id,
                 query: query.to_string(),
                 mode: req.mode,
                 results: Some(results),
@@ -759,6 +814,7 @@ fn perform_locate_search(req: &SearchRequest) -> SearchOutcome {
                 .collect();
             let status = format!("Found {} result(s)", search_results.len());
             SearchOutcome {
+                id: req.id,
                 query: query.to_string(),
                 mode: req.mode,
                 results: Some(search_results),
@@ -766,6 +822,7 @@ fn perform_locate_search(req: &SearchRequest) -> SearchOutcome {
             }
         }
         Err(err) => SearchOutcome {
+            id: req.id,
             query: query.to_string(),
             mode: req.mode,
             results: None,
@@ -803,6 +860,7 @@ fn perform_which_search(req: &SearchRequest) -> SearchOutcome {
                 .collect();
             let status = format!("Found {} provider(s)", results.len());
             SearchOutcome {
+                id: req.id,
                 query: query.to_string(),
                 mode: req.mode,
                 results: Some(results),
@@ -810,6 +868,7 @@ fn perform_which_search(req: &SearchRequest) -> SearchOutcome {
             }
         }
         Err(_) => SearchOutcome {
+            id: req.id,
             query: query.to_string(),
             mode: req.mode,
             results: None,
@@ -893,8 +952,15 @@ mod tests {
     fn type_text(app: &mut App, text: &str) -> Option<String> {
         let mut pending = None;
         let mut deadline: Option<Instant> = None;
+        let mut dispatched = None;
         for c in text.chars() {
-            handle_input_event(app, &key(KeyCode::Char(c)), &mut pending, &mut deadline);
+            handle_input_event(
+                app,
+                &key(KeyCode::Char(c)),
+                &mut pending,
+                &mut deadline,
+                &mut dispatched,
+            );
         }
         pending
     }
@@ -937,16 +1003,24 @@ mod tests {
         let mut app = app();
         let mut pending = None;
         let mut deadline: Option<Instant> = None;
+        let mut dispatched = None;
         for c in "firefox".chars() {
             handle_input_event(
                 &mut app,
                 &key(KeyCode::Char(c)),
                 &mut pending,
                 &mut deadline,
+                &mut dispatched,
             );
         }
         assert_eq!(pending.as_deref(), Some("firefox"));
-        handle_input_event(&mut app, &key(KeyCode::Tab), &mut pending, &mut deadline);
+        handle_input_event(
+            &mut app,
+            &key(KeyCode::Tab),
+            &mut pending,
+            &mut deadline,
+            &mut dispatched,
+        );
         assert_eq!(pending, None);
         assert_eq!(deadline, None);
     }
@@ -1014,7 +1088,16 @@ mod tests {
     }
 
     fn outcome(query: &str, results: Option<Vec<crate::app::SearchResult>>) -> SearchOutcome {
+        outcome_with_id(1, query, results)
+    }
+
+    fn outcome_with_id(
+        id: u64,
+        query: &str,
+        results: Option<Vec<crate::app::SearchResult>>,
+    ) -> SearchOutcome {
         SearchOutcome {
+            id,
             query: String::from(query),
             mode: SearchMode::Search,
             results,
@@ -1022,25 +1105,30 @@ mod tests {
         }
     }
 
-    /// A result for a query the user has moved on from must be dropped.
+    /// A result for a request the user has moved on from must be dropped.
     ///
     /// The search runs on a worker now, so a slow answer can arrive after more
     /// typing. Applying it would reset the selection to a list that does not
     /// match what is in the search box.
     #[test]
-    fn a_search_result_for_an_old_query_is_ignored() {
+    fn a_search_result_for_an_old_request_is_ignored() {
         let mut app = app();
         app.set_input(String::from("sqlite"));
-        super::apply_search_outcome(&mut app, outcome("sql", Some(vec![result("sql")])));
+        app.active_request = Some(2);
+        super::apply_search_outcome(
+            &mut app,
+            outcome_with_id(1, "sql", Some(vec![result("sql")])),
+        );
         assert!(app.results.is_empty(), "stale results must not be applied");
         assert_ne!(app.status_message, "done");
     }
 
-    /// A result for a query typed in another mode must be dropped too.
+    /// Switching mode retires the request in flight, so its answer is dropped.
     #[test]
     fn a_search_result_from_another_mode_is_ignored() {
         let mut app = app();
         app.set_input(String::from("sqlite"));
+        app.active_request = Some(1);
         app.set_mode(SearchMode::Locate);
         super::apply_search_outcome(&mut app, outcome("sqlite", Some(vec![result("sqlite")])));
         assert!(app.results.is_empty());
@@ -1051,6 +1139,7 @@ mod tests {
     fn a_search_result_for_the_current_query_is_applied() {
         let mut app = app();
         app.set_input(String::from("sqlite"));
+        app.active_request = Some(1);
         super::apply_search_outcome(&mut app, outcome("sqlite", Some(vec![result("sqlite")])));
         assert_eq!(app.results.len(), 1);
         assert_eq!(app.status_message, "done");
@@ -1067,6 +1156,7 @@ mod tests {
         let mut app = app();
         app.set_input(String::from("sqlite"));
         app.set_results(vec![result("sqlite")]);
+        app.active_request = Some(1);
         super::apply_search_outcome(&mut app, outcome("sqlite", None));
         assert_eq!(app.results.len(), 1, "a failure must not wipe the list");
         assert_eq!(app.status_message, "done");
@@ -1081,12 +1171,14 @@ mod tests {
         let mut app = app();
         let mut pending = None;
         let mut deadline: Option<Instant> = None;
+        let mut dispatched = None;
 
         handle_input_event(
             &mut app,
             &key(KeyCode::Char('f')),
             &mut pending,
             &mut deadline,
+            &mut dispatched,
         );
         assert_eq!(app.input, "f");
         handle_input_event(
@@ -1094,6 +1186,7 @@ mod tests {
             &key(KeyCode::Char('o')),
             &mut pending,
             &mut deadline,
+            &mut dispatched,
         );
         assert_eq!(app.input, "fo");
         handle_input_event(
@@ -1101,6 +1194,7 @@ mod tests {
             &key(KeyCode::Backspace),
             &mut pending,
             &mut deadline,
+            &mut dispatched,
         );
         assert_eq!(app.input, "f");
     }
@@ -1115,15 +1209,128 @@ mod tests {
         let mut app = app();
         app.set_input(String::from("current"));
         app.is_searching = true;
+        app.active_request = Some(2);
 
-        super::apply_search_outcome(&mut app, outcome("previous", Some(Vec::new())));
+        super::apply_search_outcome(&mut app, outcome_with_id(1, "previous", Some(Vec::new())));
         assert!(
             app.is_searching,
             "a stale outcome must not stop the spinner"
         );
 
-        super::apply_search_outcome(&mut app, outcome("current", Some(Vec::new())));
+        super::apply_search_outcome(&mut app, outcome_with_id(2, "current", Some(Vec::new())));
         assert!(!app.is_searching, "the awaited outcome stops the spinner");
+    }
+
+    /// A reload of the same query must not be finished by the earlier answer.
+    ///
+    /// Staleness used to be judged on `(query, mode)`. Ctrl+R re-runs exactly
+    /// that pair, so the pre-reload outcome looked current, stopped the spinner
+    /// and applied results the reload was about to replace.
+    #[test]
+    fn a_reload_is_not_finished_by_the_pre_reload_outcome() {
+        let mut app = app();
+        app.set_input(String::from("firefox"));
+        app.is_searching = true;
+        // Request 1 is the original search; request 2 is the Ctrl+R reload.
+        app.active_request = Some(2);
+
+        super::apply_search_outcome(&mut app, outcome_with_id(1, "firefox", Some(Vec::new())));
+
+        assert!(
+            app.is_searching,
+            "the pre-reload answer must not stop the spinner"
+        );
+        assert_eq!(app.active_request, Some(2));
+    }
+
+    /// Retiring a request without replacing it must stop the spinner.
+    ///
+    /// Escape and Tab used to leave `is_searching` true: the outcome still in
+    /// flight no longer matched the (now empty) query, so it was dropped and
+    /// nothing ever cleared the loading state.
+    #[test]
+    fn cancelling_a_search_stops_the_loading_indicator() {
+        let mut app = app();
+        app.set_input(String::from("firefox"));
+        app.is_searching = true;
+        app.active_request = Some(1);
+
+        app.cancel_search();
+        assert!(!app.is_searching);
+
+        // The answer to the retired request is still dropped when it arrives.
+        super::apply_search_outcome(&mut app, outcome_with_id(1, "firefox", Some(Vec::new())));
+        assert!(app.results.is_empty());
+        assert!(!app.is_searching);
+    }
+
+    /// Escape must let the same text be searched for again.
+    ///
+    /// `dispatched_query` survived Escape, so retyping the query that was just
+    /// cleared matched the memo and no search was dispatched: the results
+    /// stayed empty with no way to bring them back except editing the text.
+    #[test]
+    fn escape_lets_the_same_query_be_typed_again() {
+        let mut app = app();
+        let mut pending = None;
+        let mut deadline: Option<Instant> = None;
+        let mut dispatched = Some(String::from("firefox"));
+
+        handle_input_event(
+            &mut app,
+            &key(KeyCode::Esc),
+            &mut pending,
+            &mut deadline,
+            &mut dispatched,
+        );
+
+        assert_eq!(dispatched, None, "Escape must clear the dispatch memo");
+    }
+
+    /// Tab must do the same, for the same reason.
+    #[test]
+    fn tab_lets_the_same_query_be_typed_again() {
+        let mut app = app();
+        let mut pending = None;
+        let mut deadline: Option<Instant> = None;
+        let mut dispatched = Some(String::from("firefox"));
+
+        handle_input_event(
+            &mut app,
+            &key(KeyCode::Tab),
+            &mut pending,
+            &mut deadline,
+            &mut dispatched,
+        );
+
+        assert_eq!(dispatched, None);
+    }
+
+    /// Typing must not close a pinned detail pane.
+    ///
+    /// `set_input` clears `detail` and `detail_pinned`, and the input handler
+    /// ran before the detail handler with no guard, so one keystroke dismissed
+    /// the pane the pin was meant to hold open.
+    #[test]
+    fn a_pinned_detail_takes_the_keyboard() {
+        let mut app = app();
+        app.set_detail(DetailView {
+            attr: String::from("firefox"),
+            name: String::from("firefox"),
+            description: String::new(),
+            path: None,
+            size: None,
+            license: None,
+            homepage: None,
+            maintainers: Vec::new(),
+            main_program: None,
+            pinned: true,
+        });
+
+        assert!(
+            app.detail_is_pinned(),
+            "the guard the event loop reads must report the pin"
+        );
     }
 
     /// A path typed in Locate mode must keep its separators.

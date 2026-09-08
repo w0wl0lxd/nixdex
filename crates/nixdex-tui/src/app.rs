@@ -128,9 +128,19 @@ pub struct App {
     pub cache_ttl: Duration,
     pub toasts: Vec<Toast>,
     pub is_searching: bool,
+    /// Id of the search whose outcome the UI is still waiting for.
+    ///
+    /// Query and mode do not identify a request: Ctrl+R re-runs the same pair,
+    /// so the earlier outcome would look current and stop the spinner while
+    /// the reload is still queued.  Escape or Tab can also retire a request
+    /// without replacing it, and its outcome would then never match and would
+    /// leave the spinner running forever.
+    pub active_request: Option<u64>,
     pub show_help: bool,
     /// Set by Ctrl+R. The event loop clears it and re-runs the current query.
     pub reload_requested: bool,
+    /// Source of request ids.  Monotonic, so an id is never reused.
+    next_request_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -187,12 +197,30 @@ impl App {
             cache_ttl: Duration::from_secs(30),
             toasts: Vec::new(),
             is_searching: false,
+            active_request: None,
             show_help: false,
             reload_requested: false,
+            next_request_id: 0,
         }
     }
 
+    /// Retire the search in flight without starting another.
+    ///
+    /// Its outcome will no longer match `active_request`, so it is discarded
+    /// on arrival, and the spinner stops now rather than waiting for an
+    /// outcome that can never be applied.
+    /// Whether a detail pane is open and pinned, so it owns the keyboard.
+    pub fn detail_is_pinned(&self) -> bool {
+        self.detail.as_ref().is_some_and(|detail| detail.pinned)
+    }
+
+    pub fn cancel_search(&mut self) {
+        self.active_request = None;
+        self.is_searching = false;
+    }
+
     pub fn set_mode(&mut self, mode: SearchMode) {
+        self.cancel_search();
         self.mode = mode;
         self.input.clear();
         self.results.clear();
@@ -323,8 +351,10 @@ impl App {
     }
 
     /// Snapshot the settings one search needs, for the blocking worker.
-    pub fn search_request(&self, query: &str) -> SearchRequest {
+    pub fn search_request(&mut self, query: &str) -> SearchRequest {
+        self.next_request_id = self.next_request_id.wrapping_add(1);
         SearchRequest {
+            id: self.next_request_id,
             query: query.to_string(),
             mode: self.mode,
             database: self.database.clone(),
@@ -477,6 +507,9 @@ fn is_word_boundary(chars: &[char], from: usize, to: usize) -> bool {
 /// cannot borrow `App`, so it gets this copy of the settings instead.
 #[derive(Debug, Clone)]
 pub struct SearchRequest {
+    /// Identifies this request, so its outcome can be told from the outcome of
+    /// a request that has since been retired or re-run.
+    pub id: u64,
     pub query: String,
     pub mode: SearchMode,
     pub database: PathBuf,
@@ -501,6 +534,8 @@ pub struct SearchRequest {
 /// transient error does not wipe the list under the user.
 #[derive(Debug)]
 pub struct SearchOutcome {
+    /// Echoes [`SearchRequest::id`].
+    pub id: u64,
     pub query: String,
     pub mode: SearchMode,
     pub results: Option<Vec<SearchResult>>,

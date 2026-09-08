@@ -172,14 +172,26 @@ impl AppEvent {
     ///
     /// It used to be `?`. Every unmodified printable character is search input,
     /// and `?` is meaningful in a regex query, so the shortcut needs a modifier.
+    ///
+    /// A terminal without `DISAMBIGUATE_ESCAPE_CODES` sends 0x08 for Ctrl+H,
+    /// which decodes as `Backspace`. `Backspace` with CONTROL is accepted
+    /// because it can only be Ctrl+H; a plain `Backspace` is not, because there
+    /// the terminal has already lost the distinction and it is ordinary
+    /// editing. F1 is the binding that works on every terminal.
     pub fn is_ctrl_h(&self) -> bool {
         matches!(
             self,
-            Self::Key(KeyEvent {
-                code: KeyCode::Char('h'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            })
+            Self::Key(
+                KeyEvent {
+                    code: KeyCode::Char('h') | KeyCode::Backspace,
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } | KeyEvent {
+                    code: KeyCode::F(1),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }
+            )
         )
     }
 
@@ -194,14 +206,26 @@ impl AppEvent {
         )
     }
 
+    /// Ctrl+J toggles JSON output.
+    ///
+    /// Same ambiguity as [`Self::is_ctrl_h`]: a legacy terminal sends 0x0a for
+    /// Ctrl+J, which decodes as `Enter`. `Enter` with CONTROL can only be
+    /// Ctrl+J and is accepted; a plain `Enter` opens the detail pane and is
+    /// not. F2 works on every terminal.
     pub fn is_ctrl_j(&self) -> bool {
         matches!(
             self,
-            Self::Key(KeyEvent {
-                code: KeyCode::Char('j'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            })
+            Self::Key(
+                KeyEvent {
+                    code: KeyCode::Char('j') | KeyCode::Enter,
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } | KeyEvent {
+                    code: KeyCode::F(2),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }
+            )
         )
     }
 
@@ -342,5 +366,42 @@ impl AppEvent {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod ambiguous_control_key_tests {
+    use super::AppEvent;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> AppEvent {
+        AppEvent::Key(KeyEvent::new(code, modifiers))
+    }
+
+    #[test]
+    fn ctrl_h_is_recognised_however_the_terminal_spells_it() {
+        assert!(key(KeyCode::Char('h'), KeyModifiers::CONTROL).is_ctrl_h());
+        // 0x08 on a terminal without DISAMBIGUATE_ESCAPE_CODES.
+        assert!(key(KeyCode::Backspace, KeyModifiers::CONTROL).is_ctrl_h());
+        assert!(key(KeyCode::F(1), KeyModifiers::NONE).is_ctrl_h());
+    }
+
+    #[test]
+    fn ctrl_j_is_recognised_however_the_terminal_spells_it() {
+        assert!(key(KeyCode::Char('j'), KeyModifiers::CONTROL).is_ctrl_j());
+        assert!(key(KeyCode::Enter, KeyModifiers::CONTROL).is_ctrl_j());
+        assert!(key(KeyCode::F(2), KeyModifiers::NONE).is_ctrl_j());
+    }
+
+    /// Plain Backspace and Enter keep their own meanings.
+    ///
+    /// The terminal has already lost the distinction there, so treating them
+    /// as the control shortcuts would break ordinary editing and would stop
+    /// Enter from opening the detail pane.
+    #[test]
+    fn an_unmodified_backspace_or_enter_is_not_a_shortcut() {
+        assert!(!key(KeyCode::Backspace, KeyModifiers::NONE).is_ctrl_h());
+        assert!(!key(KeyCode::Enter, KeyModifiers::NONE).is_ctrl_j());
+        assert!(key(KeyCode::Enter, KeyModifiers::NONE).is_enter());
     }
 }
