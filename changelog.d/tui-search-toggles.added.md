@@ -1,0 +1,1 @@
+- Bind Ctrl+F, Ctrl+X and Ctrl+N in the TUI to fuzzy matching, regex matching and attribute-name-only results. These settings were stored and passed to every search, but no key could change them.

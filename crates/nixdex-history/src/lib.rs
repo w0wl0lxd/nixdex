@@ -28,6 +28,41 @@ const MAX_VERSION_BYTES: usize = 128;
 /// Maximum length of a commit hash.
 const MAX_COMMIT_BYTES: usize = 64;
 
+/// Cap for the `date` field, which the builder never bounded.
+///
+/// An ISO-8601 date is ten bytes and a full timestamp is under forty. This
+/// leaves room for either while keeping the field from being a place to put an
+/// arbitrarily large string.
+const MAX_DATE_BYTES: usize = 64;
+
+/// Reject a version entry whose fields exceed their caps.
+///
+/// Shared by `record_version` and by `open`. The reader used to enforce none of
+/// these: every cap lived in the builder, so a downloaded sidecar -- which is
+/// untrusted and need not have come from `HistoryBuilder` at all -- was loaded
+/// whole with no bound on any field or on the number of entries per attribute.
+fn check_entry(entry: &VersionEntry) -> Result<()> {
+    if entry.version.len() > MAX_VERSION_BYTES {
+        return Err(Error::Corrupt(format!(
+            "version string too long: {} (max {MAX_VERSION_BYTES})",
+            entry.version.len()
+        )));
+    }
+    if entry.commit.len() > MAX_COMMIT_BYTES {
+        return Err(Error::Corrupt(format!(
+            "commit hash too long: {} (max {MAX_COMMIT_BYTES})",
+            entry.commit.len()
+        )));
+    }
+    if entry.date.len() > MAX_DATE_BYTES {
+        return Err(Error::Corrupt(format!(
+            "date string too long: {} (max {MAX_DATE_BYTES})",
+            entry.date.len()
+        )));
+    }
+    Ok(())
+}
+
 /// Magic for the history sidecar.
 pub const HISTORY_MAGIC: &[u8] = b"NXHS";
 /// Sidecar format version.
@@ -116,23 +151,12 @@ impl HistoryBuilder {
         commit: String,
         date: String,
     ) -> Result<()> {
-        if version.len() > MAX_VERSION_BYTES {
-            return Err(Error::Corrupt(format!(
-                "version string too long: {} (max {MAX_VERSION_BYTES})",
-                version.len()
-            )));
-        }
-        if commit.len() > MAX_COMMIT_BYTES {
-            return Err(Error::Corrupt(format!(
-                "commit hash too long: {} (max {MAX_COMMIT_BYTES})",
-                commit.len()
-            )));
-        }
         let entry = VersionEntry {
             version,
             commit,
             date,
         };
+        check_entry(&entry)?;
         let versions = self.entries.entry(attr).or_default();
         // Deduplicate by version string. Recording a version that is already
         // present is a no-op, so the cap is only checked when a new version is
@@ -287,6 +311,14 @@ impl HistoryDb {
             }
             let history: VersionHistory =
                 sonic_rs::from_slice(line).map_err(|err| Error::Json(err.to_string()))?;
+            if history.versions.len() > MAX_VERSIONS_PER_ATTR {
+                return Err(Error::Corrupt(format!(
+                    "too many versions for attr (max {MAX_VERSIONS_PER_ATTR})"
+                )));
+            }
+            for entry in &history.versions {
+                check_entry(entry)?;
+            }
             entries.insert(history.attr, history.versions);
         }
 
@@ -309,7 +341,104 @@ impl HistoryDb {
 
 #[cfg(test)]
 mod tests {
-    use super::{HistoryBuilder, HistoryDb, MAX_VERSIONS_PER_ATTR};
+    use super::{
+        HISTORY_FILE, HISTORY_MAGIC, HistoryBuilder, HistoryDb, MAX_DATE_BYTES,
+        MAX_VERSIONS_PER_ATTR,
+    };
+
+    /// Hand-build a sidecar so the reader is tested on bytes the builder would
+    /// have refused. A downloaded sidecar need not have come from
+    /// `HistoryBuilder`, which is exactly why the reader must check.
+    fn write_raw_sidecar(dir: &std::path::Path, line: &str) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(HISTORY_MAGIC);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.push(b'\n');
+        std::fs::write(dir.join(HISTORY_FILE), bytes).expect("writing the sidecar");
+    }
+
+    /// The reader enforced none of the builder's caps, so a downloaded sidecar
+    /// could carry a date string of any size and it was loaded whole.
+    #[test]
+    fn the_reader_refuses_an_oversized_date() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let huge = "x".repeat(MAX_DATE_BYTES + 1);
+        write_raw_sidecar(
+            dir.path(),
+            &format!(
+                r#"{{"attr":"pkgs.hello","versions":[{{"version":"1.0","commit":"cafe","date":"{huge}"}}]}}"#
+            ),
+        );
+
+        let error = HistoryDb::open(dir.path()).expect_err("an oversized date must be refused");
+        assert!(
+            error.to_string().contains("date string too long"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The version cap lived only in the builder too.
+    #[test]
+    fn the_reader_refuses_an_oversized_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let huge = "x".repeat(super::MAX_VERSION_BYTES + 1);
+        write_raw_sidecar(
+            dir.path(),
+            &format!(
+                r#"{{"attr":"pkgs.hello","versions":[{{"version":"{huge}","commit":"cafe","date":"2026-01-01"}}]}}"#
+            ),
+        );
+
+        let error = HistoryDb::open(dir.path()).expect_err("an oversized version must be refused");
+        assert!(
+            error.to_string().contains("version string too long"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// So did the per-attribute entry count, which bounds how much one line of
+    /// the file can allocate.
+    #[test]
+    fn the_reader_refuses_too_many_versions_for_one_attr() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entries: Vec<String> = (0..=MAX_VERSIONS_PER_ATTR)
+            .map(|i| format!(r#"{{"version":"1.{i}","commit":"cafe","date":"2026-01-01"}}"#))
+            .collect();
+        write_raw_sidecar(
+            dir.path(),
+            &format!(
+                r#"{{"attr":"pkgs.hello","versions":[{}]}}"#,
+                entries.join(",")
+            ),
+        );
+
+        let error = HistoryDb::open(dir.path()).expect_err("too many versions must be refused");
+        assert!(
+            error.to_string().contains("too many versions"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A sidecar the builder wrote must still load, so the new checks did not
+    /// make the reader reject valid files.
+    #[test]
+    fn a_builder_written_sidecar_still_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut builder = HistoryBuilder::new();
+        builder
+            .record_version(
+                String::from("pkgs.hello"),
+                String::from("1.0"),
+                String::from("cafe"),
+                String::from("2026-01-01"),
+            )
+            .expect("recording succeeds");
+        builder.write_sidecar(dir.path()).expect("writing succeeds");
+
+        let db = HistoryDb::open(dir.path()).expect("a valid sidecar must load");
+        assert_eq!(db.lookup_attr("pkgs.hello").len(), 1);
+    }
 
     fn fill_to_capacity(builder: &mut HistoryBuilder) {
         for i in 0..MAX_VERSIONS_PER_ATTR {

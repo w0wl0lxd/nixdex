@@ -1,0 +1,6 @@
+- Rebuild the `files.frame_map` sidecar from the frame scan, so a deleted map is restored instead of staying missing forever and disabling selective frame decompression.
+- Cancel the running search on a cache hit, so a late outcome cannot overwrite the cached results with rows for the wrong query.
+- Map mouse clicks from the first result row, and account for the height of expanded results, so a click selects the row under the pointer.
+- Report a failed command-index lookup as a failure instead of zero providers.
+- Build `TerminalGuard` before the alternate-screen switch, so a failure there cannot leave the shell in raw mode.
+- Cap option values, history dates, versions and commits when reading a downloaded sidecar, matching the limits the builders already enforce.

@@ -57,23 +57,35 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub async fn run_tui(database: PathBuf) -> io::Result<()> {
+/// Put the terminal into raw mode on the alternate screen.
+///
+/// The guard is built before anything after `enable_raw_mode` can fail.
+/// Constructing it after the alternate-screen switch meant a failure there
+/// returned with raw mode still on and no guard to undo it, and the user's
+/// shell was left unusable until they ran `reset` themselves.
+fn enter_terminal() -> io::Result<(TerminalGuard, Terminal<CrosstermBackend<io::Stdout>>)> {
     enable_raw_mode()?;
+    let mut guard = TerminalGuard {
+        keyboard_enhanced: false,
+    };
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     // Ask the terminal to report Ctrl+H and Ctrl+J as themselves. Legacy
     // terminals send 0x08 and 0x0a for those, which decode as Backspace and
     // Enter, so the shortcuts never matched. Not every terminal supports the
     // request, hence the fallback bindings in `event.rs`.
-    let keyboard_enhanced = matches!(supports_keyboard_enhancement(), Ok(true))
+    guard.keyboard_enhanced = matches!(supports_keyboard_enhancement(), Ok(true))
         && execute!(
             stdout,
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )
         .is_ok();
-    let _terminal_guard = TerminalGuard { keyboard_enhanced };
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    Ok((guard, terminal))
+}
+
+pub async fn run_tui(database: PathBuf) -> io::Result<()> {
+    let (_terminal_guard, mut terminal) = enter_terminal()?;
 
     let mut app = App::new(database);
     app.cache_ttl = CACHE_TTL;
@@ -189,6 +201,39 @@ pub async fn run_tui(database: PathBuf) -> io::Result<()> {
     Ok(())
 }
 
+/// Which result sits under screen row `row`, if any.
+///
+/// Two things this has to get right, and the fixed `row - 2` it replaced got
+/// both wrong. The header is a bordered block of three rows, so the first
+/// result draws at row 3, not row 2 -- every click landed one entry too far
+/// down. And with `expand_all` on, a result is several rows tall, so the list
+/// index is not the row offset: the drift grew with every expanded entry above
+/// the pointer.
+fn result_at_row(app: &App, row: u16) -> Option<usize> {
+    // The header block occupies rows 0, 1 and 2: top border, input, bottom
+    // border. `ui::render_header` and this must agree.
+    const FIRST_RESULT_ROW: u16 = 3;
+
+    if row < FIRST_RESULT_ROW {
+        return None;
+    }
+    let mut remaining = usize::from(row - FIRST_RESULT_ROW);
+    let first = usize::from(app.scroll);
+
+    for (offset, result) in app.results.iter().enumerate().skip(first) {
+        let height = if app.expand_all {
+            crate::ui::expanded_row_count(result)
+        } else {
+            1
+        };
+        if remaining < height {
+            return Some(offset);
+        }
+        remaining -= height;
+    }
+    None
+}
+
 /// Answer a debounced query: from the cache when it is still warm, from the
 /// worker otherwise.
 fn dispatch_search(
@@ -204,6 +249,11 @@ fn dispatch_search(
     if app.is_cache_valid(query)
         && let Some(cached) = app.get_cached_results(query).cloned()
     {
+        // A search for the previous query may still be running. Answering from
+        // the cache without cancelling it left `active_request` pointing at
+        // that search, so its outcome arrived later, matched, and replaced the
+        // cache hit with rows for a query the user had already moved off.
+        app.cancel_search();
         app.set_results(cached);
         app.set_status(format!("Found {} result(s) (cached)", app.result_count()));
         return;
@@ -445,6 +495,29 @@ fn handle_search_toggle_key(app: &mut App, event: &AppEvent) {
             "Expand all {}",
             if app.expand_all { "on" } else { "off" }
         ));
+    } else if event.is_ctrl_f() {
+        // These three settings were stored and passed to every search, but no
+        // key changed them, so the TUI could only ever run one kind of search.
+        // The cache key already covers them, so a reload picks the new one up.
+        app.toggle_fuzzy();
+        app.reload_requested = true;
+        app.set_status(format!(
+            "Fuzzy {}",
+            if app.search_fuzzy { "on" } else { "off" }
+        ));
+    } else if event.is_ctrl_x() {
+        app.toggle_regex();
+        app.reload_requested = true;
+        app.set_status(format!(
+            "Regex {}",
+            if app.search_regex { "on" } else { "off" }
+        ));
+    } else if event.is_ctrl_n() {
+        app.toggle_name_only();
+        app.set_status(format!(
+            "Name only {}",
+            if app.search_name_only { "on" } else { "off" }
+        ));
     }
 }
 
@@ -532,18 +605,11 @@ fn handle_mouse_event(app: &mut App, event: AppEvent) {
             ..
         }) => {
             let result_count = app.result_count();
-            if result_count > 0 {
-                // The list is scrolled, so a screen row maps to
-                // `app.scroll + offset`, not to the offset alone. Without the
-                // scroll term a click after scrolling selected a different
-                // entry than the one under the pointer.
-                let first_result_row = 2u16;
-                let row_offset = usize::from(row.saturating_sub(first_result_row));
-                let index = usize::from(app.scroll).saturating_add(row_offset);
-                if index < result_count {
-                    app.selected = index;
-                    app.ensure_visible();
-                }
+            if result_count > 0
+                && let Some(index) = result_at_row(app, row)
+            {
+                app.selected = index;
+                app.ensure_visible();
             }
         }
         AppEvent::Mouse(MouseEvent {
@@ -840,9 +906,21 @@ fn perform_which_search(req: &SearchRequest) -> SearchOutcome {
 
     match nixdex_core::command_index::CommandIndex::open(&req.database) {
         Ok(index) => {
+            // A failed lookup is not an empty result. Turning the error into an
+            // empty vector reported "Found 0 provider(s)" for a corrupt or
+            // truncated index, which reads as "this command is provided by
+            // nothing" and sends the user looking in the wrong place.
             let providers = match index.lookup_command(command.as_bytes()) {
                 Ok(providers) => providers,
-                Err(_) => Vec::new(),
+                Err(error) => {
+                    return SearchOutcome {
+                        id: req.id,
+                        query: query.to_string(),
+                        mode: req.mode,
+                        results: None,
+                        status: Some(format!("Command index lookup failed: {error}")),
+                    };
+                }
             };
             let results: Vec<crate::app::SearchResult> = providers
                 .into_iter()
@@ -1085,6 +1163,89 @@ mod tests {
             maintainers: Vec::new(),
             main_program: None,
         }
+    }
+
+    /// The first result draws at row 3, not row 2.
+    ///
+    /// The header is a bordered block: top border, input line, bottom border.
+    /// A fixed `row - 2` selected the entry below the pointer on every click.
+    #[test]
+    fn a_click_on_the_first_row_selects_the_first_result() {
+        let mut app = app();
+        app.set_results(vec![result("alpha"), result("beta"), result("gamma")]);
+
+        assert_eq!(super::result_at_row(&app, 3), Some(0));
+        assert_eq!(super::result_at_row(&app, 4), Some(1));
+        assert_eq!(super::result_at_row(&app, 5), Some(2));
+    }
+
+    /// A click on the header selects nothing rather than the first result.
+    #[test]
+    fn a_click_on_the_header_selects_nothing() {
+        let mut app = app();
+        app.set_results(vec![result("alpha")]);
+
+        for row in 0..3u16 {
+            assert_eq!(super::result_at_row(&app, row), None, "row {row}");
+        }
+    }
+
+    /// With `expand_all` on, a result is several rows tall, so the row offset
+    /// is not the list index. The old mapping drifted further down the list
+    /// with every expanded entry above the pointer.
+    #[test]
+    fn expanded_results_map_clicks_by_height() {
+        let mut app = app();
+        let mut first = result("alpha");
+        first.description = String::from("the first one");
+        first.path = Some(String::from("/nix/store/alpha"));
+        app.set_results(vec![first, result("beta")]);
+        app.expand_all = true;
+
+        // "alpha" draws four rows (attr, name, desc, path) at 3..=6, and
+        // "beta" draws two (attr, name) at 7..=8. The old fixed mapping put
+        // "beta" at row 4.
+        assert_eq!(super::result_at_row(&app, 3), Some(0));
+        assert_eq!(super::result_at_row(&app, 6), Some(0));
+        assert_eq!(super::result_at_row(&app, 7), Some(1));
+        assert_eq!(super::result_at_row(&app, 8), Some(1));
+        assert_eq!(super::result_at_row(&app, 9), None);
+    }
+
+    /// A click below the last result selects nothing.
+    #[test]
+    fn a_click_past_the_last_result_selects_nothing() {
+        let mut app = app();
+        app.set_results(vec![result("alpha")]);
+
+        assert_eq!(super::result_at_row(&app, 4), None);
+    }
+
+    /// A cache hit must cancel the search that is still running.
+    ///
+    /// Answering from the cache without cancelling left `active_request`
+    /// pointing at the previous query's search. Its outcome arrived later,
+    /// matched, and replaced the cache hit with rows for a query the user had
+    /// already moved off.
+    #[test]
+    fn a_cache_hit_cancels_the_running_search() {
+        let (search_tx, _search_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app();
+
+        // A search for "alpha" is in flight.
+        super::dispatch_search(&mut app, "alpha", &search_tx);
+        assert!(app.active_request.is_some(), "the search must be running");
+
+        // "beta" is already cached, so it is answered without the worker.
+        app.cache_results(String::from("beta"), vec![result("beta")]);
+        super::dispatch_search(&mut app, "beta", &search_tx);
+
+        assert_eq!(
+            app.active_request, None,
+            "the stale search must be cancelled, or its outcome overwrites the cache hit"
+        );
+        assert!(!app.is_searching);
+        assert_eq!(app.result_count(), 1);
     }
 
     fn outcome(query: &str, results: Option<Vec<crate::app::SearchResult>>) -> SearchOutcome {
@@ -1430,5 +1591,90 @@ mod tests {
         super::dispatch_reload(&mut app, &tx);
         assert!(rx.try_recv().is_err(), "no search should be sent");
         assert_eq!(app.status_message, "Nothing to refresh");
+    }
+
+    /// Ctrl+F, Ctrl+X and Ctrl+N must reach the stored search settings.
+    ///
+    /// `App` held sort, field, regex, fuzzy, exact, limit, name-only and
+    /// details, and passed all of them to every search, but no key changed any
+    /// of them. The TUI could therefore only ever run one kind of search.
+    #[test]
+    fn the_search_toggles_reach_the_stored_settings() {
+        let mut app = app();
+        assert!(!app.search_fuzzy);
+        assert!(!app.search_regex);
+        assert!(!app.search_name_only);
+
+        super::handle_search_toggle_key(&mut app, &ctrl(KeyCode::Char('f')));
+        assert!(app.search_fuzzy, "Ctrl+F must turn fuzzy on");
+        assert!(app.reload_requested, "a new setting needs the query re-run");
+        assert_eq!(app.status_message, "Fuzzy on");
+
+        app.reload_requested = false;
+        super::handle_search_toggle_key(&mut app, &ctrl(KeyCode::Char('x')));
+        assert!(app.search_regex, "Ctrl+X must turn regex on");
+        assert!(
+            !app.search_fuzzy,
+            "the worker tries fuzzy first, so regex must clear it"
+        );
+        assert!(app.reload_requested);
+
+        super::handle_search_toggle_key(&mut app, &ctrl(KeyCode::Char('n')));
+        assert!(app.search_name_only, "Ctrl+N must turn name-only on");
+        assert_eq!(app.status_message, "Name only on");
+    }
+
+    /// Toggling a setting must change the cache key, or the reload returns the
+    /// results of the previous setting.
+    #[test]
+    fn a_toggled_setting_changes_the_cache_key() {
+        let mut app = app();
+        let before = app.cache_key("hello");
+        app.toggle_fuzzy();
+        assert_ne!(before, app.cache_key("hello"));
+    }
+
+    /// A corrupt command index must report the failure, not zero providers.
+    ///
+    /// `perform_which_search` turned the lookup error into an empty provider
+    /// list, so a truncated index said "Found 0 provider(s)" -- which reads as
+    /// "nothing provides this command" and sends the user looking elsewhere.
+    #[test]
+    fn a_corrupt_command_index_reports_the_failure() {
+        use nixdex_core::command_index::{CommandIndexBuilder, POSTINGS_FILE};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut builder = CommandIndexBuilder::new();
+        builder
+            .record_package(
+                String::from("hello"),
+                String::from("out"),
+                true,
+                vec![b"/bin/hello".to_vec()],
+            )
+            .expect("recording a provider");
+        builder.write_sidecars(dir.path()).expect("write sidecars");
+
+        // Keep the header valid so `CommandIndex::open` still succeeds, and
+        // cut the body so the posting list for a present key cannot be read.
+        let postings = dir.path().join(POSTINGS_FILE);
+        let raw = std::fs::read(&postings).expect("reading postings");
+        let header = raw.get(..12).expect("postings header").to_vec();
+        std::fs::write(&postings, &header).expect("truncating postings");
+
+        let mut app = App::new(dir.path().to_path_buf());
+        app.set_mode(crate::app::SearchMode::Which);
+        let request = app.search_request("hello");
+        let outcome = super::perform_which_search(&request);
+
+        assert!(
+            outcome.results.is_none(),
+            "a failed lookup must not report results"
+        );
+        let status = outcome.status.expect("a failure needs a status");
+        assert!(
+            status.contains("lookup failed"),
+            "the status must name the failure, got: {status}"
+        );
     }
 }

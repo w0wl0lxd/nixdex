@@ -317,6 +317,39 @@ impl AppEvent {
         )
     }
 
+    pub fn is_ctrl_f(&self) -> bool {
+        matches!(
+            self,
+            Self::Key(KeyEvent {
+                code: KeyCode::Char('f'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            })
+        )
+    }
+
+    pub fn is_ctrl_x(&self) -> bool {
+        matches!(
+            self,
+            Self::Key(KeyEvent {
+                code: KeyCode::Char('x'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            })
+        )
+    }
+
+    pub fn is_ctrl_n(&self) -> bool {
+        matches!(
+            self,
+            Self::Key(KeyEvent {
+                code: KeyCode::Char('n'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            })
+        )
+    }
+
     pub fn as_char(&self) -> Option<char> {
         if let Self::Key(KeyEvent {
             code: KeyCode::Char(c),

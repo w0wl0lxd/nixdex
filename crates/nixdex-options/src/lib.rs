@@ -31,6 +31,31 @@ const MAX_OPTION_TYPE_BYTES: usize = 128;
 /// Maximum length of a single option description.
 const MAX_OPTION_DESC_BYTES: usize = 4096;
 
+/// Cap for `default` and `example`, which carry rendered Nix values.
+///
+/// These were the only record fields with no bound. A downloaded sidecar is
+/// untrusted, so a compromised release source could put a value of any size in
+/// one and have it held in memory for the life of the process on every load.
+/// Larger than the description cap because a rendered attribute set is a
+/// legitimately long value, and still bounded.
+const MAX_OPTION_VALUE_BYTES: usize = 16 * 1024;
+
+/// Reject an optional value field that exceeds `MAX_OPTION_VALUE_BYTES`.
+///
+/// Shared so the builder and the reader cannot drift apart about what a valid
+/// record is.
+fn check_value_len(field: &str, value: Option<&String>) -> Result<()> {
+    if let Some(value) = value
+        && value.len() > MAX_OPTION_VALUE_BYTES
+    {
+        return Err(Error::Corrupt(format!(
+            "option {field} too long: {} (max {MAX_OPTION_VALUE_BYTES})",
+            value.len()
+        )));
+    }
+    Ok(())
+}
+
 /// Magic for the options sidecar.
 pub const OPTIONS_MAGIC: &[u8] = b"NXOP";
 /// Sidecar format version.
@@ -211,6 +236,8 @@ impl OptionsDb {
                     record.description.len()
                 )));
             }
+            check_value_len("default", record.default.as_ref())?;
+            check_value_len("example", record.example.as_ref())?;
             // Checked as entries are added, not afterwards: the old check let a
             // file with many times the cap be materialised in full before it
             // was rejected.
@@ -308,6 +335,9 @@ impl OptionsBuilder {
             )));
         }
 
+        check_value_len("default", default.as_ref())?;
+        check_value_len("example", example.as_ref())?;
+
         let record = OptionRecord {
             attr,
             r#type,
@@ -381,7 +411,92 @@ impl OptionsBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_description;
+    use super::{
+        MAX_OPTION_VALUE_BYTES, OPTIONS_FILE, OPTIONS_MAGIC, OptionsBuilder, OptionsDb,
+        normalize_description,
+    };
+
+    /// Hand-build a sidecar so the reader is tested on bytes the builder would
+    /// have refused. A downloaded sidecar need not have come from
+    /// `OptionsBuilder`, which is the whole reason the reader has caps.
+    fn write_raw_sidecar(dir: &std::path::Path, line: &str) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(OPTIONS_MAGIC);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.push(b'\n');
+        std::fs::write(dir.join(OPTIONS_FILE), bytes).expect("writing the sidecar");
+    }
+
+    /// `default` and `example` were the only record fields with no cap, so a
+    /// compromised release source could put a string of any size in one and
+    /// have it held in memory for the life of the process on every load.
+    #[test]
+    fn an_oversized_default_is_refused_by_the_reader() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let huge = "x".repeat(MAX_OPTION_VALUE_BYTES + 1);
+        write_raw_sidecar(
+            dir.path(),
+            &format!(r#"{{"attr":"a.b","type":"str","description":"d","default":"{huge}"}}"#),
+        );
+
+        let error = OptionsDb::open(dir.path()).expect_err("an oversized default must be refused");
+        assert!(
+            error.to_string().contains("default too long"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn an_oversized_example_is_refused_by_the_reader() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let huge = "x".repeat(MAX_OPTION_VALUE_BYTES + 1);
+        write_raw_sidecar(
+            dir.path(),
+            &format!(r#"{{"attr":"a.b","type":"str","description":"d","example":"{huge}"}}"#),
+        );
+
+        let error = OptionsDb::open(dir.path()).expect_err("an oversized example must be refused");
+        assert!(
+            error.to_string().contains("example too long"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The builder enforces the same cap, so it cannot write a file its own
+    /// reader would reject.
+    #[test]
+    fn the_builder_refuses_an_oversized_value() {
+        let mut builder = OptionsBuilder::new();
+        let result = builder.record_option(
+            String::from("a.b"),
+            String::from("str"),
+            String::from("d"),
+            Some("x".repeat(MAX_OPTION_VALUE_BYTES + 1)),
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "the builder must refuse an oversized value"
+        );
+    }
+
+    /// A value at the cap is still accepted, so the bound is not off by one.
+    #[test]
+    fn a_value_at_the_cap_is_accepted() {
+        let mut builder = OptionsBuilder::new();
+        let result = builder.record_option(
+            String::from("a.b"),
+            String::from("str"),
+            String::from("d"),
+            Some("x".repeat(MAX_OPTION_VALUE_BYTES)),
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "a value exactly at the cap must be accepted"
+        );
+    }
 
     #[test]
     fn a_markdown_table_prefix_is_stripped() {
