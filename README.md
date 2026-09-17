@@ -1,6 +1,6 @@
 # nixdex
 
-Modern rewrite of [`nix-index`](https://github.com/nix-community/nix-index):
+modern rewrite of [`nix-index`](https://github.com/nix-community/nix-index):
 fast package file indexing and `nix-locate`-compatible search.
 
 `nix-locate` output and the v1 database format are fully upstream-compatible.
