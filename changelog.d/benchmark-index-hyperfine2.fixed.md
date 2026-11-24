@@ -1,0 +1,1 @@
+- Fix `scripts/benchmark-index.sh` for hyperfine 2.0, which runs benchmark commands without an intermediate shell and rejects commands that start with an inline variable assignment; the `nixdex index` benchmark now sets `RUST_LOG` via an `env` prefix that works under both hyperfine 1.x (shell) and 2.x (direct) execution.

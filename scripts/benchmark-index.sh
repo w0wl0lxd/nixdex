@@ -36,12 +36,17 @@ echo "mode:    $MODE"
 echo "runs:    $RUNS"
 echo "db dir:  $DB_DIR"
 
+# hyperfine >= 2.0 runs the command directly (no intermediate shell) and
+# rejects a command that starts with a variable assignment, while hyperfine
+# 1.x always uses a shell. Prefixing `env` sets RUST_LOG in both modes and
+# keeps every quoted argument (paths may contain spaces) a single word in
+# either parser.
 hyperfine \
   --runs "$RUNS" \
   --prepare "rm -rf '$DB_DIR'; mkdir -p '$DB_DIR'" \
   --export-markdown "$OUT_MD" \
   --show-output \
-  "RUST_LOG=info \"$NIXDEX\" index -d '$DB_DIR' -f '$NIXPKGS' $EXTRA_ARGS"
+  "env RUST_LOG=info \"$NIXDEX\" index -d '$DB_DIR' -f '$NIXPKGS' $EXTRA_ARGS"
 
 echo ""
 echo "Hyperfine results written to $OUT_MD"
