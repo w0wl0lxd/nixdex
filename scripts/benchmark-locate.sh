@@ -73,8 +73,10 @@ for entry in "${QUERIES[@]}"; do
     nixlocate_cmd="$nixlocate_cmd -w"
   fi
 
-  nixdex_cmd="$nixdex_cmd '$pattern' >/dev/null 2>&1"
-  nixlocate_cmd="$nixlocate_cmd '$pattern' >/dev/null 2>&1"
+  # No shell redirection: hyperfine 2 runs a command directly, so `>/dev/null`
+  # would reach the program as an argument. `--output null` discards output.
+  nixdex_cmd="$nixdex_cmd '$pattern'"
+  nixlocate_cmd="$nixlocate_cmd '$pattern'"
 
   echo "## Pattern: '$pattern' (flags=$flags)" >>"$OUT_MD"
   echo "" >>"$OUT_MD"
@@ -83,6 +85,7 @@ for entry in "${QUERIES[@]}"; do
 
   if command -v nix-locate >/dev/null 2>&1; then
     hyperfine \
+      --output null \
       --warmup "$WARMUP" \
       --min-runs "$MIN_RUNS" \
       --export-markdown "$QUERY_MD" \
@@ -90,6 +93,7 @@ for entry in "${QUERIES[@]}"; do
       "$nixlocate_cmd"
   else
     hyperfine \
+      --output null \
       --warmup "$WARMUP" \
       --min-runs "$MIN_RUNS" \
       --export-markdown "$QUERY_MD" \

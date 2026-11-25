@@ -1,0 +1,1 @@
+- Run the locate benchmark under hyperfine 2 without shell redirections, and with fewer runs in CI so the job finishes
