@@ -21,6 +21,12 @@ cargo build --release --bin nixdex
 NIXDEX="$(realpath "${CARGO_TARGET_DIR:-target}/release/nixdex")"
 
 if [[ ! -f "$DB_DIR/files" ]]; then
+  echo "no database at '$DB_DIR/files'; downloading the prebuilt index" >&2
+  mkdir -p "$DB_DIR"
+  "$NIXDEX" index --download-prebuilt -d "$DB_DIR" || true
+fi
+
+if [[ ! -f "$DB_DIR/files" ]]; then
   echo "error: no database found at '$DB_DIR/files'" >&2
   echo "Run 'nixdex index --download-prebuilt -d $DB_DIR' first, or pass a database directory." >&2
   exit 1

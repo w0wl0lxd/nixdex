@@ -1,0 +1,1 @@
+- Download the prebuilt index in the locate benchmark when no database exists
