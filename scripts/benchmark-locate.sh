@@ -32,6 +32,18 @@ if [[ ! -f "$DB_DIR/files" ]]; then
   exit 1
 fi
 
+echo "database: $(ls -l "$DB_DIR/files")" >&2
+df -h "$DB_DIR" >&2 || true
+free -m >&2 || true
+echo "single nixdex query" >&2
+timeout 120 "$NIXDEX" locate -d "$DB_DIR" 'bin/ls' | head -3 >&2 || echo "nixdex single query exit=$?" >&2
+free -m >&2 || true
+if command -v nix-locate >/dev/null 2>&1; then
+  echo "single nix-locate query" >&2
+  timeout 120 nix-locate -d "$DB_DIR" 'bin/ls' | head -3 >&2 || echo "nix-locate single query exit=$?" >&2
+  free -m >&2 || true
+fi
+
 if ! command -v nix-locate >/dev/null 2>&1; then
   echo "warning: nix-locate not found; only nixdex will be benchmarked" >&2
 fi
