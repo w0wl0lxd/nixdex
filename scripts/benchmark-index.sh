@@ -20,8 +20,15 @@ RUNS="${3:-1}"
 DB_DIR=$(mktemp -d -t nixdex-bench-XXXXXX)
 trap 'rm -rf "$DB_DIR"' EXIT
 
-cargo build --release --bin nixdex
-NIXDEX=$(realpath "${CARGO_TARGET_DIR:-target}/release/nixdex")
+# Set NIXDEX_BIN to benchmark a binary that was built elsewhere. CI builds
+# outside nix-shell: a build inside it links against nix's toolchain and the
+# resulting binary cannot find the host's shared libraries (liblzma.so.5).
+if [[ -n "${NIXDEX_BIN:-}" ]]; then
+  NIXDEX=$(realpath "$NIXDEX_BIN")
+else
+  cargo build --release --bin nixdex
+  NIXDEX=$(realpath "${CARGO_TARGET_DIR:-target}/release/nixdex")
+fi
 
 EXTRA_ARGS="--requests 100"
 if [[ "$MODE" == "eval" ]]; then
