@@ -21,27 +21,9 @@ cargo build --release --bin nixdex
 NIXDEX="$(realpath "${CARGO_TARGET_DIR:-target}/release/nixdex")"
 
 if [[ ! -f "$DB_DIR/files" ]]; then
-  echo "no database at '$DB_DIR/files'; downloading the prebuilt index" >&2
-  mkdir -p "$DB_DIR"
-  "$NIXDEX" index --download-prebuilt -d "$DB_DIR" || true
-fi
-
-if [[ ! -f "$DB_DIR/files" ]]; then
   echo "error: no database found at '$DB_DIR/files'" >&2
   echo "Run 'nixdex index --download-prebuilt -d $DB_DIR' first, or pass a database directory." >&2
   exit 1
-fi
-
-echo "database: $(ls -l "$DB_DIR/files")" >&2
-df -h "$DB_DIR" >&2 || true
-free -m >&2 || true
-echo "single nixdex query" >&2
-timeout 120 "$NIXDEX" locate -d "$DB_DIR" 'bin/ls' | head -3 >&2 || echo "nixdex single query exit=$?" >&2
-free -m >&2 || true
-if command -v nix-locate >/dev/null 2>&1; then
-  echo "single nix-locate query" >&2
-  timeout 120 nix-locate -d "$DB_DIR" 'bin/ls' | head -3 >&2 || echo "nix-locate single query exit=$?" >&2
-  free -m >&2 || true
 fi
 
 if ! command -v nix-locate >/dev/null 2>&1; then
