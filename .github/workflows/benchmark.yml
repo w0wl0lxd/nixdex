@@ -101,7 +101,24 @@ jobs:
           rm -rf /tmp/nix-index
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Fetch prebuilt index
+        # Stream the nix-index-database release asset straight to disk when
+        # the cache step did not restore one (cache misses on a new key).
+        run: |
+          if [[ ! -f "$HOME/.cache/nixdex/files" ]]; then
+            mkdir -p "$HOME/.cache/nixdex"
+            curl --proto '=https' --tlsv1.2 --retry 5 --location --silent --show-error --fail \
+              --output "$HOME/.cache/nixdex/files" \
+              https://github.com/nix-community/nix-index-database/releases/latest/download/index-x86_64-linux
+          fi
+          ls -l "$HOME/.cache/nixdex/files"
       - name: Run locate benchmark
+        timeout-minutes: 25
+        # Each query takes seconds on a hosted runner, and the script runs 6
+        # queries against 2 tools; fewer runs keep the job well under the timeout.
+        env:
+          WARMUP: 1
+          MIN_RUNS: 3
         run: bash scripts/benchmark-locate.sh
       - name: Upload locate benchmark report
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -132,7 +149,11 @@ jobs:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - name: Build and run index benchmark
+      - name: Build nixdex
+        run: cargo build --release --bin nixdex
+      - name: Run index benchmark
+        env:
+          NIXDEX_BIN: target/release/nixdex
         run: |
           nix-shell -p nix-eval-jobs hyperfine --run \
             "./scripts/benchmark-index.sh '${{ github.event.inputs.nixpkgs || '<nixpkgs>' }}' '${{ github.event.inputs.mode || 'eval' }}' '${{ github.event.inputs.runs || '1' }}'"

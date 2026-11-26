@@ -1,0 +1,2 @@
+- Fix `scripts/benchmark-index.sh` for hyperfine 2.0, which runs benchmark commands without an intermediate shell and rejects commands that start with an inline variable assignment; the `nixdex index` benchmark now sets `RUST_LOG` via an `env` prefix that works under both hyperfine 1.x (shell) and 2.x (direct) execution.
+- Build `nixdex` outside `nix-shell` in the scheduled index benchmark job and pass it to `scripts/benchmark-index.sh` via `NIXDEX_BIN`; a binary built inside `nix-shell` failed to start with `liblzma.so.5: cannot open shared object file`.

@@ -1,0 +1,1 @@
+- Fetch the prebuilt index with `curl` in the locate benchmark job when the cache has no database, instead of failing with `no database found`
